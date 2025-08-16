@@ -53,4 +53,5 @@ htmlcov/
 # Windows
 Thumbs.db
 
-/tel_bot_test
+tel_bot_test/
+.users.db
