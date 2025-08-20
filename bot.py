@@ -120,6 +120,46 @@ def safe(v, fallback="—"):
     return fallback if v in (None, "", []) else v
 
 
+def _esc(s):
+    if s is None:
+        return "—"
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _norm_guest_requests(val):
+    """
+    Accepts:
+      - JSON string like '["A","B"]'
+      - list[str]/list[dict]
+      - plain string
+    Returns a displayable comma-separated string or None.
+    """
+    if not val:
+        return None
+    try:
+        if isinstance(val, str):
+            # try json decode first
+            parsed = json.loads(val)
+            val = parsed
+    except Exception:
+        # keep as plain string
+        return str(val)
+
+    if isinstance(val, list):
+        out = []
+        for it in val:
+            if isinstance(it, str):
+                out.append(it)
+            elif isinstance(it, dict):
+                for k in ("label", "name", "value", "text"):
+                    if it.get(k):
+                        out.append(str(it[k]))
+                        break
+        return ", ".join(out) if out else None
+
+    return str(val)
+
+
 def unpin_warning_if_any(telegram_id: int, kind: str):
     # kind: "no_token" | "expired"
     ids = get_pinned_warnings(telegram_id)
@@ -382,8 +422,63 @@ def build_ends_dt_menu(user_id: int):
 # ---------------- Stats view ----------------
 PAGE_SIZE = 5
 
+def _build_stats_block(r: dict, tz: str) -> str:
+    """
+    Build one HTML block with the same look & fields as offer messages.
+    """
+    status = r.get("status")
+    header = "✅ <b>Offer accepted</b>" if status == "accepted" else "⛔ <b>Offer rejected</b>"
+    reason = r.get("rejection_reason")
+
+    typ = safe(r.get("type"), "—").lower()
+    typ_disp = "transfer" if typ == "transfer" else ("hourly" if typ == "hourly" else "—")
+    vclass = safe(r.get("vehicle_class"), "—")
+    price = fmt_money(r.get("price"), r.get("currency"))
+
+    # Optional columns (present if you extended offer_logs)
+    flight_number = r.get("flight_number")
+    guest_reqs   = _norm_guest_requests(r.get("guest_requests"))
+
+    pu = _esc(safe(r.get("pu_address")))
+    do = _esc(r.get("do_address")) if r.get("do_address") not in (None, "", []) else None
+    dist = fmt_km(r.get("estimated_distance_meters"))
+    dur  = fmt_minutes(r.get("duration_minutes"))
+    pu_time = _esc(fmt_dt_local(r.get("pickup_time"), tz))
+    end_time = _esc(fmt_dt_local(r.get("ends_at"), tz))
+
+    lines = [header]
+    if status == "rejected" and reason:
+        lines.append(f"<i>Reason:</i> {_esc(reason)}")
+
+    lines += [
+        f"🚘 <b>Type:</b> {_esc(typ_disp)}",
+        f"🚗 <b>Class:</b> {_esc(vclass)}",
+        f"💰 <b>Price:</b> {_esc(price)}",
+    ]
+    if flight_number:
+        lines.append(f"✈️ <b>Flight number:</b> {_esc(flight_number)}")
+    if guest_reqs:
+        lines.append(f"👁️ <b>Special requests:</b> {_esc(guest_reqs)}")
+
+    if dist != "—":
+        lines.append(f"📏 <b>Distance:</b> {_esc(dist)}")
+    if dur != "—":
+        lines.append(f"⏱️ <b>Duration:</b> {_esc(dur)}")
+
+    lines += [
+        f"🕒 <b>Starts at:</b> {pu_time}",
+        f"⏳ <b>Ends at:</b> {end_time}",
+        "",
+        f"⬆️ <b>Pickup:</b>\n{pu}",
+    ]
+    if do:
+        lines += ["", f"⬇️ <b>Dropoff:</b>\n{do}"]
+
+    return "\n".join(lines)
+
 def build_stats_view(user_id: int, page: int = 0):
     tz = get_user_timezone(user_id)
+
     counts = get_offer_logs_counts(user_id)
     total = counts.get("total", 0)
     accepted = counts.get("accepted", 0)
@@ -393,59 +488,20 @@ def build_stats_view(user_id: int, page: int = 0):
     rows = get_offer_logs(user_id, limit=PAGE_SIZE, offset=offset)
 
     header = (
-        "📊 *Your offers*\n\n"
-        f"Total: *{total}*  |  ✅ *{accepted}*  |  ❌ *{rejected}*\n"
+        "📊 <b>Your offers</b>\n\n"
+        f"Total: <b>{total}</b>  |  ✅ <b>{accepted}</b>  |  ❌ <b>{rejected}</b>\n"
     )
     if not rows:
-        info_text = header + "\n_No data yet._"
+        info_text = header + "\n<i>No data yet.</i>"
         keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")]]
         return info_text, InlineKeyboardMarkup(keyboard)
 
     blocks = []
-    for idx, r in enumerate(rows, start=1 + offset):
-        s_emoji = status_emoji(r.get("status"))
-        typ = safe(r.get("type"), "—").capitalize()
-        vclass = safe(r.get("vehicle_class"), "—")
-        price = fmt_money(r.get("price"), r.get("currency"))
-        pu = fmt_dt_local(r.get("pickup_time"), tz)
-        ea = fmt_dt_local(r.get("ends_at"), tz)
-        pu_addr = safe(r.get("pu_address"))
-        do_addr = safe(r.get("do_address"))
-        dist = fmt_km(r.get("estimated_distance_meters"))
-        dur = fmt_minutes(r.get("duration_minutes"))
-        kminc = safe(r.get("km_included"))
-        reason = safe(r.get("rejection_reason"))
-        created = fmt_dt_local(r.get("created_at"), tz)
-
-        block = (
-            f"{s_emoji} *#{idx}* — *{typ}* · {vclass}\n"
-            f"🆔 `{r.get('offer_id')}`\n"
-            f"💰 {price}\n"
-            f"🕒 Pickup: {pu}\n"
-            f"🏁 Ends: {ea}\n"
-            f"📍 PU: {pu_addr}\n"
-        )
-        if do_addr != "—":
-            block += f"📍 DO: {do_addr}\n"
-
-        extra_line = []
-        if dist != "—":
-            extra_line.append(f"📏 {dist}")
-        if dur != "—":
-            extra_line.append(f"⏱️ {dur}")
-        if kminc != "—":
-            extra_line.append(f"🎁 {kminc} km incl.")
-        if extra_line:
-            block += " · ".join(extra_line) + "\n"
-
-        if reason != "—":
-            block += f"🚫 Reason: _{reason}_\n"
-
-        block += f"🗓 Created: {created}"
-        blocks.append(block)
+    for r in rows:
+        blocks.append(_build_stats_block(r, tz))
 
     body = "\n\n".join(blocks)
-    info_text = header + "\n" + body
+    info_text = header + "\n" + body  # HTML
 
     has_prev = page > 0
     has_next = (offset + PAGE_SIZE) < total
@@ -573,7 +629,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Stats
     if query.data == "statistic":
         info_text, menu = build_stats_view(user_id, page=0)
-        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        # IMPORTANT: stats are HTML now
+        await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
         return
     if query.data.startswith("stats_page:"):
         try:
@@ -581,7 +638,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             page = 0
         info_text, menu = build_stats_view(user_id, page=page)
-        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
         return
 
     # Filters menu

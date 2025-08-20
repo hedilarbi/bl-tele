@@ -83,6 +83,8 @@ def init_db():
             estimated_distance_meters REAL,
             duration_minutes INTEGER,              -- transfer: estimatedDurationMinutes; hourly: durationMinutes
             km_included INTEGER,                   -- hourly only
+            guest_requests TEXT,                   -- NEW
+            flight_number TEXT,                    -- NEW
             rejection_reason TEXT,                 -- NULL if accepted
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE (telegram_id, offer_id)
@@ -96,6 +98,8 @@ def init_db():
         ("estimated_distance_meters", "REAL"),
         ("duration_minutes", "INTEGER"),
         ("km_included", "INTEGER"),
+        ("guest_requests", "TEXT"),   # NEW
+        ("flight_number", "TEXT"),    # NEW
         ("rejection_reason", "TEXT"),
         ("created_at", "TEXT"),
     ]:
@@ -337,14 +341,29 @@ def log_offer_decision(telegram_id: int, offer: dict, status: str, reason: str =
     est_dist   = rid.get("estimatedDistanceMeters")
     km_incl    = rid.get("kmIncluded")
 
+    # NEW: optional fields
+    guest_raw  = rid.get("guestRequests")
+    if isinstance(guest_raw, (list, tuple)):
+        guest_requests = ", ".join([str(x) for x in guest_raw if str(x).strip()])
+    elif isinstance(guest_raw, dict):
+        try:
+            import json as _json
+            guest_requests = _json.dumps(guest_raw, ensure_ascii=False)
+        except Exception:
+            guest_requests = str(guest_raw)
+    else:
+        guest_requests = guest_raw if guest_raw is not None else None
+    flight_number = (rid.get("flight") or {}).get("number") if isinstance(rid.get("flight"), dict) else None
+
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
         INSERT INTO offer_logs (
             telegram_id, offer_id, status, type, vehicle_class, price, currency,
             pickup_time, ends_at, pu_address, do_address, estimated_distance_meters,
-            duration_minutes, km_included, rejection_reason, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            duration_minutes, km_included, guest_requests, flight_number,
+            rejection_reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(telegram_id, offer_id) DO UPDATE SET
             status = excluded.status,
             type = excluded.type,
@@ -358,11 +377,14 @@ def log_offer_decision(telegram_id: int, offer: dict, status: str, reason: str =
             estimated_distance_meters = excluded.estimated_distance_meters,
             duration_minutes = excluded.duration_minutes,
             km_included = excluded.km_included,
+            guest_requests = excluded.guest_requests,
+            flight_number = excluded.flight_number,
             rejection_reason = excluded.rejection_reason,
             created_at = CURRENT_TIMESTAMP
     """, (
         telegram_id, offer_id, status, otype, vehicle_cl, price, currency,
-        pickup, ends_at, pu_addr, do_addr, est_dist, duration, km_incl, reason
+        pickup, ends_at, pu_addr, do_addr, est_dist, duration, km_incl,
+        guest_requests, flight_number, reason
     ))
     conn.commit()
     conn.close()
@@ -384,6 +406,7 @@ def get_offer_logs(telegram_id: int, limit: int = 10, offset: int = 0):
     c.execute("""
         SELECT offer_id, status, type, vehicle_class, price, currency, pickup_time, ends_at,
                pu_address, do_address, estimated_distance_meters, duration_minutes, km_included,
+               guest_requests, flight_number,
                rejection_reason, created_at
         FROM offer_logs
         WHERE telegram_id = ?
@@ -408,8 +431,10 @@ def get_offer_logs(telegram_id: int, limit: int = 10, offset: int = 0):
             "estimated_distance_meters": r[10],
             "duration_minutes": r[11],
             "km_included": r[12],
-            "rejection_reason": r[13],
-            "created_at": r[14],
+            "guest_requests": r[13],
+            "flight_number": r[14],
+            "rejection_reason": r[15],
+            "created_at": r[16],
         })
     return results
 
