@@ -36,8 +36,12 @@ from db import (
     get_pinned_warnings,
     clear_pinned_warning,
 )
+import os
+from dotenv import load_dotenv
 
-BOT_TOKEN = "8132945480:AAF3iXB6JzZp_cFclqA5LHvniUW5AlXdnpU"
+load_dotenv()  # reads .env in project root
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ---------------- DB Helpers ----------------

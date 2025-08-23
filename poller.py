@@ -26,7 +26,12 @@ from db import (
     set_token_status,
 )
 
-BOT_TOKEN     = "8132945480:AAF3iXB6JzZp_cFclqA5LHvniUW5AlXdnpU"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env in project root
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_HOST      = "https://chauffeur-app-api.blacklane.com"
 POLL_INTERVAL = 2
 MAX_WORKERS   = 10
