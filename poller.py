@@ -37,7 +37,7 @@ POLL_INTERVAL = 2
 MAX_WORKERS   = 10
 
 # Toggle mock data for development
-USE_MOCK = True  # set False to hit live /offers
+USE_MOCK = False  # set False to hit live /offers
 
 # Control noisy output of raw offers (kept for quick diagnostics)
 DEBUG_PRINT_OFFERS = False
