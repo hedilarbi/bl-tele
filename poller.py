@@ -37,7 +37,10 @@ POLL_INTERVAL = 2
 MAX_WORKERS   = 10
 
 # Toggle mock data for development
-USE_MOCK = False  # set True to use mock offers instead of live /offers
+USE_MOCK = True  # set False to hit live /offers
+
+# Control noisy output of raw offers (kept for quick diagnostics)
+DEBUG_PRINT_OFFERS = False
 
 accepted_per_user = defaultdict(set)
 rejected_per_user = defaultdict(set)
@@ -308,7 +311,6 @@ def _build_user_message(offer: dict, status: str, reason: Optional[str], tz_name
     pickup_disp = _fmt_dt_local(pickup_s, tz_name) if pickup_s else "—"
     ends_disp   = _fmt_dt_local(ends_s, tz_name) if ends_s else "—"
 
-    # extra: flight + special requests
     flight_no = None
     if isinstance(rid.get("flight"), dict):
         flight_no = rid.get("flight", {}).get("number")
@@ -364,6 +366,8 @@ def _build_user_message(offer: dict, status: str, reason: Optional[str], tz_name
 
 # ---------- DEBUG PRINT ----------
 def debug_print_offers(telegram_id: int, offers: list):
+    if not DEBUG_PRINT_OFFERS:
+        return
     print(f"[{datetime.now()}] 📥 Received {len(offers)} offer(s) for user {telegram_id}")
     for idx, offer in enumerate(offers, start=1):
         rid = (offer.get("rides") or [{}])[0]
@@ -386,10 +390,6 @@ def debug_print_offers(telegram_id: int, offers: list):
 
 # ---------- Accepted intervals (busy) ----------
 def _load_accepted_intervals(telegram_id: int) -> List[Tuple[datetime, Optional[datetime]]]:
-    """
-    Read previously accepted rides from DB and return list of (start_dt, end_dt).
-    We only keep rows with a parseable pickup_time; end_dt may be None.
-    """
     rows: List[Tuple[datetime, Optional[datetime]]] = []
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -424,11 +424,6 @@ def _find_conflict(
     new_end_iso: Optional[str],
     accepted_intervals: List[Tuple[datetime, Optional[datetime]]],
 ) -> Optional[Tuple[datetime, datetime]]:
-    """
-    Returns the first conflicting (start,end) interval if:
-      - new_start is inside an accepted interval, OR
-      - new interval overlaps any accepted interval (if new_end is known).
-    """
     new_end = None
     if new_end_iso:
         try:
@@ -439,10 +434,8 @@ def _find_conflict(
     for a_start, a_end in accepted_intervals:
         if not a_end:
             continue
-        # Case 1: pickup falls inside an accepted interval
         if a_start <= new_start <= a_end:
             return (a_start, a_end)
-        # Case 2: the new window overlaps the accepted window (if we know new_end)
         if new_end and not (new_end <= a_start or new_start >= a_end):
             return (a_start, a_end)
     return None
@@ -462,7 +455,7 @@ def poll_user(user):
     if USE_MOCK:
         offers = [
             {
-                "type": "ride", "id": "mock-06102355aab-68d230-4384-a5ac-7814e2e62202af52",
+                "type": "ride", "id": "mock-06102355aab-68d230-4384-a5ac-7814edd2e62202af52",
                 "price": 120.9, "currency": "USD",
                 "actions": [{"label": "Accept", "action": "accept", "parameters": []}],
                 "vehicleClass": "van",
@@ -481,7 +474,7 @@ def poll_user(user):
                 }]
             },
             {
-                "type": "ride", "id": "mock-9aeq7a39ef-e4622d12-4f2e1-ab3a-a3398x3d14af79ca",
+                "type": "ride", "id": "mock-9aeq7a39ef-e4622d12-4f2e1-ab3a-a3398x3d214af79ca",
                 "price": 96.05, "currency": "USD",
                 "actions": [{"label": "Accept", "action": "accept", "parameters": []}],
                 "vehicleClass": "business",
@@ -507,34 +500,45 @@ def poll_user(user):
     else:
         # ---- LIVE MODE ----
         if not token or not str(token).strip():
-            pin_warning_if_needed(telegram_id, "no_token")
+            # No token → pin "no token" ONCE (do not replace an existing "expired" pin)
+            existing = get_pinned_warnings(telegram_id)
+            if not existing["expired_msg_id"] and not existing["no_token_msg_id"]:
+                pin_warning_if_needed(telegram_id, "no_token")
             return
 
         status_code, offers = get_offers(token)
 
-        if status_code == 403:
+        # Treat BOTH 401 and 403 as "expired" / invalid session
+        if status_code in (401, 403):
             set_token_status(telegram_id, "expired")
-            pin_warning_if_needed(telegram_id, "expired")
+            existing = get_pinned_warnings(telegram_id)
+            if not existing["expired_msg_id"]:
+                # Unpin "no_token" once (if it was there), then pin "expired" ONCE
+                if existing["no_token_msg_id"]:
+                    tg_unpin_message(telegram_id, existing["no_token_msg_id"])
+                    clear_pinned_warning(telegram_id, "no_token")
+                pin_warning_if_needed(telegram_id, "expired")
             return
         elif status_code == 200:
             set_token_status(telegram_id, "valid")
+            # Clean up any stale warnings (no new pins here)
             unpin_warning_if_any(telegram_id, "expired")
             unpin_warning_if_any(telegram_id, "no_token")
         else:
+            # Network error or unexpected status: do nothing this cycle
             return
 
         if not offers:
             print(f"[{datetime.now()}] ℹ️ No offers for user {telegram_id}")
             return
 
-    # 🔊 Print offers for debugging
+    # (No noisy printing while polling; toggle with DEBUG_PRINT_OFFERS)
     debug_print_offers(telegram_id, offers)
 
     filters        = json.loads(filters_json) if filters_json else {}
     class_state    = get_vehicle_classes_state(telegram_id)
     booked_slots   = get_booked_slots(telegram_id)
     processed_ids  = get_processed_offer_ids(telegram_id)
-    # Load already accepted intervals from DB
     accepted_intervals = _load_accepted_intervals(telegram_id)
 
     for offer in offers:
@@ -617,6 +621,39 @@ def poll_user(user):
             rejected_per_user[telegram_id].add(oid)
             processed_ids.add(oid)
             continue
+
+        # 2.5) Distance (meters) filter — ONLY for transfers using estimatedDistanceMeters
+        if otype == "transfer":
+            dist_m = rid.get("estimatedDistanceMeters")
+            if dist_m is not None:
+                try:
+                    dist_m = float(dist_m)
+                except Exception:
+                    dist_m = None
+            if dist_m is not None:
+                min_km = float(filters.get("min_km", 0) or 0)
+                max_km = float(filters.get("max_km", float("inf")) or float("inf"))
+                min_m = min_km * 1000.0
+                max_m = max_km * 1000.0
+                dist_km = dist_m / 1000.0
+
+                if min_km and dist_m < min_m:
+                    reason = f"distance {dist_km:.1f} km < minimum {min_km:g} km"
+                    print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
+                    log_offer_decision(telegram_id, offer, "rejected", reason)
+                    tg_send_message(telegram_id, _build_user_message(offer, "rejected", reason, tz_name))
+                    rejected_per_user[telegram_id].add(oid)
+                    processed_ids.add(oid)
+                    continue
+
+                if dist_m > max_m:
+                    reason = f"distance {dist_km:.1f} km > maximum {max_km:g} km"
+                    print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
+                    log_offer_decision(telegram_id, offer, "rejected", reason)
+                    tg_send_message(telegram_id, _build_user_message(offer, "rejected", reason, tz_name))
+                    rejected_per_user[telegram_id].add(oid)
+                    processed_ids.add(oid)
+                    continue
 
         # 3) Blacklists
         pickup_terms  = (filters.get("pickup_blacklist")  or [])

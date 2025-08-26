@@ -241,19 +241,24 @@ def build_mobile_sessions_menu(user_id: int):
 
 
 def build_filters_menu(filters_data: dict):
-    min_price = filters_data.get("price_min", 0)
-    max_price = filters_data.get("price_max", 0)
-    work_start = filters_data.get("work_start", "00:00")
-    work_end = filters_data.get("work_end", "00:00")
-    delay = filters_data.get("gap", 120)
+    min_price   = filters_data.get("price_min", 0)
+    max_price   = filters_data.get("price_max", 0)
+    work_start  = filters_data.get("work_start", "00:00")
+    work_end    = filters_data.get("work_end", "00:00")
+    delay       = filters_data.get("gap", 120)
     min_duration = filters_data.get("min_duration", 0)
+    min_km      = filters_data.get("min_km", 0)
+    max_km      = filters_data.get("max_km", 0)
+
     info_text = (
         f"⚙️ *Bot filters*\n\n"
         f"💸 Min price: {min_price}\n"
         f"💸 Max price: {max_price}\n"
         f"🕒 Work schedule: {work_start} – {work_end}\n"
         f"⏳ Delay (gap): {delay} min\n"
-        f"⌛ Min duration: {min_duration} h"
+        f"⌛ Min duration: {min_duration} h\n"
+        f"📏 Min km: {min_km}\n"
+        f"📏 Max km: {max_km}"
     )
     keyboard = [
         [InlineKeyboardButton("📦 Booked slots", callback_data="booked_slots")],
@@ -261,17 +266,18 @@ def build_filters_menu(filters_data: dict):
         [InlineKeyboardButton("🧮 Ends datetime", callback_data="ends_dt")],
         [InlineKeyboardButton("🚗 Change classes", callback_data="change_classes")],
         [InlineKeyboardButton("⚖️ Show current filters", callback_data="show_filters")],
+        [InlineKeyboardButton("🕒 Work schedule", callback_data="work_schedule")],
         [
             InlineKeyboardButton("💸 Change min price", callback_data="change_price_min"),
             InlineKeyboardButton("💸 Change max price", callback_data="change_price_max"),
         ],
         [
-            InlineKeyboardButton("🕒 Change work start", callback_data="change_work_start"),
-            InlineKeyboardButton("🕒 Change work end", callback_data="change_work_end"),
-        ],
-        [
             InlineKeyboardButton("⏳ Change gap (delay)", callback_data="change_gap"),
             InlineKeyboardButton("⌛ Change duration", callback_data="change_min_duration"),
+        ],
+        [
+            InlineKeyboardButton("📏 Change min km", callback_data="change_min_km"),
+            InlineKeyboardButton("📏 Change max km", callback_data="change_max_km"),
         ],
         [
             InlineKeyboardButton("🚫 Pickup blacklist", callback_data="pickup_blacklist"),
@@ -279,6 +285,47 @@ def build_filters_menu(filters_data: dict):
         ],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
     ]
+    return info_text, InlineKeyboardMarkup(keyboard)
+
+# --- Work schedule submenu & prompts ---
+def build_work_schedule_menu(user_id: int):
+    f = get_filters(user_id)
+    ws = f.get("work_start", "00:00")
+    we = f.get("work_end", "00:00")
+    info_text = (
+        "🕒 *Work schedule*\n\n"
+        f"Current: `{ws}` – `{we}`\n\n"
+        "Use *Update schedule* to set start & end (HH:MM)."
+    )
+    keyboard = [
+        [InlineKeyboardButton("✏️ Update schedule", callback_data="update_work_schedule")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")],
+    ]
+    return info_text, InlineKeyboardMarkup(keyboard)
+
+def build_work_schedule_start_prompt():
+    info_text = "🕒 *Enter work START* as `HH:MM` (e.g., `08:00`)."
+    keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]
+    return info_text, InlineKeyboardMarkup(keyboard)
+
+def build_work_schedule_end_prompt():
+    info_text = "🕒 *Enter work END* as `HH:MM` (e.g., `20:00`)."
+    keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]
+    return info_text, InlineKeyboardMarkup(keyboard)
+
+# --- KM prompts ---
+def build_min_km_input_menu():
+    info_text = (
+        "📏 *Enter MIN kilometers* as a float (e.g., `50`)."
+    )
+    keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]
+    return info_text, InlineKeyboardMarkup(keyboard)
+
+def build_max_km_input_menu():
+    info_text = (
+        "📏 *Enter MAX kilometers* as a float (e.g., `150`)."
+    )
+    keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
@@ -525,14 +572,17 @@ def build_stats_view(user_id: int, page: int = 0):
 # ---------------- State ----------------
 user_waiting_input = {}
 adding_slot_step = {}
+work_schedule_state = {}  # holds partial schedule input across two steps
 
 FIELD_MAPPING = {
     "change_price_min": "price_min",
     "change_price_max": "price_max",
-    "change_work_start": "work_start",
-    "change_work_end": "work_end",
+    "change_work_start": "work_start",   # kept for backward compatibility (unused in UI)
+    "change_work_end": "work_end",       # kept for backward compatibility (unused in UI)
     "change_gap": "gap",
     "change_min_duration": "min_duration",
+    "min_km": "min_km",
+    "max_km": "max_km",
 }
 
 
@@ -633,7 +683,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Stats
     if query.data == "statistic":
         info_text, menu = build_stats_view(user_id, page=0)
-        # IMPORTANT: stats are HTML now
         await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
         return
     if query.data.startswith("stats_page:"):
@@ -645,12 +694,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
         return
 
-    # Filters menu
-    if query.data == "filters":
-        info_text, menu = build_filters_menu(get_filters(user_id))
-        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
-        return
-    if query.data == "back_to_filters":
+    # Filters menu & back
+    if query.data in ("filters", "back_to_filters"):
         info_text, menu = build_filters_menu(get_filters(user_id))
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
@@ -701,20 +746,16 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
-    # Work start / end
-    if query.data == "change_work_start":
-        user_waiting_input[user_id] = "work_start"
-        await query.edit_message_text(
-            "🕒 *Enter work start* as `HH:MM` (e.g., `08:00`).",
-            parse_mode="Markdown"
-        )
+    # Work schedule submenu & flow
+    if query.data == "work_schedule":
+        info_text, menu = build_work_schedule_menu(user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
-    if query.data == "change_work_end":
-        user_waiting_input[user_id] = "work_end"
-        await query.edit_message_text(
-            "🕒 *Enter work end* as `HH:MM` (e.g., `20:00`).",
-            parse_mode="Markdown"
-        )
+    if query.data == "update_work_schedule":
+        user_waiting_input[user_id] = "work_schedule_start"
+        work_schedule_state[user_id] = {}
+        info_text, menu = build_work_schedule_start_prompt()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
     # Min duration
@@ -774,16 +815,18 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "add_pickup_blacklist":
         user_waiting_input[user_id] = "pickup_blacklist_add"
         await query.edit_message_text(
-            "✏️ *Send one pickup place/keyword to blacklist* (e.g., `USA`, `New York`, `Boston`)\n\n"
-            "_It will be added to your pickup blacklist._",
+            "✏️ *Send pickup blacklist terms*\n"
+            "• One per message (e.g., `USA`)\n"
+            "• Or multiple separated by commas (e.g., `USA, NYC, Boston`)",
             parse_mode="Markdown",
         )
         return
     if query.data == "add_dropoff_blacklist":
         user_waiting_input[user_id] = "dropoff_blacklist_add"
         await query.edit_message_text(
-            "✏️ *Send one dropoff place/keyword to blacklist* (e.g., `USA`, `New York`, `Boston`)\n\n"
-            "_It will be added to your dropoff blacklist._",
+            "✏️ *Send dropoff blacklist terms*\n"
+            "• One per message (e.g., `USA`)\n"
+            "• Or multiple separated by commas (e.g., `USA, NYC, Boston`)",
             parse_mode="Markdown",
         )
         return
@@ -800,6 +843,18 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "_This will be used to estimate ride end time._",
             parse_mode="Markdown"
         )
+        return
+
+    # KM changes
+    if query.data == "change_min_km":
+        user_waiting_input[user_id] = "min_km"
+        info_text, menu = build_min_km_input_menu()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "change_max_km":
+        user_waiting_input[user_id] = "max_km"
+        info_text, menu = build_max_km_input_menu()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
 
@@ -869,6 +924,52 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
             return
 
+    # Work schedule 2-step flow
+    if user_waiting_input.get(user_id) == "work_schedule_start":
+        # validate HH:MM
+        try:
+            datetime.strptime(text, "%H:%M")
+        except Exception:
+            info_text, menu = build_work_schedule_start_prompt()
+            await update.message.reply_text("❌ Invalid time. Please use `HH:MM` (e.g., `08:00`).", parse_mode="Markdown")
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+        work_schedule_state[user_id] = {"start": text}
+        user_waiting_input[user_id] = "work_schedule_end"
+        info_text, menu = build_work_schedule_end_prompt()
+        await update.message.reply_text("✅ Start time saved.", parse_mode="Markdown")
+        await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    if user_waiting_input.get(user_id) == "work_schedule_end":
+        try:
+            datetime.strptime(text, "%H:%M")
+        except Exception:
+            info_text, menu = build_work_schedule_end_prompt()
+            await update.message.reply_text("❌ Invalid time. Please use `HH:MM` (e.g., `20:00`).", parse_mode="Markdown")
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+        start = (work_schedule_state.get(user_id) or {}).get("start")
+        if not start:
+            # safety: restart flow
+            user_waiting_input[user_id] = "work_schedule_start"
+            info_text, menu = build_work_schedule_start_prompt()
+            await update.message.reply_text("⚠️ Let's try again. Please enter work START.", parse_mode="Markdown")
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+        # Save both
+        filters_data = get_filters(user_id)
+        filters_data["work_start"] = start
+        filters_data["work_end"]   = text
+        update_filters(user_id, json.dumps(filters_data))
+        # cleanup
+        user_waiting_input.pop(user_id, None)
+        work_schedule_state.pop(user_id, None)
+        await update.message.reply_text(f"✅ Work schedule updated to `{start} – {text}`.", parse_mode="Markdown")
+        info_text, menu = build_filters_menu(filters_data)
+        await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
     # Field updates & special inputs
     if user_id in user_waiting_input:
         field = user_waiting_input.pop(user_id)
@@ -888,21 +989,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
             return
 
-        # Add to blacklists
+        # Add to blacklists (single value or comma-separated list)
         if field in ("pickup_blacklist_add", "dropoff_blacklist_add"):
-            if not text:
-                await update.message.reply_text("❌ Please send a non-empty text.")
+            # Normalize to a list of non-empty terms
+            items = [p.strip() for p in text.split(",") if p.strip()]
+            if not items:
+                await update.message.reply_text(
+                    "❌ Please send at least one value (e.g., `USA` or `USA, NYC`).",
+                    parse_mode="Markdown",
+                )
+                # keep the state so they can resend
+                user_waiting_input[user_id] = field
                 return
+
             filters_data = get_filters(user_id)
             key = "pickup_blacklist" if field == "pickup_blacklist_add" else "dropoff_blacklist"
-            lst = filters_data.get(key, []) or []
-            if any(x.lower() == text.lower() for x in lst):
-                await update.message.reply_text(f"ℹ️ '{text}' is already in your { 'pickup' if key=='pickup_blacklist' else 'dropoff' } blacklist.")
-            else:
-                lst.append(text)
-                filters_data[key] = lst
-                update_filters(user_id, json.dumps(filters_data))
-                await update.message.reply_text(f"✅ Added '{text}' to your { 'pickup' if key=='pickup_blacklist' else 'dropoff' } blacklist.")
+            current = filters_data.get(key, []) or []
+
+            # Case-insensitive dedupe
+            current_lower = {x.lower() for x in current}
+            added, skipped = [], []
+            for item in items:
+                if item.lower() in current_lower:
+                    skipped.append(item)
+                else:
+                    current.append(item)
+                    current_lower.add(item.lower())
+                    added.append(item)
+
+            filters_data[key] = current
+            update_filters(user_id, json.dumps(filters_data))
+
+            msg_lines = []
+            if added:
+                msg_lines.append("✅ Added: " + ", ".join(f"`{a}`" for a in added))
+            if skipped:
+                msg_lines.append("ℹ️ Already present: " + ", ".join(f"`{s}`" for s in skipped))
+            await update.message.reply_text(
+                "\n".join(msg_lines) if msg_lines else "Nothing to add.",
+                parse_mode="Markdown"
+            )
+
+            # Show menu again
             if key == "pickup_blacklist":
                 info_text, menu = build_pickup_blacklist_menu(user_id)
             else:
@@ -949,7 +1077,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
             return
 
-        # Work start/end (HH:MM)
+        # Work start/end (legacy direct, not used in UI now)
         if field in ("work_start", "work_end"):
             try:
                 datetime.strptime(text, "%H:%M")
@@ -966,13 +1094,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Numeric fields
         value = text
-        if field in ["price_min", "price_max", "gap", "min_duration"]:
+        if field in ["price_min", "price_max", "gap", "min_duration", "min_km", "max_km"]:
             try:
                 val = float(value)
                 if val <= 0:
                     raise ValueError()
             except:
-                await update.message.reply_text("❌ Please send a float greater than 0.")
+                await update.message.reply_text("❌ Please send a float greater than 0 (e.g., `50`).")
                 return
             value = val
 
