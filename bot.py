@@ -4,7 +4,7 @@ import sqlite3
 import requests
 from datetime import datetime
 from dateutil.tz import gettz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
     CallbackQueryHandler, MessageHandler, filters
@@ -43,6 +43,8 @@ load_dotenv()  # reads .env in project root
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+MINI_APP_BASE = os.getenv("MINI_APP_BASE", "http://localhost:3000")
+BOOKED_SLOTS_URL = f"{MINI_APP_BASE}/booked-slots"
 
 # ---------------- DB Helpers ----------------
 def get_active(telegram_id: int) -> bool:
@@ -261,7 +263,7 @@ def build_filters_menu(filters_data: dict):
         f"📏 Max km: {max_km}"
     )
     keyboard = [
-        [InlineKeyboardButton("📦 Booked slots", callback_data="booked_slots")],
+        [InlineKeyboardButton("📦 Booked slots", web_app=WebAppInfo(url=BOOKED_SLOTS_URL))],
         [InlineKeyboardButton("📅 Schedule (blocked days)", callback_data="schedule")],
         [InlineKeyboardButton("🧮 Ends datetime", callback_data="ends_dt")],
         [InlineKeyboardButton("🚗 Change classes", callback_data="change_classes")],
@@ -708,18 +710,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Booked slots
-    if query.data == "booked_slots":
-        info_text, menu = build_booked_slots_menu(user_id)
-        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
-        return
-    if query.data == "add_booked_slot":
-        adding_slot_step[user_id] = {"step": 1}
-        await query.edit_message_text(
-            "✍️ Send *start date/time* in format `dd/mm/yyyy hh:mm` (your local timezone).",
-            parse_mode="Markdown"
-        )
-        return
 
     # Show filters summary
     if query.data == "show_filters":

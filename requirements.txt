@@ -1,4 +1,10 @@
+# Telegram bot & poller
 python-telegram-bot==20.3
-requests
-python-dateutil
+requests>=2.31.0
+python-dateutil>=2.9.0.post0
 python-dotenv==1.0.1
+
+# Mini-app API (FastAPI)
+fastapi>=0.112.0
+pydantic>=2.8.2
+uvicorn[standard]>=0.30.0
