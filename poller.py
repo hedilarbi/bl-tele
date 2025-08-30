@@ -24,6 +24,7 @@ from db import (
     save_pinned_warning,
     clear_pinned_warning,
     set_token_status,
+    get_blocked_days,     
 )
 
 import os
@@ -37,7 +38,7 @@ POLL_INTERVAL = 2
 MAX_WORKERS   = 10
 
 # Toggle mock data for development
-USE_MOCK = False  # set False to hit live /offers
+USE_MOCK = True  # set False to hit live /offers
 
 # Control noisy output of raw offers (kept for quick diagnostics)
 DEBUG_PRINT_OFFERS = False
@@ -455,18 +456,18 @@ def poll_user(user):
     if USE_MOCK:
         offers = [
             {
-                "type": "ride", "id": "mock-06102355aab-68d230-4384-a5ac-7814edd2e62202af52",
+                "type": "ride", "id": "mock-06102w23255aab-68d2230-4384-a5ac-7814eddddd2e62202af52",
                 "price": 120.9, "currency": "USD",
                 "actions": [{"label": "Accept", "action": "accept", "parameters": []}],
                 "vehicleClass": "van",
                 "rides": [{
                     "type": "hourly",
-                    "createdAt": "2025-08-03T19:40:19Z",
+                    "createdAt": "2025-09-05T19:40:19Z",
                     "pickUpLocation": {
                         "name": "la Vie en Rose Quartiers Dix 30",
                         "address": "la Vie en Rose Quartiers Dix 30, Avenue des Lumières 1600, J4Y 0A5 Brossard, Québec"
                     },
-                    "pickupTime": "2025-08-19T08:45:00-04:00",
+                    "pickupTime": "2025-09-01T08:45:00-04:00",
                     "kmIncluded": 80,
                     "durationMinutes": 120,
                     "guestRequests": ["Baby seat", "VIP pickup"],
@@ -474,13 +475,13 @@ def poll_user(user):
                 }]
             },
             {
-                "type": "ride", "id": "mock-9aeq7a39ef-e4622d12-4f2e1-ab3a-a3398x3d214af79ca",
+                "type": "ride", "id": "mock-9aeq7a39ef-e46x22d12-4f2e1-ab3a-a3398x3d214af79ca",
                 "price": 96.05, "currency": "USD",
                 "actions": [{"label": "Accept", "action": "accept", "parameters": []}],
                 "vehicleClass": "business",
                 "rides": [{
                     "type": "transfer",
-                    "createdAt": "2025-08-03T19:34:08Z",
+                    "createdAt": "2025-08-31T19:34:08Z",
                     "pickUpLocation": {
                         "name": "Centropolis",
                         "address": "Centropolis, Avenue Pierre-Péladeau 1799, H7T 2Y5 Laval, Québec"
@@ -538,6 +539,7 @@ def poll_user(user):
     filters        = json.loads(filters_json) if filters_json else {}
     class_state    = get_vehicle_classes_state(telegram_id)
     booked_slots   = get_booked_slots(telegram_id)
+    blocked_days   = {d["day"] for d in get_blocked_days(telegram_id)}
     processed_ids  = get_processed_offer_ids(telegram_id)
     accepted_intervals = _load_accepted_intervals(telegram_id)
 
@@ -587,7 +589,15 @@ def poll_user(user):
                 rejected_per_user[telegram_id].add(oid)
                 processed_ids.add(oid)
                 continue
-
+            day_key = pickup_local.strftime("%d/%m/%Y")
+            if day_key in blocked_days:
+                reason = f"jour {day_key} bloqué (Schedule)"
+                print(f"[{datetime.now()}] ⛔ Rejected {oid} – blocked day {day_key} (user tz {tz_name})")
+                log_offer_decision(telegram_id, offer, "rejected", reason)
+                tg_send_message(telegram_id, _build_user_message(offer, "rejected", reason, tz_name))
+                rejected_per_user[telegram_id].add(oid)
+                processed_ids.add(oid)
+            continue
         # 1) Gap filter (UTC base)
         gap_min = filters.get("gap", 0)
         if gap_min:

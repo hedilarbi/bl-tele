@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+from fastapi import Query
 # ---------- env ----------
 # Load .env from CWD or parents (like your bot.py does)
 load_dotenv()
@@ -53,6 +53,7 @@ logging.basicConfig(
 
 # ---------- DB hooks ----------
 from db import DB_FILE, get_booked_slots, add_booked_slot
+from db import get_blocked_days, add_blocked_day, delete_blocked_day
 try:
     from db import delete_booked_slot
 except Exception:
@@ -60,6 +61,15 @@ except Exception:
 
 # ---------- app ----------
 app = FastAPI(title="MiniApp API (verbose)")
+
+def _parse_day_ddmmyyyy(s: str) -> datetime | None:
+    try:
+        return datetime.strptime(s.strip(), "%d/%m/%Y")
+    except Exception:
+        return None
+
+def _fmt_day_ddmmyyyy(dt: datetime) -> str:
+    return dt.strftime("%d/%m/%Y")
 
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
@@ -279,3 +289,40 @@ def delete_slot(slot_id: int, Authorization: str | None = Header(default=None)):
     except Exception as e:
         logging.exception("delete_slot SQL error: %s", e)
         raise HTTPException(500, "Could not delete")
+@app.get("/webapp/days")
+def list_blocked_days(
+    Authorization: str | None = Header(default=None),
+    tma: str | None = Query(default=None),
+):
+    logging.info("📅 list_blocked_days tma=%s", tma)
+    uid = _require_user_from_any(Authorization, tma)
+    rows = get_blocked_days(uid)  # [{"id":..., "day":"dd/mm/YYYY"}, ...]
+    days = [r["day"] for r in rows]
+    logging.info("📅 list_blocked_days uid=%s -> %d", uid, len(days))
+    return {"days": days}
+
+class ToggleDayIn(BaseModel):
+    day: str  # "dd/mm/YYYY"
+
+@app.post("/webapp/days/toggle")
+def toggle_blocked_day(payload: ToggleDayIn, Authorization: str | None = Header(default=None)):
+    uid = _require_user(Authorization)
+    day_raw = (payload.day or "").strip()
+    dt = _parse_day_ddmmyyyy(day_raw)
+    if not dt:
+        raise HTTPException(400, detail={"error": "bad_day_format", "expected": "dd/mm/YYYY", "got": day_raw})
+    day = _fmt_day_ddmmyyyy(dt)
+    existing = {d["day"] for d in get_blocked_days(uid)}
+    if day in existing:
+        # unblock
+        # find ID (cheap loop)
+        for d in get_blocked_days(uid):
+            if d["day"] == day:
+                delete_blocked_day(d["id"])
+                logging.info("🟢 unblocked %s for uid=%s", day, uid)
+                return {"ok": True, "blocked": False, "day": day}
+        raise HTTPException(404, "Not found")
+    else:
+        add_blocked_day(uid, day)
+        logging.info("🛑 blocked %s for uid=%s", day, uid)
+        return {"ok": True, "blocked": True, "day": day}
