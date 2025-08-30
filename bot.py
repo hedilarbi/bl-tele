@@ -46,6 +46,7 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 MINI_APP_BASE = os.getenv("MINI_APP_BASE", "http://localhost:3000")
 BOOKED_SLOTS_URL = f"{MINI_APP_BASE}/booked-slots"
 SCHEDULE_URL = f"{MINI_APP_BASE}/schedule"
+CURRENT_SCHEDULE_URL = f"{MINI_APP_BASE}/current-schedule"
 
 # ---------------- DB Helpers ----------------
 def get_active(telegram_id: int) -> bool:
@@ -266,6 +267,7 @@ def build_filters_menu(filters_data: dict):
     keyboard = [
         [InlineKeyboardButton("📦 Booked slots", web_app=WebAppInfo(url=BOOKED_SLOTS_URL))],
         [InlineKeyboardButton("📅 Schedule (blocked days)", web_app=WebAppInfo(url=SCHEDULE_URL))],
+        [InlineKeyboardButton("🗓️ Show current schedule", web_app=WebAppInfo(url=CURRENT_SCHEDULE_URL))],
         [InlineKeyboardButton("🧮 Ends datetime", callback_data="ends_dt")],
         [InlineKeyboardButton("🚗 Change classes", callback_data="change_classes")],
         [InlineKeyboardButton("⚖️ Show current filters", callback_data="show_filters")],

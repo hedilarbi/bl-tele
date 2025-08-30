@@ -6,12 +6,22 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi import Query
+import requests
+import requests
+import uuid
+from fastapi import Header, HTTPException, Query
+from fastapi.responses import JSONResponse
+from datetime import datetime
+from typing import Optional
+from db import DB_FILE, get_booked_slots, add_booked_slot
+from db import get_blocked_days, add_blocked_day, delete_blocked_day
+import sqlite3, uuid
+from fastapi import Query, Header, HTTPException
 # ---------- env ----------
 # Load .env from CWD or parents (like your bot.py does)
 load_dotenv()
 
-from datetime import datetime
-from typing import Optional
+
 
 # Accept both EU, US and HTML5 datetime-local (with/without seconds)
 ACCEPTED_FORMATS = (
@@ -52,8 +62,7 @@ logging.basicConfig(
 )
 
 # ---------- DB hooks ----------
-from db import DB_FILE, get_booked_slots, add_booked_slot
-from db import get_blocked_days, add_blocked_day, delete_blocked_day
+
 try:
     from db import delete_booked_slot
 except Exception:
@@ -61,6 +70,20 @@ except Exception:
 
 # ---------- app ----------
 app = FastAPI(title="MiniApp API (verbose)")
+
+API_HOST = "https://chauffeur-app-api.blacklane.com"
+
+def _get_user_token(uid: int) -> str | None:
+    # Your existing way to fetch the user’s mobile session token from DB.
+    # If you already have a helper in db.py, use that instead.
+    import sqlite3
+    from db import DB_FILE
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT token FROM users WHERE telegram_id = ?", (uid,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
 
 def _parse_day_ddmmyyyy(s: str) -> datetime | None:
     try:
@@ -85,7 +108,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-from fastapi import Query, Header, HTTPException
+
 
 def _require_user_from_any(auth_header: str | None, tma_qs: str | None) -> int:
     # dev bypass still works
@@ -326,3 +349,33 @@ def toggle_blocked_day(payload: ToggleDayIn, Authorization: str | None = Header(
         add_blocked_day(uid, day)
         logging.info("🛑 blocked %s for uid=%s", day, uid)
         return {"ok": True, "blocked": True, "day": day}
+    
+@app.get("/webapp/rides")
+def list_user_rides(
+    Authorization: str | None = Header(default=None),
+    page: int = Query(0),
+    limit: int = Query(30),
+    status: str | None = Query(default=None),
+):
+    uid = _require_user(Authorization)
+    token = _get_user_token(uid)
+    if not token:
+        raise HTTPException(401, detail={"error": "no_token", "hint": "Add your mobile session token."})
+
+    headers = {
+        "Host": API_HOST.replace("https://", ""),
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Authorization": token,               # SAME as poller
+        "X-Request-ID": str(uuid.uuid4()),
+        "X-Correlation-ID": str(uuid.uuid4()),
+    }
+    
+
+    try:
+        r = requests.get(f"{API_HOST}/rides", headers=headers, timeout=15)
+        # Return upstream status + body as JSON
+        data = r.json()
+        return JSONResponse(status_code=r.status_code, content=data)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(502, detail="upstream_error")
