@@ -39,11 +39,11 @@ POLL_INTERVAL = 2
 MAX_WORKERS   = 10
 
 # Toggle mock data for development
-USE_MOCK = True  # set False to hit live /offers
+USE_MOCK = False  # set False to hit live /offers
 
 # Control noisy output of raw offers (kept for quick diagnostics)
 DEBUG_PRINT_OFFERS = False
-CF_DEBUG = True  # extra debug for custom filters
+CF_DEBUG = False  # extra debug for custom filters
 accepted_per_user = defaultdict(set)
 rejected_per_user = defaultdict(set)
 
