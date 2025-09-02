@@ -272,6 +272,8 @@ def build_filters_menu(filters_data: dict):
         [InlineKeyboardButton("🚗 Change classes", callback_data="change_classes")],
         [InlineKeyboardButton("⚖️ Show current filters", callback_data="show_filters")],
         [InlineKeyboardButton("🕒 Work schedule", callback_data="work_schedule")],
+        [InlineKeyboardButton("🧩 Custom filters", web_app=WebAppInfo(url=f"{MINI_APP_BASE}/custom-filters"))],
+
         [
             InlineKeyboardButton("💸 Change min price", callback_data="change_price_min"),
             InlineKeyboardButton("💸 Change max price", callback_data="change_price_max"),

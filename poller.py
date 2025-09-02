@@ -24,9 +24,10 @@ from db import (
     save_pinned_warning,
     clear_pinned_warning,
     set_token_status,
-    get_blocked_days,     
+    get_blocked_days,   
+    list_user_custom_filters,  
 )
-
+import json as _json
 import os
 from dotenv import load_dotenv
 
@@ -38,11 +39,11 @@ POLL_INTERVAL = 2
 MAX_WORKERS   = 10
 
 # Toggle mock data for development
-USE_MOCK = False  # set False to hit live /offers
+USE_MOCK = True  # set False to hit live /offers
 
 # Control noisy output of raw offers (kept for quick diagnostics)
 DEBUG_PRINT_OFFERS = False
-
+CF_DEBUG = True  # extra debug for custom filters
 accepted_per_user = defaultdict(set)
 rejected_per_user = defaultdict(set)
 
@@ -57,6 +58,72 @@ def _esc(s: Optional[str]) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+def _get_enabled_filter_slugs(telegram_id: int):
+    items = list_user_custom_filters(telegram_id)
+    return {it["slug"]: it for it in items if it["global_enabled"] and it["user_enabled"]}
+def _filter_pickup_airport_reject(offer: dict) -> tuple[str|None, str|None]:
+    rid = (offer.get("rides") or [{}])[0]
+    pu = (rid.get("pickUpLocation") or {}).get("address") or (rid.get("pickUpLocation") or {}).get("name") or ""
+    text = (pu or "").lower()
+    matched = next((k for k in ["airport", "aéroport"] if k in text), None)
+    if matched:
+       if CF_DEBUG:
+           try:
+               oid = offer.get("id")
+               print(f"[{datetime.now()}] 🧪 CF fired: pickup_airport_reject (match='{matched}') "
+                     f"for offer={oid} PU='{pu}'")
+           except Exception:
+               pass
+       return "reject", "pickup contains 'airport'"
+
+   
+    return None, None
+def _filter_reject_under_90_between_20_22(offer: dict, tz_name: str, min_price: float = 90.0,
+                                          win_from="20:00", win_to="22:00") -> tuple[str|None, str|None]:
+    rid = (offer.get("rides") or [{}])[0]
+    if not rid.get("pickupTime"): return None, None
+    # localize pickup to user tz
+    try:
+        pu_dt = parser.isoparse(rid["pickupTime"])
+        pu_local = pu_dt.astimezone(gettz(tz_name))
+        # time window
+        fH, fM = [int(x) for x in win_from.split(":")]
+        tH, tM = [int(x) for x in win_to.split(":")]
+        within = (fH, fM) <= (pu_local.hour, pu_local.minute) <= (tH, tM)
+    except Exception:
+        within = False
+    if not within:
+        return None, None
+    price = float(offer.get("price") or 0)
+    if price < float(min_price):
+        return "reject", f"price {price:.0f} < {min_price:.0f} between {win_from}-{win_to}"
+    return None, None
+def _run_custom_filters(offer: dict, enabled_map: dict, tz_name: str):
+    # Add a case per slug (simple)
+    if "pickup_airport_reject" in enabled_map:
+        d, r = _filter_pickup_airport_reject(offer)
+        if d:
+           # extra breadcrumb (already logged inside the filter, but keeps things obvious here too)
+            if CF_DEBUG:
+                print(f"[{datetime.now()}] 🔔 Decision from CF 'pickup_airport_reject': {d} – {r}")
+            return d, r
+
+    if "reject_under_90_between_20_22" in enabled_map:
+        # read optional params if you ever stored them
+        try:
+            params = _json.loads(enabled_map["reject_under_90_between_20_22"]["params"] or "{}")
+        except Exception:
+            params = {}
+        d, r = _filter_reject_under_90_between_20_22(
+            offer, tz_name,
+            float(params.get("min_price", 90)),
+            params.get("from", "20:00"),
+            params.get("to", "22:00"),
+        )
+        if d: return d, r
+
+    return None, None
+
 
 def _fmt_money(price, currency) -> str:
     if price is None:
@@ -456,7 +523,7 @@ def poll_user(user):
     if USE_MOCK:
         offers = [
             {
-                "type": "ride", "id": "mock-06102w23255aab-68d2230-4384-a5ac-7814eddddd2e62202af52",
+                "type": "ride", "id": "mock-0f2255aab-68d2230-4384-a5ac-7814eddddfsgd2e621202af52",
                 "price": 120.9, "currency": "USD",
                 "actions": [{"label": "Accept", "action": "accept", "parameters": []}],
                 "vehicleClass": "van",
@@ -465,9 +532,9 @@ def poll_user(user):
                     "createdAt": "2025-09-05T19:40:19Z",
                     "pickUpLocation": {
                         "name": "la Vie en Rose Quartiers Dix 30",
-                        "address": "la Vie en Rose Quartiers Dix 30, Avenue des Lumières 1600, J4Y 0A5 Brossard, Québec"
+                        "address": "la Vie en Rose Quartiers Dix 30, Avenue des Lumières 1600, J4Y 0A5 Brossard, Québec, airport"
                     },
-                    "pickupTime": "2025-09-01T08:45:00-04:00",
+                    "pickupTime": "2025-09-02T08:45:00-04:00",
                     "kmIncluded": 80,
                     "durationMinutes": 120,
                     "guestRequests": ["Baby seat", "VIP pickup"],
@@ -542,6 +609,24 @@ def poll_user(user):
     blocked_days   = {d["day"] for d in get_blocked_days(telegram_id)}
     processed_ids  = get_processed_offer_ids(telegram_id)
     accepted_intervals = _load_accepted_intervals(telegram_id)
+    # Log ALL assigned CFs for this user (global vs user vs params)
+    assigned_cfs = list_user_custom_filters(telegram_id)
+    if CF_DEBUG:
+        print(f"[{datetime.now()}] 🧾 Assigned CFs for {telegram_id}:")
+        for it in assigned_cfs:
+            try:
+                print("   - {slug} | global={g} user={u} | params={p}".format(
+                    slug=it.get("slug"),
+                    g=int(bool(it.get("global_enabled"))),
+                    u=int(bool(it.get("user_enabled"))),
+                    p=it.get("params"),
+                ))
+            except Exception:
+                pass
+
+    user_cfilters = _get_enabled_filter_slugs(telegram_id)
+    if CF_DEBUG:
+        print(f"[{datetime.now()}] ✅ Enabled CFs (effective) for {telegram_id}: {list(user_cfilters.keys())}")
 
     for offer in offers:
         oid = offer.get("id")
@@ -574,6 +659,7 @@ def poll_user(user):
                 offer["rides"][0]["_endCalc"] = end_calc
 
         # 0) Working hours (user timezone)
+       # 0) Working hours (user timezone)
         ws = filters.get("work_start")
         we = filters.get("work_end")
         if ws and we:
@@ -581,6 +667,7 @@ def poll_user(user):
             pickup_t = pickup_local.time()
             start_t  = datetime.strptime(ws, "%H:%M").time()
             end_t    = datetime.strptime(we, "%H:%M").time()
+
             if not (start_t <= pickup_t <= end_t):
                 reason = f"heure pickup {pickup_t.strftime('%H:%M')} hors plage {ws}–{we}"
                 print(f"[{datetime.now()}] ⛔ Rejected {oid} – outside work hours {ws}-{we} (user tz {tz_name})")
@@ -588,7 +675,8 @@ def poll_user(user):
                 tg_send_message(telegram_id, _build_user_message(offer, "rejected", reason, tz_name))
                 rejected_per_user[telegram_id].add(oid)
                 processed_ids.add(oid)
-                continue
+                continue  # only continue when rejected
+
             day_key = pickup_local.strftime("%d/%m/%Y")
             if day_key in blocked_days:
                 reason = f"jour {day_key} bloqué (Schedule)"
@@ -597,7 +685,9 @@ def poll_user(user):
                 tg_send_message(telegram_id, _build_user_message(offer, "rejected", reason, tz_name))
                 rejected_per_user[telegram_id].add(oid)
                 processed_ids.add(oid)
-            continue
+                continue  # only continue when rejected
+# no continue here → fall through to custom filters
+
         # 1) Gap filter (UTC base)
         gap_min = filters.get("gap", 0)
         if gap_min:
@@ -611,6 +701,24 @@ def poll_user(user):
                 rejected_per_user[telegram_id].add(oid)
                 processed_ids.add(oid)
                 continue
+        decision, reason_txt = _run_custom_filters(offer, user_cfilters, tz_name)
+        if decision == "reject":
+            if CF_DEBUG:
+              print(f"[{datetime.now()}] ⛔ Custom filter rejected offer {oid}: {reason_txt}")
+            log_offer_decision(telegram_id, offer, "rejected", reason_txt)
+            tg_send_message(telegram_id, _build_user_message(offer, "rejected", reason_txt, tz_name))
+            rejected_per_user[telegram_id].add(oid); processed_ids.add(oid)
+            continue
+        elif decision == "accept":
+            if CF_DEBUG:
+               print(f"[{datetime.now()}] ✅ Custom filter accepted offer {oid}: {reason_txt or 'custom filter'}")
+            offer_to_log = deepcopy(offer)
+            log_offer_decision(telegram_id, offer_to_log, "accepted", reason_txt or "custom filter")
+            tg_send_message(telegram_id, _build_user_message(offer_to_log, "accepted", reason_txt, tz_name))
+            accepted_per_user[telegram_id].add(oid); processed_ids.add(oid)
+            # add interval …
+            ...
+            continue
 
         # 2) Price filter
         min_p = filters.get("price_min", 0)

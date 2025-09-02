@@ -13,15 +13,23 @@ from fastapi import Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from datetime import datetime
 from typing import Optional
-from db import DB_FILE, get_booked_slots, add_booked_slot
-from db import get_blocked_days, add_blocked_day, delete_blocked_day
+from db import DB_FILE, get_booked_slots, add_booked_slot, list_user_custom_filters, toggle_user_custom_filter
+from db import get_blocked_days, add_blocked_day, delete_blocked_day 
+from db import (
+   
+    get_all_users,
+    list_all_custom_filters, create_custom_filter, update_custom_filter,
+     assign_custom_filter, unassign_custom_filter
+)
 import sqlite3, uuid
 from fastapi import Query, Header, HTTPException
+
+
 # ---------- env ----------
 # Load .env from CWD or parents (like your bot.py does)
 load_dotenv()
 
-
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 # Accept both EU, US and HTML5 datetime-local (with/without seconds)
 ACCEPTED_FORMATS = (
@@ -72,6 +80,37 @@ except Exception:
 app = FastAPI(title="MiniApp API (verbose)")
 
 API_HOST = "https://chauffeur-app-api.blacklane.com"
+
+
+def _require_admin(Authorization: str | None):
+    if not Authorization or not Authorization.startswith("admin "):
+        raise HTTPException(401, "Use Authorization: admin <token>")
+    token = Authorization[6:].strip()
+    if token != ADMIN_TOKEN:
+        raise HTTPException(403, "Invalid admin token")
+    
+from db import init_db  # add this import at top
+
+@app.on_event("startup")
+async def _startup():
+    init_db()  # <-- run schema/migrations here
+    logging.info("🚀 FastAPI starting")
+    logging.info("🔐 DEV_SKIP_TMA=%s DEV_FAKE_USER_ID=%s", DEV_SKIP_TMA, DEV_FAKE_USER_ID or "—")
+    logging.info("🗄️  DB_FILE=%s", DB_FILE)
+    if ALLOWED_ORIGINS:
+        logging.info("🌐 CORS allow_origins=%s", ", ".join(ALLOWED_ORIGINS))
+    else:
+        logging.info("🌐 CORS allow_origins=* (dev)")
+
+    
+@app.get("/admin/users")
+def admin_list_users(Authorization: str | None = Header(default=None)):
+    _require_admin(Authorization)
+    conn = sqlite3.connect(DB_FILE); cur = conn.cursor()
+    cur.execute("SELECT telegram_id, active FROM users ORDER BY telegram_id ASC")
+    rows = cur.fetchall(); conn.close()
+    users = [{"id": r[0], "telegram_id": r[0], "active": bool(r[1])} for r in rows]
+    return {"users": users}
 
 def _get_user_token(uid: int) -> str | None:
     # Your existing way to fetch the user’s mobile session token from DB.
@@ -379,3 +418,120 @@ def list_user_rides(
         return JSONResponse(status_code=r.status_code, content=data)
     except requests.exceptions.RequestException as e:
         raise HTTPException(502, detail="upstream_error")
+@app.get("/admin/users")
+def admin_users(Authorization: str | None = Header(default=None)):
+    _require_admin(Authorization)
+    rows = get_all_users()
+    return {"users": [{"telegram_id": r[0], "active": bool(r[3])} for r in rows]}
+
+
+@app.get("/admin/custom-filters")
+def admin_list_filters(Authorization: str | None = Header(default=None)):
+    _require_admin(Authorization)
+    return {"filters": list_all_custom_filters()}
+
+class AdminCreateCF(BaseModel):
+    slug: str
+    name: str
+    description: str | None = ""
+    params: dict | None = None
+    global_enabled: bool = True
+    rule_kind: str | None = "generic"
+    rule_code: str | None = None
+
+@app.post("/admin/custom-filters")
+def admin_create_filter(payload: AdminCreateCF, Authorization: str | None = Header(default=None)):
+    _require_admin(Authorization)
+    slug = payload.slug.strip().lower()
+    if not slug or not all(ch.isalnum() or ch in "-_." for ch in slug):
+        raise HTTPException(400, "Bad slug")
+    create_custom_filter(
+        slug,
+        payload.name.strip(),
+        payload.description or "",
+        payload.params or {},
+        payload.global_enabled,
+        rule_kind=(payload.rule_kind or "generic"),
+        rule_code=payload.rule_code,
+    )
+    return {"ok": True}
+
+class AdminPatchCF(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    params: dict | None = None
+    global_enabled: bool | None = None
+    rule_kind: str | None = None
+    rule_code: str | None = None
+
+
+
+@app.patch("/admin/custom-filters/{slug}")
+def admin_update_filter(slug: str, payload: AdminPatchCF, Authorization: str | None = Header(default=None)):
+    _require_admin(Authorization)
+    update_custom_filter(slug, **{k:v for k,v in payload.dict().items() if v is not None})
+    return {"ok": True}
+
+# --- Admin: assign/unassign/toggle for a user ---
+@app.get("/admin/users/{telegram_id}/custom-filters")
+def admin_user_filters(telegram_id: int, Authorization: str | None = Header(default=None)):
+    _require_admin(Authorization)
+    assigned = list_user_custom_filters(telegram_id)
+    return {"assigned": assigned, "all": list_all_custom_filters()}
+
+@app.post("/admin/users/{telegram_id}/custom-filters/{slug}")
+def admin_assign_cf(telegram_id: int, slug: str, Authorization: str | None = Header(default=None)):
+    _require_admin(Authorization)
+    assign_custom_filter(telegram_id, slug, True)
+    return {"ok": True}
+
+@app.delete("/admin/users/{telegram_id}/custom-filters/{slug}")
+def admin_unassign_cf(telegram_id: int, slug: str, Authorization: str | None = Header(default=None)):
+    _require_admin(Authorization)
+    unassign_custom_filter(telegram_id, slug)
+    return {"ok": True}
+
+class AdminToggleUserCF(BaseModel):
+    enabled: bool
+
+@app.patch("/admin/users/{telegram_id}/custom-filters/{slug}")
+def admin_toggle_user_cf(telegram_id: int, slug: str, payload: AdminToggleUserCF, Authorization: str | None = Header(default=None)):
+    _require_admin(Authorization)
+    toggle_user_custom_filter(telegram_id, slug, payload.enabled)
+    return {"ok": True}
+# ---- WebApp: list/toggle my custom filters ----
+class ToggleMyCF(BaseModel):
+    enabled: bool
+
+@app.get("/webapp/custom-filters")
+def webapp_list_my_filters(
+    Authorization: str | None = Header(default=None),
+    tma: str | None = Query(default=None),
+):
+    uid = _require_user_from_any(Authorization, tma)
+    rows = list_user_custom_filters(uid)  # [{slug, name, description, global_enabled, user_enabled, params}]
+    # Only show assigned filters; expose a simple shape the UI expects
+    items = []
+    for r in rows:
+        effective_enabled = bool(r.get("user_enabled")) and bool(r.get("global_enabled", 1))
+        items.append({
+            "slug": r["slug"],
+            "name": r["name"],
+            "enabled": effective_enabled,  # UI reads it.enabled
+        })
+    return {"filters": items}
+
+@app.post("/webapp/custom-filters/{slug}/toggle")
+def webapp_toggle_my_filter(
+    slug: str,
+    payload: ToggleMyCF,
+    Authorization: str | None = Header(default=None),
+):
+    uid = _require_user(Authorization)
+    # assign (insert-or-update) and set enabled state
+    toggle_user_custom_filter(uid, slug, bool(payload.enabled))
+    return {"ok": True}
+
+
+
+
