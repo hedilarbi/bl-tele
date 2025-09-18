@@ -29,7 +29,7 @@ from db import (
     set_bl_account, get_bl_account,           # may be sanitized (no password)
     get_portal_token, update_portal_token,
     get_bl_uuid, get_user_timezone, get_endtime_formulas,
-    replace_endtime_formulas, add_endtime_formula, delete_endtime_formula,
+    replace_endtime_formulas, add_endtime_formula, delete_endtime_formula,set_bl_uuid,
 )
 
 try:
@@ -47,6 +47,8 @@ if not BOT_TOKEN:
 API_HOST = "https://chauffeur-app-api.blacklane.com"  # mobile fallback
 ATHENA_BASE = "https://athena.blacklane.com"
 PORTAL_CLIENT_ID = os.getenv("BL_PORTAL_CLIENT_ID", "7qL5jGGai6MqBCatVeoihQx5dKEhrNCh")
+PARTNER_PORTAL_API = os.getenv("PARTNER_PORTAL_API", "https://partner-portal-api.blacklane.com")
+
 PORTAL_PAGE_SIZE = 50
 
 # ----------------- Logging -----------------
@@ -396,6 +398,25 @@ def _athena_login(email: str, password: str) -> Tuple[bool, Optional[str], str]:
         return False, None, f"upstream:{r.status_code}"
     except requests.exceptions.RequestException as e:
         return False, None, f"network:{type(e).__name__}"
+    
+def _portal_get_me(access_token: str) -> Tuple[Optional[int], Optional[dict]]:
+    url = f"{PARTNER_PORTAL_API}/me"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "BLPortal/uuid-fetch (+miniapp)",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if 200 <= r.status_code < 300:
+            try:
+                return r.status_code, r.json()
+            except Exception:
+                return r.status_code, None
+        return r.status_code, None
+    except requests.exceptions.RequestException:
+        return None, None
+
 
 def _hades_fetch_plain(token: str, page: int, page_size: int) -> Tuple[int, Optional[dict]]:
     url = (
@@ -877,14 +898,47 @@ def webapp_get_bl_account(Authorization: Optional[str] = Header(default=None), t
     return {"email": acc.get("email")}
 
 @app.post("/webapp/bl-account")
-def webapp_save_bl_account(payload: BLAccountIn, Authorization: Optional[str] = Header(default=None), tma: Optional[str] = Query(default=None)):
+def webapp_save_bl_account(
+    payload: BLAccountIn,
+    Authorization: Optional[str] = Header(default=None),
+    tma: Optional[str] = Query(default=None),
+):
     uid = _require_user_from_any(Authorization, tma)
+
     email = (payload.email or "").strip()
     password = (payload.password or "").strip()
     if not email or not password:
         raise HTTPException(400, detail={"error": "missing_fields"})
+
+    # 1) Save credentials
     set_bl_account(uid, email, password)
-    return {"ok": True}
+
+    # 2) Login to Athena
+    ok, token, note = _athena_login(email, password)
+    if not ok or not token:
+        if str(note).startswith("unauthorized:"):
+            # exact per your ask
+            raise HTTPException(status_code=401, detail={"error": "invalid_credentials"})
+        raise HTTPException(status_code=502, detail={"error": "portal_login_failed", "note": note})
+
+    # 3) Persist portal token
+    update_portal_token(uid, token)
+
+    # 4) Fetch UUID from Partner Portal /me
+    status, me = _portal_get_me(token)
+    if not status:
+        raise HTTPException(status_code=502, detail={"error": "portal_me_failed", "note": "network"})
+    if not (200 <= status < 300) or not isinstance(me, dict):
+        raise HTTPException(status_code=502, detail={"error": "portal_me_failed", "status": status})
+
+    bl_id = (me or {}).get("id")
+    if isinstance(bl_id, str) and bl_id.strip():
+        set_bl_uuid(uid, bl_id.strip())
+        return {"ok": True, "uuid": bl_id}
+
+    # Token worked but response lacked id
+    raise HTTPException(status_code=502, detail={"error": "portal_me_no_id"})
+
 
 # --- Admin: users listing ---
 @app.get("/admin/users")
