@@ -2,11 +2,37 @@
 
 import sqlite3, json as _json, os
 from datetime import datetime as _dt
+from datetime import datetime
 
 DB_FILE = "users.db"
 
 # ✅ Vehicle classes we support
 VEHICLE_CLASSES = ["SUV", "VAN", "Business", "First", "Electric", "Sprinter"]
+
+def _add_column(cur, table, column, coltype):
+    try:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e).lower():
+            pass
+        else:
+            raise
+
+def _ensure_tg_user_columns(cur):
+    cols = [
+        ("tg_first_name", "TEXT"),
+        ("tg_last_name", "TEXT"),
+        ("tg_username", "TEXT"),
+        ("tg_lang", "TEXT"),
+        ("tg_is_premium", "INTEGER"),
+        ("tg_last_seen", "TEXT"),
+        ("tg_first_seen", "TEXT"),
+        ("tg_chat_type", "TEXT"),
+        ("tg_chat_id", "INTEGER"),
+        ("tg_chat_title", "TEXT"),
+    ]
+    for name, typ in cols:
+        _add_column(cur, "users", name, typ)
 
 
 def init_db():
@@ -38,6 +64,39 @@ def init_db():
     for alter_sql in [
         "ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'UTC'",
         "ALTER TABLE users ADD COLUMN token_status TEXT DEFAULT 'unknown'"
+    ]:
+        try:
+            c.execute(alter_sql)
+        except Exception:
+            pass
+    for alter_sql in [
+        "ALTER TABLE users ADD COLUMN notify_accepted INTEGER DEFAULT 1",
+        "ALTER TABLE users ADD COLUMN notify_not_accepted INTEGER DEFAULT 1",
+        "ALTER TABLE users ADD COLUMN notify_rejected INTEGER DEFAULT 1",
+    ]:
+        try:
+            c.execute(alter_sql)
+        except Exception:
+            pass
+    for alter_sql in [
+        "ALTER TABLE users ADD COLUMN bl_email TEXT",
+        "ALTER TABLE users ADD COLUMN bl_password TEXT"  # store hashed/encrypted or plaintext (see helpers below)
+    ]:
+        try:
+            c.execute(alter_sql)
+        except Exception:
+            pass
+    for alter_sql in [
+        "ALTER TABLE users ADD COLUMN portal_token TEXT"
+    ]:
+        try:
+            c.execute(alter_sql)
+        except Exception:
+            pass
+
+        # --- store Blacklane profile uuid ---
+    for alter_sql in [
+        "ALTER TABLE users ADD COLUMN bl_uuid TEXT"
     ]:
         try:
             c.execute(alter_sql)
@@ -163,12 +222,71 @@ def init_db():
     try: c.execute("UPDATE custom_filters SET matcher   = COALESCE(matcher,'') WHERE matcher IS NULL")
     except Exception: pass
 
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS endtime_formulas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            start_hhmm TEXT,               -- 'HH:MM' or NULL for default/else
+            end_hhmm   TEXT,               -- 'HH:MM' or NULL for default/else
+            speed_kmh  REAL NOT NULL,
+            bonus_min  REAL NOT NULL DEFAULT 0,
+            priority   INTEGER NOT NULL DEFAULT 0,  -- lower first
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+        )
+    ''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_endtime_formulas_user ON endtime_formulas(telegram_id, priority, id)')
 
+    _ensure_tg_user_columns(c)
 
     conn.commit()
     conn.close()
 
+def upsert_user_from_bot(user_obj: dict, chat_obj: dict | None = None):
+    """
+    user_obj: dict with keys like id, first_name, last_name, username, language_code, is_premium
+              (e.g. telegram.User.to_dict() or manually mapped)
+    chat_obj: optional dict (telegram.Chat.to_dict()) to capture context
+    """
+    if not user_obj or "id" not in user_obj: 
+        return
+    uid = int(user_obj["id"])
 
+    first = user_obj.get("first_name") or None
+    last  = user_obj.get("last_name") or None
+    uname = user_obj.get("username") or None
+    lang  = user_obj.get("language_code") or None
+    prem  = 1 if user_obj.get("is_premium") else 0
+
+    chat_obj = chat_obj or {}
+    chat_type  = chat_obj.get("type") or None
+    chat_id    = chat_obj.get("id") or None
+    chat_title = chat_obj.get("title") or None
+
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    # ensure row exists
+    cur.execute("INSERT OR IGNORE INTO users(telegram_id, active) VALUES (?, 1)", (uid,))
+    # if first_seen is NULL, set it now
+    cur.execute("""
+        UPDATE users
+           SET tg_first_name = ?,
+               tg_last_name  = ?,
+               tg_username   = ?,
+               tg_lang       = ?,
+               tg_is_premium = ?,
+               tg_last_seen  = ?,
+               tg_chat_type  = ?,
+               tg_chat_id    = ?,
+               tg_chat_title = ?,
+               tg_first_seen = COALESCE(tg_first_seen, ?)
+         WHERE telegram_id = ?
+    """, (first, last, uname, lang, prem, now, chat_type, chat_id, chat_title, now, uid))
+
+    conn.commit(); conn.close()
 # ---------------- USERS ----------------
 def add_user(telegram_id: int):
     conn = sqlite3.connect(DB_FILE)
@@ -195,6 +313,21 @@ def set_token_status(telegram_id: int, status: str):
     c.execute("UPDATE users SET token_status = ? WHERE telegram_id = ?", (status, telegram_id))
     conn.commit()
     conn.close()
+def update_portal_token(telegram_id: int, token: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET portal_token = ? WHERE telegram_id = ?", (token, telegram_id))
+    conn.commit()
+    conn.close()
+
+def get_portal_token(telegram_id: int) -> str | None:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT portal_token FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
 
 
 def get_token_status(telegram_id: int) -> str:
@@ -727,3 +860,141 @@ def _default_for_sqlite_type(type_str: str):
     if "BLOB" in t: return b""
     # TEXT / unknown
     return ""
+def get_notifications(telegram_id: int) -> dict:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT 
+            COALESCE(notify_accepted,1),
+            COALESCE(notify_not_accepted,1),
+            COALESCE(notify_rejected,1)
+        FROM users WHERE telegram_id = ?
+    """, (telegram_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return {"accepted": True, "not_accepted": True, "rejected": True}
+    return {
+        "accepted":      bool(row[0]),
+        "not_accepted":  bool(row[1]),
+        "rejected":      bool(row[2]),
+    }
+
+
+def set_notification(telegram_id: int, kind: str, enabled: bool):
+    colmap = {
+        "accepted": "notify_accepted",
+        "not_accepted": "notify_not_accepted",
+        "rejected": "notify_rejected",
+    }
+    col = colmap.get(kind)
+    if not col:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(f"UPDATE users SET {col} = ? WHERE telegram_id = ?", (1 if enabled else 0, telegram_id))
+    conn.commit()
+    conn.close()
+
+def set_bl_account(telegram_id: int, email: str, password: str):
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute("UPDATE users SET bl_email=?, bl_password=? WHERE telegram_id=?",
+              (email.strip(), password.strip(), telegram_id))
+    conn.commit(); conn.close()
+
+def get_bl_account(telegram_id: int):
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute("SELECT bl_email, bl_password FROM users WHERE telegram_id=?", (telegram_id,))
+    row = c.fetchone(); conn.close()
+    if not row: return {"email": None, "has_password": False}
+    return {"email": row[0], "has_password": bool(row[1])}
+
+def get_bl_account_full(telegram_id: int):
+    """Return both email and password (or (None, None) if missing)."""
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute("SELECT bl_email, bl_password FROM users WHERE telegram_id=?", (telegram_id,))
+    row = c.fetchone(); conn.close()
+    if not row:
+        return None, None
+    email, password = row[0], row[1]
+    if not email or not password:
+        return None, None
+    return email, password
+
+def get_endtime_formulas(telegram_id: int):
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute('''
+        SELECT id, start_hhmm, end_hhmm, speed_kmh, bonus_min, priority
+        FROM endtime_formulas
+        WHERE telegram_id = ?
+        ORDER BY priority ASC, COALESCE(start_hhmm,''), COALESCE(end_hhmm,'')
+    ''', (telegram_id,))
+    rows = c.fetchall(); conn.close()
+    return [
+        {"id": r[0], "start": r[1], "end": r[2],
+         "speed_kmh": r[3], "bonus_min": r[4], "priority": r[5]}
+        for r in rows
+    ]
+
+def replace_endtime_formulas(telegram_id: int, items: list[dict]):
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute('DELETE FROM endtime_formulas WHERE telegram_id=?', (telegram_id,))
+    for it in items:
+        c.execute('''
+            INSERT INTO endtime_formulas (telegram_id, start_hhmm, end_hhmm, speed_kmh, bonus_min, priority)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            telegram_id,
+            (it.get("start") or None),
+            (it.get("end") or None),
+            float(it["speed_kmh"]),
+            float(it.get("bonus_min", 0) or 0),
+            int(it.get("priority", 0) or 0),
+        ))
+    conn.commit(); conn.close()
+
+def add_endtime_formula(telegram_id: int, start: str|None, end: str|None,
+                        speed_kmh: float, bonus_min: float = 0, priority: int = 0):
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute('''
+        INSERT INTO endtime_formulas (telegram_id, start_hhmm, end_hhmm, speed_kmh, bonus_min, priority)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (telegram_id, start, end, float(speed_kmh), float(bonus_min or 0), int(priority or 0)))
+    conn.commit(); conn.close()
+
+def delete_endtime_formula(telegram_id: int, formula_id: int):
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute('DELETE FROM endtime_formulas WHERE id=? AND telegram_id=?', (formula_id, telegram_id))
+    conn.commit(); conn.close()
+    # db.py (append)
+def get_user_endtime_formulas(telegram_id: int):
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    c.execute("""
+        SELECT id, from_time, to_time, speed_kmh, bonus_min, active, position
+        FROM user_endtime_formulas
+        WHERE telegram_id=? AND COALESCE(active,1)=1
+        ORDER BY position ASC, id ASC
+    """, (telegram_id,))
+    rows = c.fetchall(); conn.close()
+    return [
+        {
+            "id": r[0], "from": r[1], "to": r[2],
+            "speed_kmh": float(r[3]), "bonus_min": float(r[4]),
+            "active": bool(r[5]), "position": int(r[6]),
+        }
+        for r in rows
+    ]
+def set_bl_uuid(telegram_id: int, bl_uuid: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET bl_uuid = ? WHERE telegram_id = ?", (bl_uuid, telegram_id))
+    conn.commit()
+    conn.close()
+
+def get_bl_uuid(telegram_id: int) -> str | None:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT bl_uuid FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None

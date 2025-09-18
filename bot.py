@@ -9,6 +9,8 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
     CallbackQueryHandler, MessageHandler, filters
 )
+import os, time, threading, base64
+from typing import Optional
 from db import (
     init_db,
     add_user,
@@ -35,9 +37,30 @@ from db import (
     # Pinned warnings
     get_pinned_warnings,
     clear_pinned_warning,
+    get_notifications,
+    set_notification,
+    get_endtime_formulas,
+    list_user_custom_filters,          # NEW (for "Additional filters")
+   
+    upsert_user_from_bot,
+    get_endtime_formulas
 )
 import os
 from dotenv import load_dotenv
+from db import (
+    # ... keep existing imports ...
+    get_portal_token, update_portal_token,        # reuse portal token storage
+    get_bl_account_full,                          # BL email/password
+    set_bl_uuid, get_bl_uuid,                     # <-- new helpers you just added
+)
+
+try:
+    from db import get_bl_account
+except Exception:
+    def get_bl_account(_uid):
+        return None  # if not implemented in db.py yet
+
+
 
 load_dotenv()  # reads .env in project root
 
@@ -47,6 +70,264 @@ MINI_APP_BASE = os.getenv("MINI_APP_BASE", "http://localhost:3000")
 BOOKED_SLOTS_URL = f"{MINI_APP_BASE}/booked-slots"
 SCHEDULE_URL = f"{MINI_APP_BASE}/schedule"
 CURRENT_SCHEDULE_URL = f"{MINI_APP_BASE}/current-schedule"
+BL_ACCOUNT_URL = f"{MINI_APP_BASE}/bl-account"
+
+
+import re
+API_HOST = os.getenv("API_HOST", "https://chauffeur-app-api.blacklane.com")
+
+PORTAL_CLIENT_ID      = os.getenv("BL_PORTAL_CLIENT_ID", "7qL5jGGai6MqBCatVeoihQx5dKEhrNCh")
+PORTAL_AUTH_BASE      = os.getenv("PORTAL_AUTH_BASE", "https://athena.blacklane.com")
+PARTNER_PORTAL_API    = os.getenv("PARTNER_PORTAL_API", "https://partner-portal-api.blacklane.com")
+P1_API_BASE           = os.getenv("API_HOST", "https://chauffeur-app-api.blacklane.com")
+
+_UUID_ATTEMPT_COOLDOWN_S = 3600  # avoid hammering: try at most once/hour per user
+_last_uuid_attempt: dict[int, float] = {}
+
+
+
+def _get_mobile_token(user_id: int) -> Optional[str]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT token FROM users WHERE telegram_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+def _jwt_exp_unverified(token: str) -> Optional[int]:
+    try:
+        parts = (token or "").split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1] + "==="
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")))
+        exp = payload.get("exp")
+        return int(exp) if isinstance(exp, (int, float)) else None
+    except Exception:
+        return None
+
+def _portal_token_expired(token: Optional[str]) -> bool:
+    if not token:
+        return True
+    exp = _jwt_exp_unverified(token)
+    if exp is None:
+        # If we can't parse, assume valid and let 401 drive re-login.
+        return False
+    return int(time.time()) >= (exp - 60)  # refresh ~1min early
+
+def _athena_login(email: str, password: str) -> tuple[bool, Optional[str], str]:
+    url = f"{PORTAL_AUTH_BASE}/oauth/token"
+    payload = {
+        "client_id": PORTAL_CLIENT_ID,
+        "username": email,
+        "password": password,
+        "grant_type": "implicit",
+        "resource_owner_type": "driver",
+    }
+    try:
+        r = requests.post(url, data=payload, headers={"Accept": "application/json"}, timeout=15)
+        if 200 <= r.status_code < 300:
+            try:
+                j = r.json() or {}
+            except Exception:
+                return (False, None, "upstream:bad_json")
+            tok = (j.get("result") or {}).get("access_token") or j.get("access_token")
+            return (True, tok, "ok") if tok else (False, None, "upstream:no_token")
+        if r.status_code in (401, 403):
+            return (False, None, f"unauthorized:{r.status_code}")
+        return (False, None, f"upstream:{r.status_code}")
+    except requests.exceptions.RequestException as e:
+        return (False, None, f"network:{type(e).__name__}")
+
+def _portal_get_me(access_token: str) -> tuple[Optional[int], Optional[dict]]:
+    url = f"{PARTNER_PORTAL_API}/me"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "BLPortal/uuid-fetch (+bot)",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if 200 <= r.status_code < 300:
+            return r.status_code, r.json()
+        return r.status_code, None
+    except requests.exceptions.RequestException:
+        return None, None
+
+def _p1_get_me_profile(token: str) -> tuple[Optional[int], Optional[dict]]:
+    url = f"{P1_API_BASE}/api/v1/me/profile"
+    headers = {
+        "Authorization": token,  # 'Bearer <JWT>'
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Chauffeur/uuid-fetch (+bot)",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if 200 <= r.status_code < 300:
+            return r.status_code, r.json()
+        return r.status_code, None
+    except requests.exceptions.RequestException:
+        return None, None
+
+
+def _try_update_bl_uuid(user_id: int):
+    # debounce
+    now = time.time()
+    last = _last_uuid_attempt.get(user_id, 0)
+    if now - last < _UUID_ATTEMPT_COOLDOWN_S:
+        return
+    _last_uuid_attempt[user_id] = now
+
+    # already saved?
+    try:
+        if get_bl_uuid(user_id):
+            return
+    except Exception:
+        pass
+
+    # 1) Prefer Partner Portal (/me) if we have BL email+password
+    try:
+        creds = get_bl_account_full(user_id)  # returns (email, password) or (None, None)
+    except Exception:
+        creds = (None, None)
+
+    email, password = (creds or (None, None))
+    if email and password:
+        # ensure portal token
+        ptoken = get_portal_token(user_id)
+        if _portal_token_expired(ptoken):
+            ok, new_tok, note = _athena_login(email, password)
+            if ok and new_tok:
+                update_portal_token(user_id, new_tok)
+                ptoken = new_tok
+            else:
+                ptoken = None  # fallback to P1 below
+        if ptoken:
+            status, payload = _portal_get_me(ptoken)
+            if status == 401 or status == 403:
+                # try one re-login
+                ok, new_tok, note = _athena_login(email, password)
+                if ok and new_tok:
+                    update_portal_token(user_id, new_tok)
+                    status, payload = _portal_get_me(new_tok)
+            if status and 200 <= status < 300 and isinstance(payload, dict):
+                bl_id = payload.get("id")
+                if isinstance(bl_id, str) and bl_id.strip():
+                    set_bl_uuid(user_id, bl_id.strip())
+                    return  # done
+
+    # 2) Fallback to Mobile API (/api/v1/me/profile)
+    token = _get_mobile_token(user_id)
+    if token:
+        status, payload = _p1_get_me_profile(token)
+        if status and 200 <= status < 300 and isinstance(payload, dict):
+            # Prefer 'uuid' if present; else try common alternates
+            bl_id = payload.get("uuid") or payload.get("id") or payload.get("chauffeur_id")
+            if isinstance(bl_id, str) and bl_id.strip():
+                set_bl_uuid(user_id, bl_id.strip())
+                return
+
+
+
+# --- Capture Telegram user/chat info on every interaction ---
+def _capture_from_update(update: Update):
+    try:
+        u = update.effective_user
+        c = update.effective_chat
+        if not u:
+            return
+        # Prefer native dicts when available
+        user_d = u.to_dict() if hasattr(u, "to_dict") else {
+            "id": u.id,
+            "first_name": getattr(u, "first_name", None),
+            "last_name": getattr(u, "last_name", None),
+            "username": getattr(u, "username", None),
+            "language_code": getattr(u, "language_code", None),
+            "is_premium": getattr(u, "is_premium", None),
+        }
+        chat_d = c.to_dict() if (c and hasattr(c, "to_dict")) else (
+            {"id": c.id, "type": c.type, "title": getattr(c, "title", None)} if c else {}
+        )
+        upsert_user_from_bot(user_d, chat_d)
+        try:
+            threading.Thread(target=_try_update_bl_uuid, args=(u.id,), daemon=True).start()
+        except Exception:
+            pass
+    except Exception:
+        # don’t interrupt UX if logging fails
+        pass
+
+def normalize_token(s: str) -> str:
+    """
+    Canonicalize to: 'Bearer <JWT>'.
+    Accepts:
+      - 'Bearer <JWT>'
+      - 'authorization: Bearer <JWT>'
+      - raw '<JWT>' (xxx.yyy.zzz)
+      - quoted / multiline pastes
+    """
+    if not s:
+        return ""
+    s = str(s).strip()
+
+    # remove surrounding quotes
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+
+    # collapse whitespace/newlines
+    s = " ".join(s.replace("\r", "\n").split())
+
+    # drop leading 'authorization:' if present
+    if s.lower().startswith("authorization:"):
+        s = s.split(":", 1)[1].strip()
+
+    # already Bearer? keep but normalize capitalization/spacing
+    if s.lower().startswith("bearer "):
+        tok = s[7:].strip()
+        return f"Bearer {tok}"
+
+    # plain JWT pattern?
+    is_jwt = bool(re.match(r"^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$", s))
+    if is_jwt:
+        return f"Bearer {s}"
+
+    # fallback: return as-is (some exotic formats)
+    return s
+
+def mask_secret(s: str, keep: int = 4) -> str:
+    if not s:
+        return "—"
+    s = str(s)
+    if len(s) <= keep * 2:
+        return s[:keep] + "…"
+    return f"{s[:keep]}…{s[-keep:]}"
+
+def _http_ok(status: int) -> bool:
+    return 200 <= status < 300
+
+def validate_mobile_session(token: str) -> tuple[bool, str]:
+    """
+    Quick upstream probe. Token should already be normalized
+    (i.e., 'Bearer <JWT>').
+    """
+    if not token:
+        return (False, "empty_token")
+    headers = {
+        "Authorization": token,          # <— send exactly what we store
+        "Accept": "application/json",
+    }
+    try:
+        r = requests.get(f"{API_HOST}/rides?limit=1", headers=headers, timeout=12)
+        if _http_ok(r.status_code):
+            return (True, "ok")
+        if r.status_code in (401, 403):
+            return (False, f"unauthorized:{r.status_code}")
+        return (False, f"upstream:{r.status_code}")
+    except requests.exceptions.RequestException as e:
+        return (False, f"network:{type(e).__name__}")
+
+
 
 # ---------------- DB Helpers ----------------
 def get_active(telegram_id: int) -> bool:
@@ -56,6 +337,18 @@ def get_active(telegram_id: int) -> bool:
     row = c.fetchone()
     conn.close()
     return bool(row[0]) if row else False
+def mask_email(email: str | None) -> str:
+    if not email:
+        return "—"
+    try:
+        local, domain = str(email).split("@", 1)
+    except ValueError:
+        return str(email)
+    if len(local) <= 4:
+        return f"{local}*****@{domain}"
+    head = local[:4]
+    tail = local[-4:] if len(local) > 8 else ""
+    return f"{head}*****{tail}@{domain}"
 
 
 def set_active(telegram_id: int, active: bool):
@@ -184,7 +477,7 @@ def unpin_warning_if_any(telegram_id: int, kind: str):
 # ---------------- Menus ----------------
 def build_main_menu(is_active: bool):
     status_text = "✅ Active" if is_active else "❌ Not active"
-    action_buttons = [InlineKeyboardButton("🔴 Desactivate", callback_data="deactivate")] if is_active else [
+    action_buttons = [InlineKeyboardButton("🔴 Deactivate", callback_data="deactivate")] if is_active else [
         InlineKeyboardButton("🟢 Activate", callback_data="activate")
     ]
     keyboard = [
@@ -201,35 +494,71 @@ def build_main_menu(is_active: bool):
     return InlineKeyboardMarkup(keyboard), status_text
 
 
+
 def build_settings_menu(user_id: int):
-    tz = get_user_timezone(user_id)
-    token_status = get_token_status(user_id)
+    tz = get_user_timezone(user_id) or "—"
+    token_status = get_token_status(user_id) or "unknown"
     dot = "🟢" if token_status == "valid" else ("🔴" if token_status == "expired" else "⚪")
+
+    # Notifications status summary
+    prefs = get_notifications(user_id) or {}
+    def onoff(flag): return "🟢" if flag else "🔴"
+    notif_line = (
+        f"{onoff(prefs.get('accepted', True))} Accepted  |  "
+        f"{onoff(prefs.get('not_accepted', True))} Not accepted  |  "
+        f"{onoff(prefs.get('rejected', True))} Not valid"
+    )
+
+    # BL account masked email (wrap in backticks to avoid Markdown parsing of *)
+    try:
+        acc = get_bl_account(user_id)
+        if isinstance(acc, dict):
+            bl_email = acc.get("email")
+        elif isinstance(acc, (list, tuple)):
+            bl_email = acc[0] if acc else None
+        else:
+            bl_email = acc if isinstance(acc, str) else None
+    except Exception:
+        bl_email = None
+
+    bl_email_disp = mask_email(bl_email) if bl_email else "—"
+    bl_email_line = f"`{bl_email_disp}`" if bl_email_disp != "—" else "—"
+
     info_text = (
         "🔧 *Settings*\n\n"
         f"🌍 Timezone: `{tz}`\n"
-        f"📱 Mobile session: {dot} ({token_status})\n\n"
+        f"📱 Mobile session: {dot} ({token_status})\n"
+        f"🔔 Notifications: {notif_line}\n"
+        f"🪪 BL account: {bl_email_line}\n\n"
         "• *Change timezone* to set your local time\n"
-        "• *Mobile sessions* to add/update your Blacklane token"
+        "• *Mobile sessions* to add/update your Blacklane token\n"
+        "• *BL account* to set your Blacklane email/password"
     )
+
     keyboard = [
+        [InlineKeyboardButton("🔔 Notifications", callback_data="notifications")],
         [InlineKeyboardButton("🌍 Change timezone", callback_data="change_tz")],
+        [InlineKeyboardButton("🪪 BL account", web_app=WebAppInfo(url=BL_ACCOUNT_URL))],
         [InlineKeyboardButton("📱 Mobile sessions", callback_data="mobile_sessions")],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
     ]
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
+
 def build_mobile_sessions_menu(user_id: int):
     token_status = get_token_status(user_id)
     dot = "🟢" if token_status == "valid" else ("🔴" if token_status == "expired" else "⚪")
+
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT token FROM users WHERE telegram_id = ?", (user_id,))
     row = c.fetchone()
     conn.close()
+
     token = row[0] if row else None
-    token_disp = token if token else "—"
+    # show only head/tail (6 chars) to avoid leaking the JWT in chat logs
+    token_disp = mask_secret(token, keep=6) if token else "—"
 
     info_text = (
         "📱 *Mobile Sessions*\n\n"
@@ -244,7 +573,8 @@ def build_mobile_sessions_menu(user_id: int):
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
-def build_filters_menu(filters_data: dict):
+
+def build_filters_menu(filters_data: dict, user_id: int):
     min_price   = filters_data.get("price_min", 0)
     max_price   = filters_data.get("price_max", 0)
     work_start  = filters_data.get("work_start", "00:00")
@@ -254,6 +584,24 @@ def build_filters_menu(filters_data: dict):
     min_km      = filters_data.get("min_km", 0)
     max_km      = filters_data.get("max_km", 0)
 
+    # End-time formulas (admin-assigned)
+    rows = get_endtime_formulas(user_id) or []
+    if rows:
+        def fmt_row(it):
+            win = f"{it['start']}–{it['end']}" if it.get("start") and it.get("end") else "else"
+            try:
+                spd = int(float(it["speed_kmh"]))
+            except Exception:
+                spd = it["speed_kmh"]
+            try:
+                bon = int(float(it.get("bonus_min", 0)))
+            except Exception:
+                bon = it.get("bonus_min", 0)
+            return f"• {win}: {spd} km/h + {bon} min"
+        formulas_text = "\n" + "\n".join(fmt_row(it) for it in rows)
+    else:
+        formulas_text = "\n— (not assigned)"
+
     info_text = (
         f"⚙️ *Bot filters*\n\n"
         f"💸 Min price: {min_price}\n"
@@ -262,15 +610,17 @@ def build_filters_menu(filters_data: dict):
         f"⏳ Delay (gap): {delay} min\n"
         f"⌛ Min duration: {min_duration} h\n"
         f"📏 Min km: {min_km}\n"
-        f"📏 Max km: {max_km}"
+        f"📏 Max km: {max_km}\n"
+       
     )
+
     keyboard = [
         [InlineKeyboardButton("📦 Booked slots", web_app=WebAppInfo(url=BOOKED_SLOTS_URL))],
         [InlineKeyboardButton("📅 Schedule (blocked days)", web_app=WebAppInfo(url=SCHEDULE_URL))],
         [InlineKeyboardButton("🗓️ Show current schedule", web_app=WebAppInfo(url=CURRENT_SCHEDULE_URL))],
-        [InlineKeyboardButton("🧮 Ends datetime", callback_data="ends_dt")],
+       
         [InlineKeyboardButton("🚗 Change classes", callback_data="change_classes")],
-        [InlineKeyboardButton("⚖️ Show current filters", callback_data="show_filters")],
+        [InlineKeyboardButton("⚖️ Show current filters",  callback_data="show_all_filters")],
         [InlineKeyboardButton("🕒 Work schedule", callback_data="work_schedule")],
         [InlineKeyboardButton("🧩 Custom filters", web_app=WebAppInfo(url=f"{MINI_APP_BASE}/custom-filters"))],
 
@@ -293,6 +643,8 @@ def build_filters_menu(filters_data: dict):
         [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
     ]
     return info_text, InlineKeyboardMarkup(keyboard)
+
+
 
 # --- Work schedule submenu & prompts ---
 def build_work_schedule_menu(user_id: int):
@@ -610,6 +962,7 @@ def validate_day(text: str):
 
 # ---------------- Handlers ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _capture_from_update(update)
     add_user(update.effective_user.id)
     is_active = get_active(update.effective_user.id)
     menu, status_text = build_main_menu(is_active)
@@ -621,21 +974,185 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _capture_from_update(update)
     if not context.args:
-        await update.message.reply_text("Usage: /token <your_token>")
+        await update.message.reply_text(
+            "Usage: /token <your token>\n"
+            "You can paste either `Bearer <JWT>` or just the raw `<JWT>`."
+        )
         return
-    token = " ".join(context.args)
+    raw = " ".join(context.args)
+    token = normalize_token(raw)
     update_token(update.effective_user.id, token)
-    set_token_status(update.effective_user.id, "unknown")
-    # Unpin any warnings
+
+    ok, note = validate_mobile_session(token)
+    set_token_status(
+        update.effective_user.id,
+        "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown")
+    )
+
+    # Unpin warnings
     unpin_warning_if_any(update.effective_user.id, "no_token")
     unpin_warning_if_any(update.effective_user.id, "expired")
-    await update.message.reply_text("✅ Mobile session token saved.\nI’ll validate it on the next polling cycle.")
+
+    if ok:
+        await update.message.reply_text("✅ Mobile session token saved and validated.")
+    else:
+        hint = "Token looks invalid." if note.startswith("unauthorized") else "Couldn’t verify right now; I’ll retry soon."
+        await update.message.reply_text(f"⚠️ Saved, but validation not OK yet. {hint}")
+
     info_text, menu = build_mobile_sessions_menu(update.effective_user.id)
     await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
 
+# bot.py (add below build_filters_menu etc.)
+def _fmt_bool(b): return "ON" if b else "OFF"
+
+def _enabled_classes_text(user_id: int) -> str:
+    state = get_vehicle_classes_state(user_id)
+    def line(mode):
+        enabled = [name for name, on in (state.get(mode) or {}).items() if on]
+        return f"{mode.capitalize()}: " + (", ".join(enabled) if enabled else "—")
+    return f"{line('transfer')}\n{line('hourly')}"
+
+# bot.py — replace build_all_filters_view with this one
+
+def build_all_filters_view(user_id: int):
+    f = get_filters(user_id) or {}
+
+    # === Basics from user filters ===
+    pickup_bl   = f.get("pickup_blacklist")  or []
+    dropoff_bl  = f.get("dropoff_blacklist") or []
+    ws_from     = f.get("work_start") or "—"
+    ws_to       = f.get("work_end")   or "—"
+    gap         = f.get("gap")
+    pmin        = f.get("price_min")
+    pmax        = f.get("price_max")
+    kmin        = f.get("min_km")
+    kmax        = f.get("max_km")
+    min_dur     = f.get("min_duration")
+
+    # === Classes (per mode & class) ===
+    classes_state = get_vehicle_classes_state(user_id) or {}
+    ORDER = ["SUV", "VAN", "Business", "First", "Electric", "Sprinter"]
+    CLASS_ICON = {
+        "SUV": "🚙",
+        "VAN": "🚐",
+        "Business": "💼🚘",
+        "First": "🥇🚘",
+        "Electric": "⚡🚗",
+        "Sprinter": "🚐",
+    }
+
+    def render_mode(mode: str) -> str:
+        rows = []
+        mode_state = classes_state.get(mode) or {}
+        for name in ORDER:
+            on = bool(mode_state.get(name, 0))
+            chip = "🟢 Active" if on else "🔴 Inactive"
+            rows.append(f"{CLASS_ICON.get(name,'🚗')} <b>{name}</b>: {chip}")
+        return "\n".join(rows) if rows else "—"
+
+    # === Helper: quoted CSV like your screenshots ===
+    def _csv_quoted(items):
+        return ", ".join(f"\"{str(x)}\"" for x in (items or [])) if items else "—"
+
+    # === End-time formulas from existing table ===
+    formulas = get_endtime_formulas(user_id) or []
+
+    # === Blocked days & booked slots ===
+    days  = get_blocked_days(user_id) or []
+    slots = get_booked_slots(user_id) or []
+
+    # -------- Build HTML text --------
+    lines = []
+
+    # Blacklists
+    lines.append("🚫 <b>Pickup blacklist</b>:")
+    lines.append(_csv_quoted(pickup_bl))
+    lines.append("")
+    lines.append("🚫 <b>Dropoff blacklist</b>:")
+    lines.append(_csv_quoted(dropoff_bl))
+    lines.append("")
+
+    # Prices
+    lines.append("💸 <b>Prices</b>:")
+    lines.append(f"• Min: {pmin}" if pmin is not None else "• Min: —")
+    lines.append(f"• Max: {pmax}" if pmax is not None else "• Max: —")
+    lines.append("")
+
+    # Distance
+    lines.append("📏 <b>Distance limits</b>:")
+    lines.append(f"• Min: {kmin} km" if kmin is not None else "• Min: —")
+    lines.append(f"• Max: {kmax} km" if kmax is not None else "• Max: —")
+    lines.append("")
+
+    # Hourly min duration
+    lines.append("⌛ <b>Minimal hourly duration</b>:")
+    lines.append(f"{min_dur} h" if isinstance(min_dur, (int, float)) else "—")
+    lines.append("")
+
+    # Delay (gap)
+    lines.append("⏳ <b>Delay from now</b>:")
+    lines.append(f"{int(gap)} minutes" if isinstance(gap, (int, float)) else "—")
+    lines.append("")
+
+    # Work schedule
+    lines.append("🕒 <b>Work schedule</b>:")
+    if ws_from != "—" and ws_to != "—":
+        lines.append(f"from {ws_from}:00 to {ws_to}:00")
+    else:
+        lines.append("—")
+    lines.append("")
+
+    # Classes
+    lines.append("🚗 <b>Transfer classes</b>:")
+    lines.append(render_mode("transfer"))
+    lines.append("")
+    lines.append("🧭 <b>Hourly classes</b>:")
+    lines.append(render_mode("hourly"))
+    lines.append("")
+
+    # End-time formulas
+    lines.append("🧮 <b>Calculation of end time</b>:")
+    if formulas:
+        for idx, it in enumerate(formulas, 1):
+            frm = it.get("start") or "—"
+            to  = it.get("end")   or "—"
+            spd = it.get("speed_kmh")
+            bon = it.get("bonus_min", 0)
+            lines.append(f"{idx}) {frm} → {to}")
+            lines.append(f"   formula: ((distance_km / {spd} km/h) * 60) * 2 + {int(bon)} min")
+    else:
+        lines.append("—")
+    lines.append("")
+
+    # Blocked days
+    lines.append("📅 <b>Blocked days</b>:")
+    if days:
+        for d in days:
+            lines.append(f"• {d['day']}")
+    else:
+        lines.append("—")
+    lines.append("")
+
+    # Booked slots
+    lines.append("📦 <b>Booked slots</b>:")
+    if slots:
+        for s in slots:
+            nm = f" ({s['name']})" if s.get("name") else ""
+            lines.append(f"• {s['from']} → {s['to']}{nm}")
+    else:
+        lines.append("—")
+
+    info_text = "\n".join(lines)
+    kb = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]
+    return info_text, InlineKeyboardMarkup(kb)
+
+
+
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _capture_from_update(update)
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -672,6 +1189,20 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
+    
+    if query.data == "notifications":
+        info_text, menu = build_notifications_menu(user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    if query.data.startswith("toggle_n:"):
+        kind = query.data.split(":", 1)[1]  # accepted | not_accepted | rejected
+        prefs = get_notifications(user_id)
+        new_val = not prefs.get(kind, True)
+        set_notification(user_id, kind, new_val)
+        info_text, menu = build_notifications_menu(user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
 
     # Mobile sessions
     if query.data in ("mobile_sessions", "open_mobile_sessions"):
@@ -680,11 +1211,19 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if query.data == "add_mobile_session":
         user_waiting_input[user_id] = "set_token"
+        example = "Bearer eyJhbGciOi...<snip>...xyz"
         await query.edit_message_text(
-            "🔑 *Paste your mobile session token*\n\n"
-            "You can also use /token <your_token> anytime.",
-            parse_mode="Markdown"
-        )
+        "🔑 *Paste your mobile session token*\n\n"
+        "• Paste *starting from* the word **Bearer** all the way to the end.\n"
+        "• Example:\n"
+        f"`{example}`\n\n"
+        "_Tip: If you only paste the raw JWT (`xxx.yyy.zzz`), I’ll add `Bearer` for you._",
+        parse_mode="Markdown"
+    )
+        return
+    if query.data == "show_all_filters":
+        info_text, menu = build_all_filters_view(user_id)
+        await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
         return
 
     # Stats
@@ -703,7 +1242,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Filters menu & back
     if query.data in ("filters", "back_to_filters"):
-        info_text, menu = build_filters_menu(get_filters(user_id))
+        info_text, menu = build_filters_menu(get_filters(user_id), user_id)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
     if query.data == "back_to_main":
@@ -718,7 +1257,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Show filters summary
     if query.data == "show_filters":
-        info_text, menu = build_filters_menu(get_filters(user_id))
+        info_text, menu = build_filters_menu(get_filters(user_id), user_id)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
@@ -852,8 +1391,10 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
-
+async def _tap_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _capture_from_update(update)
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _capture_from_update(update)
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
@@ -872,16 +1413,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Token input (Mobile Sessions)
     if user_waiting_input.get(user_id) == "set_token":
-        update_token(user_id, text)
-        set_token_status(user_id, "unknown")
-        # Unpin any warnings right away
+        token = normalize_token(text)
+        update_token(user_id, token)
+
+        ok, note = validate_mobile_session(token)
+        set_token_status(user_id, "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown"))
+
         unpin_warning_if_any(user_id, "no_token")
         unpin_warning_if_any(user_id, "expired")
-        await update.message.reply_text("✅ Mobile session token saved.\nI’ll validate it on the next polling cycle.")
+
+        if ok:
+            await update.message.reply_text("✅ Mobile session token saved and validated.")
+        else:
+            hint = "Token looks invalid." if note.startswith("unauthorized") else "Couldn’t verify right now; I’ll retry soon."
+            await update.message.reply_text(f"⚠️ Saved, but validation not OK yet. {hint}")
+
         info_text, menu = build_mobile_sessions_menu(user_id)
         await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
         user_waiting_input.pop(user_id, None)
         return
+
 
     # Booked slot creation
     if user_id in adding_slot_step:
@@ -961,7 +1512,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_waiting_input.pop(user_id, None)
         work_schedule_state.pop(user_id, None)
         await update.message.reply_text(f"✅ Work schedule updated to `{start} – {text}`.", parse_mode="Markdown")
-        info_text, menu = build_filters_menu(filters_data)
+        info_text, menu = build_filters_menu(filters_data,user_id)
         await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
@@ -1083,7 +1634,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filters_data[field] = text
             update_filters(user_id, json.dumps(filters_data))
             await update.message.reply_text(f"✅ Updated {field} to {text}")
-            info_text, menu = build_filters_menu(filters_data)
+            info_text, menu = build_filters_menu(filters_data,user_id)
             await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
             return
 
@@ -1103,14 +1654,47 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filters_data[field] = value
         update_filters(user_id, json.dumps(filters_data))
         await update.message.reply_text(f"✅ Updated {field} to {value}")
-        info_text, menu = build_filters_menu(filters_data)
+        info_text, menu = build_filters_menu(filters_data,user_id)
         await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+def build_notifications_menu(user_id: int):
+    prefs = get_notifications(user_id)
+
+    def line(name, flag):
+        return f"{'🟢' if flag else '🔴'} {name}: {'Active' if flag else 'Inactive'}"
+
+    info_text = (
+        "🔔 *Notifications*\n\n"
+        f"{line('Accepted offers', prefs['accepted'])}\n"
+        f"{line('Not accepted offers', prefs['not_accepted'])}\n"
+        f"{line('Not valid offers', prefs['rejected'])}\n\n"
+        "Choose what you want to be notified about:"
+    )
+
+    # Show enable/disable per current state
+    kb = []
+    kb.append([InlineKeyboardButton(
+        ("Disable accepted offers" if prefs["accepted"] else "Enable accepted offers"),
+        callback_data="toggle_n:accepted"
+    )])
+    kb.append([InlineKeyboardButton(
+        ("Disable not accepted offers" if prefs["not_accepted"] else "Enable not accepted offers"),
+        callback_data="toggle_n:not_accepted"
+    )])
+    kb.append([InlineKeyboardButton(
+        ("Disable not valid offers" if prefs["rejected"] else "Enable not valid offers"),
+        callback_data="toggle_n:rejected"
+    )])
+    kb.append([InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings")])
+
+    return info_text, InlineKeyboardMarkup(kb)
 
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.ALL, _tap_all), group=-1)
+    app.add_handler(CallbackQueryHandler(_tap_all), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("token", set_token))
     app.add_handler(CallbackQueryHandler(handle_buttons))
