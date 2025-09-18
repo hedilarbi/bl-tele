@@ -138,6 +138,13 @@ def _athena_login(email: str, password: str) -> tuple[bool, Optional[str], str]:
         return (False, None, f"upstream:{r.status_code}")
     except requests.exceptions.RequestException as e:
         return (False, None, f"network:{type(e).__name__}")
+    
+async def open_settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _capture_from_update(update)               # keep telemetry + uuid background try
+    add_user(update.effective_user.id)         # ensure user row exists
+    info_text, menu = build_settings_menu(update.effective_user.id)
+    await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+
 
 def _portal_get_me(access_token: str) -> tuple[Optional[int], Optional[dict]]:
     url = f"{PARTNER_PORTAL_API}/me"
@@ -1697,6 +1704,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(_tap_all), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("token", set_token))
+    app.add_handler(CommandHandler("settings", open_settings_cmd))
     app.add_handler(CallbackQueryHandler(handle_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     print("✅ Bot started...")
