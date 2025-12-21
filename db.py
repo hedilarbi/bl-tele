@@ -496,6 +496,52 @@ def toggle_vehicle_class(telegram_id: int, mode: str, vclass: str):
     conn.close()
     return new_val
 
+# ---------------- OFFER MESSAGES (details for Telegram UI) ----------------
+def save_offer_message(telegram_id: int, message_key: str, header_text: str, full_text: str):
+    """
+    Persist the rendered header + full message for an offer so callbacks can expand/collapse.
+    """
+    if not message_key or not full_text:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS offer_messages (
+            telegram_id INTEGER NOT NULL,
+            offer_id    TEXT    NOT NULL,
+            full_text   TEXT    NOT NULL,
+            header_text TEXT,
+            PRIMARY KEY (telegram_id, offer_id)
+        )
+    """)
+    try:
+        c.execute("ALTER TABLE offer_messages ADD COLUMN header_text TEXT")
+    except Exception:
+        pass
+    c.execute("""
+        INSERT INTO offer_messages (telegram_id, offer_id, full_text, header_text)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(telegram_id, offer_id) DO UPDATE SET
+            full_text = excluded.full_text,
+            header_text = excluded.header_text
+    """, (telegram_id, message_key, full_text, header_text))
+    conn.commit()
+    conn.close()
+
+def get_offer_message(telegram_id: int, message_key: str) -> tuple[str | None, str | None]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT header_text, full_text FROM offer_messages
+        WHERE telegram_id = ? AND offer_id = ?
+        LIMIT 1
+    """, (telegram_id, message_key))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return (None, None)
+    return row[0], row[1]
+
 
 # ---------------- OFFER LOGGING ----------------
 def log_offer_decision(telegram_id: int, offer: dict, status: str, reason: str = None):

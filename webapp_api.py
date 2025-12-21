@@ -1,7 +1,17 @@
 # webapp_api.py
-import os, hmac, hashlib, json, urllib.parse, time, sqlite3, logging, uuid, re
+import os, hmac, hashlib, json, urllib.parse, time, sqlite3, logging, uuid, re, sys
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Dict, Any
+
+# Pydantic v1 isn't yet Python 3.13-compatible: ForwardRef._evaluate now requires
+# a keyword-only recursive_guard. Patch pydantic's helper before FastAPI imports.
+if sys.version_info >= (3, 13):
+    import pydantic.typing as _pydantic_typing
+
+    def _evaluate_forwardref_py313(type_: Any, globalns: Any, localns: Any) -> Any:
+        return type_._evaluate(globalns, localns, recursive_guard=set())
+
+    _pydantic_typing.evaluate_forwardref = _evaluate_forwardref_py313
 
 import requests
 from dotenv import load_dotenv

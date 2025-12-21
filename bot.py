@@ -52,6 +52,7 @@ from db import (
     get_portal_token, update_portal_token,        # reuse portal token storage
     get_bl_account_full,                          # BL email/password
     set_bl_uuid, get_bl_uuid,                     # <-- new helpers you just added
+    get_offer_message,
 )
 
 try:
@@ -64,9 +65,23 @@ except Exception:
 
 load_dotenv()  # reads .env in project root
 
+def _ensure_https_base(url: str) -> str:
+    """
+    Telegram WebApp buttons only accept HTTPS URLs.
+    Coerce any http/relative base into https and strip trailing slash.
+    """
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return url
+    if url.lower().startswith("http://"):
+        return "https://" + url[7:]
+    if not url.lower().startswith("https://"):
+        return "https://" + url
+    return url
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-MINI_APP_BASE = os.getenv("MINI_APP_BASE", "http://localhost:3000")
+MINI_APP_BASE = _ensure_https_base(os.getenv("MINI_APP_BASE", "http://localhost:3000"))
 BOOKED_SLOTS_URL = f"{MINI_APP_BASE}/booked-slots"
 SCHEDULE_URL = f"{MINI_APP_BASE}/schedule"
 CURRENT_SCHEDULE_URL = f"{MINI_APP_BASE}/current-schedule"
@@ -1231,6 +1246,28 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "show_all_filters":
         info_text, menu = build_all_filters_view(user_id)
         await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
+        return
+
+    if query.data.startswith("show_offer:"):
+        key = query.data.split(":", 1)[1]
+        header, full = get_offer_message(user_id, key)
+        if not full:
+            await query.edit_message_text(
+                "No details available for this offer.",
+                parse_mode="HTML",
+            )
+            return
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Hide details", callback_data=f"hide_offer:{key}")]])
+        await query.edit_message_text(full, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if query.data.startswith("hide_offer:"):
+        key = query.data.split(":", 1)[1]
+        header, full = get_offer_message(user_id, key)
+        if not header:
+            header = "Details hidden."
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Show details", callback_data=f"show_offer:{key}")]])
+        await query.edit_message_text(header, parse_mode="HTML", reply_markup=kb)
         return
 
     # Stats

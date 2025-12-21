@@ -28,6 +28,7 @@ from db import (
     get_booked_slots,
     get_vehicle_classes_state,
     log_offer_decision,
+    save_offer_message,
     get_user_timezone,
     get_pinned_warnings,
     save_pinned_warning,
@@ -41,8 +42,6 @@ from db import (
     update_portal_token,
     get_bl_account_full,
     get_endtime_formulas,
-    get_processed_offer_ids,
-
     get_bl_uuid,
 )
 
@@ -64,18 +63,20 @@ ATHENA_BASE = "https://athena.blacklane.com"          # Platform 2 (Portal)
 PORTAL_CLIENT_ID = os.getenv("BL_PORTAL_CLIENT_ID", "7qL5jGGai6MqBCatVeoihQx5dKEhrNCh")
 PORTAL_PAGE_SIZE = 50
 
-POLL_INTERVAL = 2
+POLL_INTERVAL = 5
 MAX_WORKERS = 10
 
 # Toggle mock data for development (default: real polling)
 USE_MOCK_P1 = False      # set True to use mock offers for Platform 1
 USE_MOCK_P2 = False      # set True to use mock offers for Platform 2
-ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (Athena preferred)
+ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when available)
+# When enabled, accepted offers will be actually reserved via API calls (P1/P2).
+AUTO_RESERVE_ENABLED = False
 
 # Diagnostics
 DEBUG_PRINT_OFFERS = False   # print raw offers
 CF_DEBUG = False             # custom filters debug
-ATHENA_PRINT_DEBUG = False   # print portal token and raw payloads
+ATHENA_PRINT_DEBUG = True   # print portal token and raw payloads
 DEBUG_ENDS = False           # log endsAt math for each offer
 APPLY_GAP_TO_BUSY_INTERVALS = False  # ← gap will NOT extend busy intervals
 
@@ -440,24 +441,56 @@ def get_offers_p1(token: str):
     }
     try:
         r = requests.get(f"{API_HOST}/offers", headers=headers, timeout=12)
-        if r.status_code == 200:
-            try:
-                j = r.json()
-            except Exception:
-                return 200, []
-            results = j.get("results", []) or []
-            # Inject platform marker so downstream can tell
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+
+        if r.status_code == 200 and isinstance(body, dict):
+            results = body.get("results", []) or []
             for it in results:
                 try:
                     it["_platform"] = "p1"
                 except Exception:
                     pass
             return 200, results
-        else:
-            return r.status_code, None
+
+        # return status + body for diagnostics (401/403/etc)
+        return r.status_code, body
     except Exception as e:
         print(f"[{datetime.now()}] ❌ P1 /offers exception: {e}")
         return None, None
+
+# ---------- P1: reserve ----------
+def reserve_offer_p1(token: str, offer_id: str):
+    """
+    Accept (reserve) an offer on Platform 1.
+
+    Returns: (status_code, json_or_text)
+      200/201 → accepted
+      401/403 → token invalid/expired
+      409      → conflict / already taken
+      422      → cannot accept (validation)
+    """
+    headers = {
+        "Host": API_HOST.replace("https://", ""),
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Authorization": token,                 # e.g. "Bearer <JWT>"
+        "X-Request-ID": str(uuid.uuid4()),
+        "X-Correlation-ID": str(uuid.uuid4()),
+    }
+    payload = {
+        "id": offer_id,
+        "action": "accept",
+        "parameters": []                        # present for symmetry with actions list
+    }
+    r = requests.post(f"{API_HOST}/offers", headers=headers, json=payload, timeout=12)
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text
+    return r.status_code, body
 
 # ---------- P2: helpers ----------
 def _safe_attr(d, *keys, default=None):
@@ -593,6 +626,38 @@ def _map_portal_offer(raw: dict, included: list) -> Optional[dict]:
         "_platform": "p2",         # mark platform explicitly
     }
     return mapped
+
+# ---------- P2: reserve ----------
+def reserve_offer_p2(access_token: str, offer_id: str, price: float):
+    """
+    Place a bid for an offer on Platform 2 (Athena/Portal).
+
+    Returns: (status_code, json_or_text)
+    """
+    url = f"{ATHENA_BASE}/hades/bids"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/vnd.api+json",
+        "Content-Type": "application/vnd.api+json",
+        "User-Agent": "BLPortal/1.0 (+poller)",
+    }
+    payload = {
+        "data": {
+            "type": "bids",
+            "attributes": {"price": float(price)},
+            "relationships": {
+                "offer": {"data": {"id": str(offer_id), "type": "offers"}}
+            },
+        },
+        "meta": {},
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=15)
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text
+    return r.status_code, body
 
 def _athena_login(email: str, password: str) -> Tuple[bool, Optional[str], str]:
     url = f"{ATHENA_BASE}/oauth/token"
@@ -849,6 +914,24 @@ def _run_custom_filters(offer: dict, enabled_map: dict, tz_name: str):
             return d, r
     return None, None
 
+def _format_filter_summary(results: List[dict]) -> str:
+    """
+    Build a verbose summary of all filters with green/red markers.
+    Each item in results is expected to have: name (str), ok (bool), detail (optional str).
+    """
+    if not results:
+        return ""
+    lines = ["<b>🧰 Filters:</b>"]
+    for r in results:
+        name = r.get("name") or "Filtre"
+        detail = r.get("detail")
+        icon = "✅" if r.get("ok") else "❌"
+        if detail:
+            lines.append(f"{icon} <b>{_esc(name)}:</b> {_esc(detail)}")
+        else:
+            lines.append(f"{icon} <b>{_esc(name)}:</b> {_esc('ok' if r.get('ok') else 'non respecté')}")
+    return "\n".join(lines)
+
 # ---------- Conflicts ----------
 def _find_conflict(new_start: datetime, new_end_iso: Optional[str], accepted_intervals: List[Tuple[datetime, Optional[datetime]]]) -> Optional[Tuple[datetime, datetime]]:
     new_end = None
@@ -990,7 +1073,16 @@ def _extract_addr(loc: dict) -> str:
         return "—"
     return loc.get("address") or loc.get("name") or "—"
 
-def _build_user_message(offer: dict, status: str, reason: Optional[str], tz_name: Optional[str]) -> str:
+def _build_user_message(
+    offer: dict,
+    status: str,
+    reason: Optional[str],
+    tz_name: Optional[str],
+    filters_summary: Optional[str] = None,
+    filter_results: Optional[List[dict]] = None,
+    platform: Optional[str] = None,
+    forced_accept: bool = False,
+) -> str:
     rid = (offer.get("rides") or [{}])[0]
     otype = (rid.get("type") or "").lower()
     vclass = (offer.get("vehicleClass") or "")
@@ -1024,11 +1116,7 @@ def _build_user_message(offer: dict, status: str, reason: Optional[str], tz_name
         guest_reqs = None
     dist = _fmt_km(rid.get("estimatedDistanceMeters"))
     dur  = _fmt_minutes(_duration_minutes_from_rid(rid))
-    header = "✅ <b>Offer accepted</b>" if status == "accepted" else "⛔ <b>Offer rejected</b>"
-    lines = [header]
-    if status == "rejected" and reason:
-        lines.append(f"<i>Reason:</i> {_esc(reason)}")
-    lines += [
+    lines = [
         f"🚘 <b>Type:</b> {_esc(typ_disp)}",
         f"🚗 <b>Class:</b> {_esc(vclass)}",
         f"💰 <b>Price:</b> {_esc(price_disp)}",
@@ -1049,6 +1137,35 @@ def _build_user_message(offer: dict, status: str, reason: Optional[str], tz_name
     ]
     if do_addr:
         lines += ["", f"⬇️ <b>Dropoff:</b>\n{_esc(do_addr)}"]
+
+    status_icon = "🟢" if status == "accepted" else "🔴"
+    plat_icon = _platform_icon(platform or "p1")
+    status_word = "valid" if status == "accepted" else "not valid"
+    if forced_accept and status == "accepted":
+        status_word = "valid (override)"
+    header = f"🔥 New offer - {price_disp} - {status_icon} {status_word} {plat_icon}"
+    body = "\n".join(lines)
+    filters_block = _format_filter_summary(filter_results or []) if filter_results else (filters_summary or "")
+    parts = [header, body]
+    if filters_block:
+        parts.append(filters_block)
+    return "\n\n".join(parts)
+
+def _build_offer_header_line(
+    offer: dict,
+    status: str,
+    platform: Optional[str],
+    forced_accept: bool = False,
+) -> str:
+    rid = (offer.get("rides") or [{}])[0]
+    otype = (rid.get("type") or "").lower()
+    price_disp = _fmt_money(offer.get("price"), offer.get("currency"))
+    status_icon = "🟢" if status == "accepted" else "🔴"
+    plat_icon = _platform_icon(platform or "p1")
+    status_word = "valid" if status == "accepted" else "not valid"
+    if forced_accept and status == "accepted":
+        status_word = "valid (override)"
+    return f"🔥 New offer - {price_disp} - {status_icon} {status_word} {plat_icon}"
     return "\n".join(lines)
 
 def _log(msg: str):
@@ -1122,6 +1239,8 @@ def _process_offers_for_user(
     blocked_days: set,
     accepted_intervals: List[Tuple[datetime, Optional[datetime]]],
     tz_name: str,
+    p1_token: Optional[str] = None,
+    p2_token: Optional[str] = None,
 ):
     user_cfilters = _get_enabled_filter_slugs(telegram_id)
 
@@ -1165,6 +1284,12 @@ def _process_offers_for_user(
             )
 
         # --- 0) Working hours & blocked days (user timezone) ---
+        filter_results: List[dict] = []
+        accept_override = False
+
+        def record_result(name: str, ok: bool, detail: Optional[str] = None):
+            filter_results.append({"name": name, "ok": bool(ok), "detail": detail})
+
         pickup_local = pickup.astimezone(gettz(tz_name))
         pickup_t = pickup_local.time()
 
@@ -1178,33 +1303,29 @@ def _process_offers_for_user(
                 end_t   = dt_time(we_hm[0], we_hm[1])
                 if not (start_t <= pickup_t <= end_t):
                     reason = f"heure pickup {pickup_t.strftime('%H:%M')} hors plage {ws}–{we}"
-                    print(f"[{datetime.now()}] ⛔ Rejected {oid} – outside work hours {ws}-{we} (user tz {tz_name})")
-                    log_offer_decision(telegram_id, offer, "rejected", reason)
-                    maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                    rejected_per_user[telegram_id].add(oid)
-                    continue
+                    record_result("Horaires", False, reason)
+                else:
+                    record_result("Horaires", True, f"{pickup_t.strftime('%H:%M')} dans {ws}–{we}")
 
         day_key = pickup_local.strftime("%d/%m/%Y")
         if day_key in blocked_days:
-            reason = f"jour {day_key} bloqué (Schedule)"
-            print(f"[{datetime.now()}] ⛔ Rejected {oid} – blocked day {day_key} (user tz {tz_name})")
-            log_offer_decision(telegram_id, offer, "rejected", reason)
-            maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-            rejected_per_user[telegram_id].add(oid)
-            continue
+            record_result("Jours bloqués", False, f"jour {day_key} bloqué (Schedule)")
+        elif blocked_days:
+            record_result("Jours bloqués", True, f"{day_key} autorisé")
 
         # 1) Minimal gap before pickup vs current time (UTC base)
         gap_min_now = filters.get("gap", 0)
         if gap_min_now:
             now_utc = datetime.now(timezone.utc)
+            mins_left = max(0, (pickup - now_utc).total_seconds() / 60)
             if pickup < now_utc + timedelta(minutes=float(gap_min_now)):
-                mins_left = max(0, (pickup - now_utc).total_seconds() / 60)
-                reason = f"délai minimal {gap_min_now} min non respecté ({mins_left:.0f} min restants)"
-                print(f"[{datetime.now()}] ⛔ Rejected {oid} – gap {gap_min_now} min; pickup in {mins_left:.0f} min")
-                log_offer_decision(telegram_id, offer, "rejected", reason)
-                maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                rejected_per_user[telegram_id].add(oid)
-                continue
+                record_result(
+                    "Délai minimal",
+                    False,
+                    f"{mins_left:.0f} min restants < seuil {gap_min_now} min",
+                )
+            else:
+                record_result("Délai minimal", True, f"{mins_left:.0f} min restants")
 
         # 1.5) Enforce min/max hourly duration (filters in HOURS)
         dur_min_est = _duration_minutes_from_rid(rid)
@@ -1220,62 +1341,44 @@ def _process_offers_for_user(
             except Exception:
                 max_minutes = None
 
-            if min_minutes and (dur_min_est is None or dur_min_est < min_minutes):
-                reason = f"durée horaire {0 if dur_min_est is None else dur_min_est:.0f} min < min {min_minutes:.0f} min"
-                print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
-                log_offer_decision(telegram_id, offer, "rejected", reason)
-                maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                rejected_per_user[telegram_id].add(oid)
-                continue
-
-            if max_minutes is not None and dur_min_est is not None and dur_min_est > max_minutes:
-                reason = f"durée horaire {dur_min_est:.0f} min > max {max_minutes:.0f} min"
-                print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
-                log_offer_decision(telegram_id, offer, "rejected", reason)
-                maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                rejected_per_user[telegram_id].add(oid)
-                continue
+            if min_minutes:
+                ok = not (dur_min_est is None or dur_min_est < min_minutes)
+                record_result(
+                    "Durée horaire min",
+                    ok,
+                    None if ok else f"{0 if dur_min_est is None else dur_min_est:.0f} min < min {min_minutes:.0f} min",
+                )
+            if max_minutes is not None and dur_min_est is not None:
+                ok = dur_min_est <= max_minutes
+                record_result(
+                    "Durée horaire max",
+                    ok,
+                    None if ok else f"{dur_min_est:.0f} min > max {max_minutes:.0f} min",
+                )
 
         # Custom filters (user-defined)
         decision, reason_txt = _run_custom_filters(offer, user_cfilters, tz_name)
         if decision == "reject":
             if CF_DEBUG:
                 print(f"[{datetime.now()}] ⛔ Custom filter rejected offer {oid}: {reason_txt}")
-            log_offer_decision(telegram_id, offer, "rejected", reason_txt)
-            maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason_txt, tz_name), platform)
-            rejected_per_user[telegram_id].add(oid)
-            continue
+            record_result("Filtres personnalisés", False, reason_txt or "rejeté")
         elif decision == "accept":
             if CF_DEBUG:
                 print(f"[{datetime.now()}] ✅ Custom filter accepted offer {oid}: {reason_txt or 'custom filter'}")
-            offer_to_log = deepcopy(offer)
-            log_offer_decision(telegram_id, offer_to_log, "accepted", reason_txt or "custom filter")
-            maybe_send_message(telegram_id, "accepted", _build_user_message(offer_to_log, "accepted", reason_txt, tz_name), platform)
-            accepted_per_user[telegram_id].add(oid)
-            try:
-                new_end_dt = parser.isoparse(offer_to_log["rides"][0].get("endsAt")) if offer_to_log["rides"][0].get("endsAt") else None
-            except Exception:
-                new_end_dt = None
-            accepted_intervals.append((pickup, new_end_dt))
-            continue
+            accept_override = True
+            record_result("Filtres personnalisés", True, reason_txt or "accepté")
+        elif user_cfilters:
+            record_result("Filtres personnalisés", True, "ok")
 
         # 2) Price filter
         min_p = float(filters.get("price_min", 0) or 0)
         max_p = float(filters.get("price_max", float("inf")))
-        if price < min_p:
-            reason = f"prix {price} < minimum {min_p}"
-            print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
-            log_offer_decision(telegram_id, offer, "rejected", reason)
-            maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-            rejected_per_user[telegram_id].add(oid)
-            continue
-        if price > max_p:
-            reason = f"prix {price} > maximum {max_p}"
-            print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
-            log_offer_decision(telegram_id, offer, "rejected", reason)
-            maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-            rejected_per_user[telegram_id].add(oid)
-            continue
+        if min_p:
+            ok = price >= min_p
+            record_result("Prix min", ok, None if ok else f"prix {price} < minimum {min_p}")
+        if max_p != float("inf"):
+            ok = price <= max_p
+            record_result("Prix max", ok, None if ok else f"prix {price} > maximum {max_p}")
 
         # 2.5) Distance filters
         if otype == "transfer":
@@ -1292,21 +1395,12 @@ def _process_offers_for_user(
                 max_m = max_km * 1000.0
                 dist_km = dist_m / 1000.0
 
-                if min_km and dist_m < min_m:
-                    reason = f"distance {dist_km:.1f} km < minimum {min_km:g} km"
-                    print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
-                    log_offer_decision(telegram_id, offer, "rejected", reason)
-                    maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                    rejected_per_user[telegram_id].add(oid)
-                    continue
-
-                if dist_m > max_m:
-                    reason = f"distance {dist_km:.1f} km > maximum {max_km:g} km"
-                    print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
-                    log_offer_decision(telegram_id, offer, "rejected", reason)
-                    maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                    rejected_per_user[telegram_id].add(oid)
-                    continue
+                if min_km:
+                    ok = dist_m >= min_m
+                    record_result("Distance min", ok, None if ok else f"distance {dist_km:.1f} km < {min_km:g} km")
+                if max_km != float("inf"):
+                    ok = dist_m <= max_m
+                    record_result("Distance max", ok, None if ok else f"distance {dist_km:.1f} km > {max_km:g} km")
         elif otype == "hourly":
             # Optional hourly km constraints if provided
             km_inc = rid.get("kmIncluded")
@@ -1317,20 +1411,12 @@ def _process_offers_for_user(
             if km_inc is not None:
                 h_min_km = filters.get("min_hourly_km")
                 h_max_km = filters.get("max_hourly_km")
-                if h_min_km is not None and km_inc < float(h_min_km):
-                    reason = f"km inclus {km_inc:g} < minimum {float(h_min_km):g}"
-                    print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
-                    log_offer_decision(telegram_id, offer, "rejected", reason)
-                    maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                    rejected_per_user[telegram_id].add(oid)
-                    continue
-                if h_max_km is not None and km_inc > float(h_max_km):
-                    reason = f"km inclus {km_inc:g} > maximum {float(h_max_km):g}"
-                    print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
-                    log_offer_decision(telegram_id, offer, "rejected", reason)
-                    maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                    rejected_per_user[telegram_id].add(oid)
-                    continue
+                if h_min_km is not None:
+                    ok = km_inc >= float(h_min_km)
+                    record_result("Km inclus min", ok, None if ok else f"{km_inc:g} < {float(h_min_km):g}")
+                if h_max_km is not None:
+                    ok = km_inc <= float(h_max_km)
+                    record_result("Km inclus max", ok, None if ok else f"{km_inc:g} > {float(h_max_km):g}")
 
         # 3) Blacklists
         pickup_terms  = (filters.get("pickup_blacklist")  or [])
@@ -1348,40 +1434,20 @@ def _process_offers_for_user(
             return None
 
         hit_pu = _first_blacklist_hit(pu_addr, pickup_terms)
-        if hit_pu:
-            reason = f"pickup contient «{hit_pu}»"
-            print(f"[{datetime.now()}] ⛔ Rejected {oid} – pickup blacklist term '{hit_pu}'")
-            log_offer_decision(telegram_id, offer, "rejected", reason)
-            maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-            rejected_per_user[telegram_id].add(oid)
-            continue
+        if pickup_terms:
+            record_result("Pickup blacklist", hit_pu is None, None if hit_pu is None else f"pickup contient «{hit_pu}»")
 
-        if do_addr:
-            hit_do = _first_blacklist_hit(do_addr, dropoff_terms)
-            if hit_do:
-                reason = f"dropoff contient «{hit_do}»"
-                print(f"[{datetime.now()}] ⛔ Rejected {oid} – dropoff blacklist term '{hit_do}'")
-                log_offer_decision(telegram_id, offer, "rejected", reason)
-                maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                rejected_per_user[telegram_id].add(oid)
-                continue
+        hit_do = _first_blacklist_hit(do_addr, dropoff_terms) if do_addr else None
+        if dropoff_terms and do_addr:
+            record_result("Dropoff blacklist", hit_do is None, None if hit_do is None else f"dropoff contient «{hit_do}»")
 
         # 4) Class filter
         otype_dict = class_state.get(otype, {})
         matched_vc = next((cls for cls in otype_dict.keys() if cls.lower() == raw_vc.lower()), None)
         enabled = otype_dict.get(matched_vc, 0) if matched_vc else 0
-        if not enabled:
-            reason = f"{otype} '{raw_vc}' désactivé"
-            print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason} (matched='{matched_vc}')")
-            log_offer_decision(telegram_id, offer, "rejected", reason)
-            maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-            rejected_per_user[telegram_id].add(oid)
-            continue
+        record_result("Classe véhicule", bool(enabled), f"{otype} '{raw_vc}' désactivé" if not enabled else None)
 
         # 5) Booked-slots (user tz) – overlap using start & end
-        conflict = False
-        pickup_local = pickup.astimezone(gettz(tz_name))
-
         ends_at_iso = rid.get("endsAt")
         offer_end_local = None
         if ends_at_iso:
@@ -1390,6 +1456,7 @@ def _process_offers_for_user(
             except Exception:
                 offer_end_local = None
 
+        conflict_reason = None
         for slot in booked_slots:
             start_local = _parse_user_slot_local(slot.get("from"), tz_name)
             end_local   = _parse_user_slot_local(slot.get("to"), tz_name)
@@ -1408,39 +1475,113 @@ def _process_offers_for_user(
 
             if overlap:
                 slot_name = slot.get("name") or "Sans nom"
-                reason = (
+                conflict_reason = (
                     f"tombe dans créneau bloqué «{slot_name}» "
                     f"({start_local.strftime('%Y-%m-%d %H:%M')} → {end_local.strftime('%Y-%m-%d %H:%M')})"
                 )
-                print(f"[{datetime.now()}] ⛔ Rejected {oid} – in booked slot (user tz {tz_name})")
-                log_offer_decision(telegram_id, offer, "rejected", reason)
-                maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
-                rejected_per_user[telegram_id].add(oid)
-                conflict = True
                 break
-        if conflict:
-            continue
+        if booked_slots:
+            record_result("Créneaux bloqués", conflict_reason is None, conflict_reason)
 
         # 5.5) Conflict with already accepted offers (busy intervals)
         conflict_with = _find_conflict(pickup, ends_at_iso, accepted_intervals)
         if conflict_with:
             a_start, a_end = conflict_with
-            reason = (
+            conflict_text = (
                 "conflit avec une course acceptée "
                 f"({_fmt_dt_local_from_dt(a_start, tz_name)} – {_fmt_dt_local_from_dt(a_end, tz_name)})"
             )
-            print(f"[{datetime.now()}] ⛔ Rejected {oid} – {reason}")
-            log_offer_decision(telegram_id, offer, "rejected", reason)
-            maybe_send_message(telegram_id, "rejected", _build_user_message(offer, "rejected", reason, tz_name), platform)
+            record_result("Conflit trajets acceptés", False, conflict_text)
+        elif accepted_intervals:
+            record_result("Conflit trajets acceptés", True, "aucun conflit")
+
+        # --- Final decision based on accumulated filters ---
+        failed_filters = [fr for fr in filter_results if not fr["ok"]]
+        summary_text = _format_filter_summary(filter_results)
+        base_reason = "; ".join([fr["detail"] or fr["name"] for fr in failed_filters]) if failed_filters else None
+
+        forced_accept_reason = None
+        if accept_override and failed_filters:
+            forced_accept_reason = f"accepté (filtre personnalisé) malgré: {base_reason}"
+
+        is_rejected = bool(failed_filters) and not accept_override
+        reason_for_log = forced_accept_reason or base_reason
+
+        if is_rejected:
+            print(f"[{datetime.now()}] ⛔ Rejected {oid} – {base_reason or 'filtres non respectés'}")
+            log_offer_decision(telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
+            full_text = _build_user_message(
+                offer,
+                "rejected",
+                None,
+                tz_name,
+                summary_text,
+                filter_results=filter_results,
+                platform=platform,
+                forced_accept=False,
+            )
+            header_line = _build_offer_header_line(offer, "rejected", platform, forced_accept=False)
+            details_key = uuid.uuid4().hex[:16]
+            save_offer_message(telegram_id, details_key, header_line, full_text)
+            kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
+            maybe_send_message(
+                telegram_id,
+                "rejected",
+                header_line,
+                platform,
+                reply_markup=kb,
+            )
             rejected_per_user[telegram_id].add(oid)
             continue
 
-        # 6) Accept
+        # Accept (either all filters OK or overridden by custom filter)
         print(f"[{datetime.now()}] ✅ Accepted {oid} [{platform}]")
         offer_to_log = deepcopy(offer)
-        log_offer_decision(telegram_id, offer_to_log, "accepted", None)
-        maybe_send_message(telegram_id, "accepted", _build_user_message(offer_to_log, "accepted", None, tz_name), platform)
+        log_offer_decision(telegram_id, offer_to_log, "accepted", reason_for_log)
+        full_text = _build_user_message(
+            offer_to_log,
+            "accepted",
+            None,
+            tz_name,
+            summary_text,
+            filter_results=filter_results,
+            platform=platform,
+            forced_accept=bool(accept_override and failed_filters),
+        )
+        header_line = _build_offer_header_line(offer_to_log, "accepted", platform, forced_accept=bool(accept_override and failed_filters))
+        details_key = uuid.uuid4().hex[:16]
+        save_offer_message(telegram_id, details_key, header_line, full_text)
+        kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
+        maybe_send_message(
+            telegram_id,
+            "accepted",
+            header_line,
+            platform,
+            reply_markup=kb,
+        )
         accepted_per_user[telegram_id].add(oid)
+
+        # Optionally auto-reserve the offer upstream
+        if AUTO_RESERVE_ENABLED:
+            try:
+                if platform == "p1":
+                    if p1_token:
+                        rs, rb = reserve_offer_p1(p1_token, oid)
+                        print(f"[{datetime.now()}] 🎯 P1 reserve {oid} -> {rs} | {rb}")
+                    else:
+                        print(f"[{datetime.now()}] ⚠️ P1 reserve skipped (no token) for user {telegram_id}")
+                else:  # p2
+                    if p2_token:
+                        bid_price = offer_to_log.get("price")
+                        if bid_price is None:
+                            print(f"[{datetime.now()}] ⚠️ P2 reserve skipped (no price) for {oid}")
+                        else:
+                            rs, rb = reserve_offer_p2(p2_token, oid, float(bid_price))
+                            print(f"[{datetime.now()}] 🎯 P2 reserve {oid} -> {rs} | {rb}")
+                    else:
+                        print(f"[{datetime.now()}] ⚠️ P2 reserve skipped (no portal token) for user {telegram_id}")
+            except Exception as e:
+                print(f"[{datetime.now()}] ❌ Auto-reserve error for {oid}: {e}")
 
         try:
             new_end_dt = parser.isoparse(offer_to_log["rides"][0].get("endsAt")) if offer_to_log["rides"][0].get("endsAt") else None
@@ -1603,6 +1744,7 @@ def poll_user(user):
         portal_token = _ensure_portal_token(telegram_id, email, password)
         
     if ALWAYS_POLL_REAL_ORDERS:
+        # Platform 2 rides (Athena)
         if portal_token:
             prev_etag = _athena_rides_etag.get(telegram_id)
             status_code, payload, new_etag = _athena_get_rides(portal_token, etag=prev_etag)
@@ -1611,24 +1753,19 @@ def poll_user(user):
 
             if status_code == 200 and isinstance(payload, dict):
                 data_all = (payload or {}).get("data") or []
-                # keep only rides assigned to our driver id if we have it
                 data_kept = _filter_rides_by_bl_uuid(data_all, bl_uuid) if bl_uuid else data_all
-
-                # print/dump ONLY the kept rides
                 filtered_payload = {"data": data_kept, "included": (payload or {}).get("included") or []}
                 snap = _rides_snapshot_from_athena_payload(filtered_payload, tz_name)
                 _dump_rides(telegram_id, snap, "p2")
-
-                # build intervals from the kept rides
-                accepted_intervals = _extract_intervals_from_rides([
+                intervals_p2 = _extract_intervals_from_rides([
                     (r.get("attributes") or {}) | {"starts_at": (r.get("attributes") or {}).get("starts_at")}
                     for r in (data_kept or [])
                 ])
+                accepted_intervals.extend(intervals_p2)
                 print(
-                    f"[{datetime.now()}] 📚 Loaded {len(accepted_intervals)} assigned interval(s) "
+                    f"[{datetime.now()}] 📚 Loaded {len(intervals_p2)} assigned interval(s) "
                     f"(kept {len(data_kept)}/{len(data_all)} rides) from Athena for user {telegram_id}"
                 )
-
             elif status_code == 304:
                 if ATHENA_PRINT_DEBUG:
                     print(f"[{datetime.now()}] 📦 Athena rides 304 Not Modified for user {telegram_id} (etag hit)")
@@ -1639,18 +1776,17 @@ def poll_user(user):
             else:
                 print(f"[{datetime.now()}] ⚠️ Athena rides returned status {status_code} for user {telegram_id}")
 
-        elif token and str(token).strip():
+        # Platform 1 rides (mobile) — also fetch even if portal is present
+        if token and str(token).strip():
             status_code, ride_results = get_rides_p1(token)
             if status_code == 200 and isinstance(ride_results, list):
                 kept = _filter_rides_by_bl_uuid(ride_results, bl_uuid) if bl_uuid else ride_results
-
-                # print/dump ONLY the kept rides
                 snap = _rides_snapshot_from_p1_list(kept, tz_name)
                 _dump_rides(telegram_id, snap, "p1")
-
-                accepted_intervals = _extract_intervals_from_rides(kept)
+                intervals_p1 = _extract_intervals_from_rides(kept)
+                accepted_intervals.extend(intervals_p1)
                 print(
-                    f"[{datetime.now()}] 📚 Loaded {len(accepted_intervals)} assigned interval(s) "
+                    f"[{datetime.now()}] 📚 Loaded {len(intervals_p1)} assigned interval(s) "
                     f"(kept {len(kept)}/{len(ride_results)} rides) from P1 /rides for user {telegram_id}"
                 )
 
@@ -1666,7 +1802,7 @@ def poll_user(user):
                 print(f"[{datetime.now()}] ⚠️ P1 /rides network error for user {telegram_id}")
             else:
                 print(f"[{datetime.now()}] ⚠️ P1 /rides returned status {status_code} for user {telegram_id}")
-        else:
+        elif not portal_token:
             existing = get_pinned_warnings(telegram_id)
             if not existing["expired_msg_id"] and not existing["no_token_msg_id"]:
                 pin_warning_if_needed(telegram_id, "no_token")
@@ -1691,7 +1827,7 @@ def poll_user(user):
                             "name": "la Vie en Rose Quartiers Dix 30",
                             "address": "la Vie en Rose Quartiers Dix 30, Avenue des Lumières 1600, J4Y 0A5 Brossard, Québec",
                         },
-                        "pickupTime": "2025-09-17T20:45:00-04:00",
+                        "pickupTime": "2025-12-24T20:45:00-04:00",
                         "kmIncluded": 80,
                         "durationMinutes": 120,
                         "guestRequests": ["Baby seat", "VIP pickup"],
@@ -1743,12 +1879,16 @@ def poll_user(user):
                         tg_unpin_message(telegram_id, existing["no_token_msg_id"])
                         clear_pinned_warning(telegram_id, "no_token")
                     pin_warning_if_needed(telegram_id, "expired")
+                print(f"[{datetime.now()}] ⚠️ P1 offers returned {status_code} for user {telegram_id}")
             elif status_code == 200:
                 set_token_status(telegram_id, "valid")
                 unpin_warning_if_any(telegram_id, "expired")
                 unpin_warning_if_any(telegram_id, "no_token")
                 # results already tagged with _platform='p1' in get_offers_p1
                 offers_p1 = results or []
+                print(f"[{datetime.now()}] 📥 P1 offers for user {telegram_id}: {len(offers_p1)}")
+            else:
+                print(f"[{datetime.now()}] ⚠️ P1 offers returned {status_code} for user {telegram_id} | body={results}")
         else:
             existing = get_pinned_warnings(telegram_id)
             if not existing["expired_msg_id"] and not existing["no_token_msg_id"]:
@@ -1763,7 +1903,7 @@ def poll_user(user):
                     "id": "2254f2w94e-ba06-4b5ddb-aec3-25e0x9bddfwddwfdfww21ecdf05f",
                     "type": "offers",
                     "attributes": {
-                        "starts_at": "2025-09-20T15:30:00-04:00",
+                        "starts_at": "2025-12-25T15:30:00-04:00",
                         "price": "236.39",
                         "currency": "USD",
                         "distance": 166560,
@@ -1831,6 +1971,7 @@ def poll_user(user):
                     mapped = _map_portal_offer(raw, included)
                     if mapped:
                         offers_p2.append(mapped)
+                print(f"[{datetime.now()}] 📥 P2 offers for user {telegram_id}: {len(offers_p2)}")
             elif status_code == 304 and ATHENA_PRINT_DEBUG:
                 print(f"[{datetime.now()}] 📦 Athena offers 304 Not Modified for user {telegram_id}")
 
@@ -1851,6 +1992,8 @@ def poll_user(user):
         blocked_days,
         accepted_intervals,
         tz_name,
+        p1_token=token,
+        p2_token=portal_token,
     )
 
     return f"Done with user {telegram_id}"
