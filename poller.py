@@ -67,8 +67,8 @@ POLL_INTERVAL = 5
 MAX_WORKERS = 10
 
 # Toggle mock data for development (default: real polling)
-USE_MOCK_P1 = False      # set True to use mock offers for Platform 1
-USE_MOCK_P2 = False      # set True to use mock offers for Platform 2
+USE_MOCK_P1 = True      # set True to use mock offers for Platform 1
+USE_MOCK_P2 = True      # set True to use mock offers for Platform 2
 ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when available)
 # When enabled, accepted offers will be actually reserved via API calls (P1/P2).
 AUTO_RESERVE_ENABLED = False
@@ -90,9 +90,9 @@ ATHENA_RELOGIN_SKEW_S = 3600 * 24 * 1000  # seconds before exp to proactively re
 _athena_offers_etag: Dict[int, Optional[str]] = {}  # telegram_id -> etag (offers)
 _athena_rides_etag: Dict[int, Optional[str]] = {}   # telegram_id -> etag (rides)
 
-# In-memory dedupe for accepted/rejected per user (reset every 24h)
+# In-memory dedupe for accepted per user + rejected per user/platform (reset every 24h)
 accepted_per_user = defaultdict(set)
-rejected_per_user = defaultdict(set)
+rejected_per_user = defaultdict(lambda: defaultdict(set))
 _CACHE_RESET_INTERVAL = timedelta(hours=24)
 _cache_last_reset = datetime.now(timezone.utc)
 
@@ -1249,7 +1249,7 @@ def _process_offers_for_user(
         platform = offer.get("_platform", "p1")
 
         # Skip already processed (in-mem)
-        if oid in accepted_per_user[telegram_id] or oid in rejected_per_user[telegram_id]:
+        if oid in accepted_per_user[telegram_id] or oid in rejected_per_user[telegram_id][platform]:
             print(f"[{datetime.now()}] ⏭️ Skipping offer {oid} for user {telegram_id} – already processed (memory).")
             continue
 
@@ -1531,7 +1531,7 @@ def _process_offers_for_user(
                 platform,
                 reply_markup=kb,
             )
-            rejected_per_user[telegram_id].add(oid)
+            rejected_per_user[telegram_id][platform].add(oid)
             continue
 
         # Accept (either all filters OK or overridden by custom filter)
@@ -1900,7 +1900,7 @@ def poll_user(user):
         portal_sample = {
             "data": [
                 {
-                    "id": "2254f2w94e-ba06-4b5ddb-aec3-25e0x9bddfwddwfdfww21ecdf05f",
+                    "id": "mock-hourly-1",
                     "type": "offers",
                     "attributes": {
                         "starts_at": "2025-12-25T15:30:00-04:00",
