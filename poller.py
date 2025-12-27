@@ -67,8 +67,8 @@ POLL_INTERVAL = 5
 MAX_WORKERS = 10
 
 # Toggle mock data for development (default: real polling)
-USE_MOCK_P1 = True      # set True to use mock offers for Platform 1
-USE_MOCK_P2 = True      # set True to use mock offers for Platform 2
+USE_MOCK_P1 = False      # set True to use mock offers for Platform 1
+USE_MOCK_P2 = False      # set True to use mock offers for Platform 2
 ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when available)
 # When enabled, accepted offers will be actually reserved via API calls (P1/P2).
 AUTO_RESERVE_ENABLED = False
