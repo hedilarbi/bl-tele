@@ -93,13 +93,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⛔ Admin bot is already assigned to another user.")
                 return
         await update.message.reply_text(
-            "🛠️ *Admin Bot*\n\n"
+            "🛠️ <b>Admin Bot</b>\n\n"
             "Commands:\n"
-            "• /addbot <token> [name] [timezone]\n"
+            "• /addbot <code>&lt;token&gt; [name] [timezone]</code>\n"
             "• /listbots\n"
-            "• /botinfo <bot_id>\n"
+            "• /botinfo <code>&lt;bot_id&gt;</code>\n"
             "• /listusers\n",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         return
 

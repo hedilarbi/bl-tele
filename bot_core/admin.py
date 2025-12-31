@@ -90,9 +90,12 @@ async def admin_add_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     add_bot_instance(bot_id, token, bot_name, role="user", default_timezone=tz)
     tz_disp = tz or "UTC"
+    bot_id_disp = html.escape(str(bot_id))
+    bot_name_disp = html.escape(str(bot_name))
+    tz_disp_safe = html.escape(str(tz_disp))
     await update.message.reply_text(
-        f"✅ Bot added: `{bot_id}` ({bot_name}) tz={tz_disp}",
-        parse_mode="Markdown",
+        f"✅ Bot added: <code>{bot_id_disp}</code> ({bot_name_disp}) tz={tz_disp_safe}",
+        parse_mode="HTML",
     )
 
 
