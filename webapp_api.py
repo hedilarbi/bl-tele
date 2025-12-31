@@ -39,7 +39,8 @@ from db import (
     set_bl_account, get_bl_account,           # may be sanitized (no password)
     get_portal_token, update_portal_token,
     get_bl_uuid, get_user_timezone, get_endtime_formulas,
-    replace_endtime_formulas, add_endtime_formula, delete_endtime_formula,set_bl_uuid,
+    replace_endtime_formulas, add_endtime_formula, delete_endtime_formula, set_bl_uuid,
+    get_bot_token, list_bot_instances, set_bot_admin_active,
 )
 
 try:
@@ -50,9 +51,6 @@ except Exception:
 # ----------------- Env -----------------
 load_dotenv()
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN missing")
 
 API_HOST = "https://chauffeur-app-api.blacklane.com"  # mobile fallback
 ATHENA_BASE = "https://athena.blacklane.com"
@@ -119,7 +117,17 @@ async def _log_requests(request: Request, call_next):
         raise
 
 # ----------------- Auth helpers -----------------
-def _validate_init_data(init_data_raw: str, max_age_sec: int = 600) -> dict:
+def _resolve_bot_token(init_data_raw: str, bot_id: Optional[str]) -> Optional[str]:
+    if bot_id:
+        tok = get_bot_token(bot_id)
+        if tok:
+            return tok
+    return None
+
+def _validate_init_data(init_data_raw: str, bot_token: Optional[str], max_age_sec: int = 600) -> dict:
+    if not bot_token:
+        logging.warning("initData validation failed: unknown bot token")
+        raise HTTPException(401, "Unknown bot")
     try:
         qs = urllib.parse.parse_qs(init_data_raw, strict_parsing=True)
     except Exception:
@@ -133,7 +141,7 @@ def _validate_init_data(init_data_raw: str, max_age_sec: int = 600) -> dict:
         raise HTTPException(401, "Missing hash")
 
     data_check_string = "\n".join(f"{k}={data[k]}" for k in sorted(data.keys()))
-    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
     check = hmac.new(secret, data_check_string.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(check, tg_hash):
         logging.warning("initData HMAC mismatch")
@@ -155,20 +163,26 @@ def _validate_init_data(init_data_raw: str, max_age_sec: int = 600) -> dict:
         raise HTTPException(401, "No user in initData")
     return user
 
-def _require_user(auth_header: Optional[str]) -> int:
+def _require_user(auth_header: Optional[str], bot_id: Optional[str] = None) -> int:
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
     if not auth_header or not auth_header.startswith("tma "):
         raise HTTPException(401, "Use header: Authorization: tma <initData>")
     init_data_raw = auth_header[4:]
-    user = _validate_init_data(init_data_raw)
+    bot_token = _resolve_bot_token(init_data_raw, bot_id)
+    user = _validate_init_data(init_data_raw, bot_token)
     uid = int(user["id"])
     logging.info("🔑 Auth OK for user_id=%s", uid)
     return uid
 
-def _require_user_from_any(auth_header: Optional[str], tma_qs: Optional[str]) -> int:
+def _require_user_from_any(auth_header: Optional[str], tma_qs: Optional[str], bot_id: Optional[str]) -> int:
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
     if auth_header and auth_header.startswith("tma "):
-        return _require_user(auth_header)
+        return _require_user(auth_header, bot_id)
     if tma_qs:
-        user = _validate_init_data(tma_qs)
+        bot_token = _resolve_bot_token(tma_qs, bot_id)
+        user = _validate_init_data(tma_qs, bot_token)
         uid = int(user["id"])
         logging.info("🔑 Auth OK (query) uid=%s", uid)
         return uid
@@ -330,7 +344,7 @@ def _compute_ends_at_for_ride(ride: dict, formulas: list, pickup_dt: datetime, t
     return None
 
 # ----------------- Internal creds helper (fetch real password) -----------------
-def _get_bl_creds_from_db(uid: int) -> Tuple[Optional[str], Optional[str]]:
+def _get_bl_creds_from_db(bot_id: str, uid: int) -> Tuple[Optional[str], Optional[str]]:
     """
     Try a few likely places to find email+password.
     Adjust the SQL to your actual schema if needed.
@@ -341,7 +355,7 @@ def _get_bl_creds_from_db(uid: int) -> Tuple[Optional[str], Optional[str]]:
 
         # Try users table first
         try:
-            cur.execute("SELECT bl_email, bl_password FROM users WHERE telegram_id = ?", (uid,))
+            cur.execute("SELECT bl_email, bl_password FROM users WHERE bot_id = ? AND telegram_id = ?", (bot_id, uid))
             row = cur.fetchone()
             if row and (row[0] or row[1]):
                 email = (row[0] or "").strip()
@@ -354,7 +368,7 @@ def _get_bl_creds_from_db(uid: int) -> Tuple[Optional[str], Optional[str]]:
 
         # Try dedicated bl_accounts table
         try:
-            cur.execute("SELECT email, password FROM bl_accounts WHERE telegram_id = ?", (uid,))
+            cur.execute("SELECT email, password FROM bl_accounts WHERE bot_id = ? AND telegram_id = ?", (bot_id, uid))
             row = cur.fetchone()
             if row and (row[0] or row[1]):
                 email = (row[0] or "").strip()
@@ -367,7 +381,7 @@ def _get_bl_creds_from_db(uid: int) -> Tuple[Optional[str], Optional[str]]:
 
         # Try generic accounts table
         try:
-            cur.execute("SELECT email, password FROM accounts WHERE telegram_id = ?", (uid,))
+            cur.execute("SELECT email, password FROM accounts WHERE bot_id = ? AND telegram_id = ?", (bot_id, uid))
             row = cur.fetchone()
             if row and (row[0] or row[1]):
                 email = (row[0] or "").strip()
@@ -453,19 +467,19 @@ def _hades_fetch_plain(token: str, page: int, page_size: int) -> Tuple[int, Opti
         logging.warning("Hades network error")
         return 0, None
 
-def _fetch_hades_with_login_flow(uid: int, page: int, page_size: int) -> Tuple[int, Optional[dict]]:
+def _fetch_hades_with_login_flow(bot_id: str, uid: int, page: int, page_size: int) -> Tuple[int, Optional[dict]]:
     """
     Steps:
     1) If email+password and NO portal_token -> login, store, fetch.
     2) If email+password and portal_token -> use it; on 401/403 -> login, store, retry.
     3) If no email+password -> let caller fallback to mobile.
     """
-    email, password = _get_bl_creds_from_db(uid)
+    email, password = _get_bl_creds_from_db(bot_id, uid)
     if not (email and password):
         logging.info("🔸 No portal credentials for uid=%s", uid)
         return 0, None  # caller falls back to mobile
 
-    tok = get_portal_token(uid)
+    tok = get_portal_token(bot_id, uid)
     if isinstance(tok, (list, tuple)):
         tok = tok[0] if tok else None
     logging.info("🔑 Current portal_token: %s", "present" if tok else "not present")
@@ -477,7 +491,7 @@ def _fetch_hades_with_login_flow(uid: int, page: int, page_size: int) -> Tuple[i
         if not ok or not new_tok:
             logging.warning("❌ Athena login failed (uid=%s): %s", uid, note)
             return 401, None
-        update_portal_token(uid, new_tok)
+        update_portal_token(bot_id, uid, new_tok)
         tok = new_tok
         sc, body = _hades_fetch_plain(tok, page, page_size)
         return sc, body
@@ -489,7 +503,7 @@ def _fetch_hades_with_login_flow(uid: int, page: int, page_size: int) -> Tuple[i
         logging.info("🔁 Token rejected (%s). Logging in again (uid=%s).", sc, uid)
         ok, new_tok, note = _athena_login(email, password)
         if ok and new_tok:
-            update_portal_token(uid, new_tok)
+            update_portal_token(bot_id, uid, new_tok)
             sc, body = _hades_fetch_plain(new_tok, page, page_size)
         else:
             logging.warning("❌ Re-login failed (uid=%s): %s", uid, note)
@@ -648,6 +662,9 @@ class AdminToggleUserCF(BaseModel):
 class ToggleMyCF(BaseModel):
     enabled: bool
 
+class AdminBotPatch(BaseModel):
+    admin_active: bool
+
 class BLAccountIn(BaseModel):
     email: str
     password: str
@@ -669,10 +686,10 @@ class EndtimeFormulaIn(BaseModel):
         return f"{h:02d}:{m:02d}"
 
 # ----------------- Utility: mobile token -----------------
-def _get_mobile_token(uid: int) -> Optional[str]:
+def _get_mobile_token(bot_id: str, uid: int) -> Optional[str]:
     try:
         conn = sqlite3.connect(DB_FILE); cur = conn.cursor()
-        cur.execute("SELECT token FROM users WHERE telegram_id = ?", (uid,))
+        cur.execute("SELECT token FROM users WHERE bot_id = ? AND telegram_id = ?", (bot_id, uid))
         row = cur.fetchone(); conn.close()
         return row[0] if row and row[0] else None
     except Exception:
@@ -684,24 +701,32 @@ def ping():
     return {"ok": True, "ts": int(time.time())}
 
 @app.get("/debug/whoami")
-def whoami(Authorization: Optional[str] = Header(default=None)):
+def whoami(Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     try:
-        uid = _require_user(Authorization)
+        uid = _require_user(Authorization, bot_id)
         return {"ok": True, "user_id": uid}
     except HTTPException as e:
         return {"ok": False, "error": e.detail}
 
 # --- Slots ---
 @app.get("/webapp/slots")
-def list_slots(Authorization: Optional[str] = Header(default=None), tma: Optional[str] = Query(default=None)):
-    uid = _require_user_from_any(Authorization, tma)
-    rows = get_booked_slots(uid)
+def list_slots(
+    Authorization: Optional[str] = Header(default=None),
+    tma: Optional[str] = Query(default=None),
+    bot_id: Optional[str] = Query(default=None),
+):
+    uid = _require_user_from_any(Authorization, tma, bot_id)
+    rows = get_booked_slots(bot_id, uid)
     logging.info("📦 list_slots user=%s -> %d rows", uid, len(rows or []))
     return {"slots": rows}
 
 @app.post("/webapp/slots")
-def create_slot(payload: CreateSlotIn, Authorization: Optional[str] = Header(default=None)):
-    uid = _require_user(Authorization)
+def create_slot(
+    payload: CreateSlotIn,
+    Authorization: Optional[str] = Header(default=None),
+    bot_id: Optional[str] = Query(default=None),
+):
+    uid = _require_user(Authorization, bot_id)
     dt_start = _parse_dt(payload.start); dt_end = _parse_dt(payload.end)
     if not (dt_start and dt_end):
         raise HTTPException(400, detail={
@@ -710,23 +735,27 @@ def create_slot(payload: CreateSlotIn, Authorization: Optional[str] = Header(def
             "accepted": list(ACCEPTED_FORMATS),
             "hint": "Use HTML5 datetime-local or dd/mm/yyyy HH:MM",
         })
-    add_booked_slot(uid, _fmt_ddmmyyyy(dt_start), _fmt_ddmmyyyy(dt_end), payload.name or None)
+    add_booked_slot(bot_id, uid, _fmt_ddmmyyyy(dt_start), _fmt_ddmmyyyy(dt_end), payload.name or None)
     return {"ok": True}
 
 @app.delete("/webapp/slots/{slot_id}")
-def delete_slot(slot_id: int, Authorization: Optional[str] = Header(default=None)):
-    uid = _require_user(Authorization)
+def delete_slot(
+    slot_id: int,
+    Authorization: Optional[str] = Header(default=None),
+    bot_id: Optional[str] = Query(default=None),
+):
+    uid = _require_user(Authorization, bot_id)
     if delete_booked_slot:
         try:
-            delete_booked_slot(slot_id)
+            delete_booked_slot(bot_id, slot_id)
             return {"ok": True}
         except Exception as e:
             logging.warning("custom deleter failed: %s", e)
     try:
         conn = sqlite3.connect(DB_FILE); cur = conn.cursor()
-        cur.execute("DELETE FROM booked_slots WHERE id = ? AND telegram_id = ?", (slot_id, uid))
+        cur.execute("DELETE FROM booked_slots WHERE id = ? AND bot_id = ? AND telegram_id = ?", (slot_id, bot_id, uid))
         if cur.rowcount == 0:
-            cur.execute("DELETE FROM booked_slots WHERE id = ?", (slot_id,))
+            cur.execute("DELETE FROM booked_slots WHERE id = ? AND bot_id = ?", (slot_id, bot_id))
         conn.commit(); conn.close()
         return {"ok": True}
     except Exception as e:
@@ -735,57 +764,66 @@ def delete_slot(slot_id: int, Authorization: Optional[str] = Header(default=None
 
 # --- Days ---
 @app.get("/webapp/days")
-def list_blocked_days(Authorization: Optional[str] = Header(default=None), tma: Optional[str] = Query(default=None)):
-    uid = _require_user_from_any(Authorization, tma)
-    rows = get_blocked_days(uid)
+def list_blocked_days(
+    Authorization: Optional[str] = Header(default=None),
+    tma: Optional[str] = Query(default=None),
+    bot_id: Optional[str] = Query(default=None),
+):
+    uid = _require_user_from_any(Authorization, tma, bot_id)
+    rows = get_blocked_days(bot_id, uid)
     return {"days": [r["day"] for r in rows]}
 
 @app.post("/webapp/days/toggle")
-def toggle_blocked_day(payload: ToggleDayIn, Authorization: Optional[str] = Header(default=None)):
-    uid = _require_user(Authorization)
+def toggle_blocked_day(
+    payload: ToggleDayIn,
+    Authorization: Optional[str] = Header(default=None),
+    bot_id: Optional[str] = Query(default=None),
+):
+    uid = _require_user(Authorization, bot_id)
     dt = _parse_day_ddmmyyyy((payload.day or "").strip())
     if not dt:
         raise HTTPException(400, detail={"error": "bad_day_format", "expected": "dd/mm/YYYY", "got": payload.day})
     day = _fmt_day_ddmmyyyy(dt)
-    existing = {d["day"] for d in get_blocked_days(uid)}
+    existing = {d["day"] for d in get_blocked_days(bot_id, uid)}
     if day in existing:
-        for d in get_blocked_days(uid):
+        for d in get_blocked_days(bot_id, uid):
             if d["day"] == day:
-                delete_blocked_day(d["id"])
+                delete_blocked_day(bot_id, d["id"])
                 return {"ok": True, "blocked": False, "day": day}
         raise HTTPException(404, "Not found")
     else:
-        add_blocked_day(uid, day)
+        add_blocked_day(bot_id, uid, day)
         return {"ok": True, "blocked": True, "day": day}
 
 # --- Rides (Hades first per your steps; fallback to mobile ONLY if no creds) ---
 @app.get("/webapp/rides")
 def list_user_rides(
     Authorization: Optional[str] = Header(default=None),
+    bot_id: Optional[str] = Query(default=None),
     page: int = Query(1, ge=1),
     limit: int = Query(30, ge=1, le=200),
     status: Optional[str] = Query(default=None),
 ):
-    uid = _require_user(Authorization)
+    uid = _require_user(Authorization, bot_id)
 
-    tz_name = get_user_timezone(uid) or "UTC"
-    formulas = _normalize_formulas(get_endtime_formulas(uid))
+    tz_name = get_user_timezone(bot_id, uid) or "UTC"
+    formulas = _normalize_formulas(get_endtime_formulas(bot_id, uid))
 
     normalized: List[dict] = []
     used_platform = None
 
     # Try Athena/Hades if raw creds exist
-    email, password = _get_bl_creds_from_db(uid)
+    email, password = _get_bl_creds_from_db(bot_id, uid)
     have_creds = bool((email or "").strip() and (password or "").strip())
     logging.info("👤 have_creds=%s (email=%s, len(password)=%d)", have_creds, (email or ""), len(password or ""))
 
     if have_creds:
-        sc, payload = _fetch_hades_with_login_flow(uid, page=page, page_size=limit)
+        sc, payload = _fetch_hades_with_login_flow(bot_id, uid, page=page, page_size=limit)
         logging.info("Hades flow result status=%s", sc)
         if sc and 200 <= sc < 300:
             data_all = (payload or {}).get("data") if isinstance(payload, dict) else []
             included = (payload or {}).get("included") if isinstance(payload, dict) else []
-            bl_uuid = get_bl_uuid(uid)
+            bl_uuid = get_bl_uuid(bot_id, uid)
             kept = _filter_rides_by_bl_uuid(data_all or [], bl_uuid) if bl_uuid else (data_all or [])
 
             for raw in kept:
@@ -816,7 +854,7 @@ def list_user_rides(
             raise HTTPException(502, detail="upstream_error")
 
     # No creds → fallback to mobile /rides
-    token = _get_mobile_token(uid)
+    token = _get_mobile_token(bot_id, uid)
     if not token:
         raise HTTPException(401, detail={"error": "no_token", "hint": "Add your mobile session token or portal account."})
 
@@ -844,7 +882,7 @@ def list_user_rides(
             else:
                 raw_list = []
 
-            bl_uuid = get_bl_uuid(uid)
+            bl_uuid = get_bl_uuid(bot_id, uid)
             kept = _filter_rides_by_bl_uuid(raw_list, bl_uuid) if bl_uuid else raw_list
 
             for it in kept:
@@ -885,9 +923,13 @@ def list_user_rides(
 
 # --- Filters UI (mini-app) ---
 @app.get("/webapp/custom-filters")
-def webapp_list_my_filters(Authorization: Optional[str] = Header(default=None), tma: Optional[str] = Query(default=None)):
-    uid = _require_user_from_any(Authorization, tma)
-    rows = list_user_custom_filters(uid)
+def webapp_list_my_filters(
+    Authorization: Optional[str] = Header(default=None),
+    tma: Optional[str] = Query(default=None),
+    bot_id: Optional[str] = Query(default=None),
+):
+    uid = _require_user_from_any(Authorization, tma, bot_id)
+    rows = list_user_custom_filters(bot_id, uid)
     items = []
     for r in rows:
         effective_enabled = bool(r.get("user_enabled")) and bool(r.get("global_enabled", 1))
@@ -895,16 +937,25 @@ def webapp_list_my_filters(Authorization: Optional[str] = Header(default=None), 
     return {"filters": items}
 
 @app.post("/webapp/custom-filters/{slug}/toggle")
-def webapp_toggle_my_filter(slug: str, payload: ToggleMyCF, Authorization: Optional[str] = Header(default=None)):
-    uid = _require_user(Authorization)
-    toggle_user_custom_filter(uid, slug, bool(payload.enabled))
+def webapp_toggle_my_filter(
+    slug: str,
+    payload: ToggleMyCF,
+    Authorization: Optional[str] = Header(default=None),
+    bot_id: Optional[str] = Query(default=None),
+):
+    uid = _require_user(Authorization, bot_id)
+    toggle_user_custom_filter(bot_id, uid, slug, bool(payload.enabled))
     return {"ok": True}
 
 # --- BL portal account (mini-app) ---
 @app.get("/webapp/bl-account")
-def webapp_get_bl_account(Authorization: Optional[str] = Header(default=None), tma: Optional[str] = Query(default=None)):
-    uid = _require_user_from_any(Authorization, tma)
-    acc = get_bl_account(uid) or {}
+def webapp_get_bl_account(
+    Authorization: Optional[str] = Header(default=None),
+    tma: Optional[str] = Query(default=None),
+    bot_id: Optional[str] = Query(default=None),
+):
+    uid = _require_user_from_any(Authorization, tma, bot_id)
+    acc = get_bl_account(bot_id, uid) or {}
     return {"email": acc.get("email")}
 
 @app.post("/webapp/bl-account")
@@ -912,8 +963,9 @@ def webapp_save_bl_account(
     payload: BLAccountIn,
     Authorization: Optional[str] = Header(default=None),
     tma: Optional[str] = Query(default=None),
+    bot_id: Optional[str] = Query(default=None),
 ):
-    uid = _require_user_from_any(Authorization, tma)
+    uid = _require_user_from_any(Authorization, tma, bot_id)
 
     email = (payload.email or "").strip()
     password = (payload.password or "").strip()
@@ -921,7 +973,7 @@ def webapp_save_bl_account(
         raise HTTPException(400, detail={"error": "missing_fields"})
 
     # 1) Save credentials
-    set_bl_account(uid, email, password)
+    set_bl_account(bot_id, uid, email, password)
 
     # 2) Login to Athena
     ok, token, note = _athena_login(email, password)
@@ -932,7 +984,7 @@ def webapp_save_bl_account(
         raise HTTPException(status_code=502, detail={"error": "portal_login_failed", "note": note})
 
     # 3) Persist portal token
-    update_portal_token(uid, token)
+    update_portal_token(bot_id, uid, token)
 
     # 4) Fetch UUID from Partner Portal /me
     status, me = _portal_get_me(token)
@@ -943,7 +995,7 @@ def webapp_save_bl_account(
 
     bl_id = (me or {}).get("id")
     if isinstance(bl_id, str) and bl_id.strip():
-        set_bl_uuid(uid, bl_id.strip())
+        set_bl_uuid(bot_id, uid, bl_id.strip())
         return {"ok": True, "uuid": bl_id}
 
     # Token worked but response lacked id
@@ -952,27 +1004,42 @@ def webapp_save_bl_account(
 
 # --- Admin: users listing ---
 @app.get("/admin/users")
-def admin_users(Authorization: Optional[str] = Header(default=None)):
+def admin_users(Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     _require_admin(Authorization)
     conn = sqlite3.connect(DB_FILE); cur = conn.cursor()
-    cur.execute("""
+    if bot_id:
+        cur.execute("""
         SELECT
-          telegram_id, active, bl_email,
+          u.bot_id, u.telegram_id, u.active, u.bl_email, COALESCE(b.admin_active, 0),
           tg_first_name, tg_last_name, tg_username, tg_lang, tg_is_premium,
           tg_last_seen, tg_first_seen, tg_chat_type, tg_chat_id, tg_chat_title
-        FROM users
+        FROM users u
+        LEFT JOIN bot_instances b ON b.bot_id = u.bot_id
+        WHERE u.bot_id = ?
         ORDER BY telegram_id ASC
+    """, (bot_id,))
+    else:
+        cur.execute("""
+        SELECT
+          u.bot_id, u.telegram_id, u.active, u.bl_email, COALESCE(b.admin_active, 0),
+          tg_first_name, tg_last_name, tg_username, tg_lang, tg_is_premium,
+          tg_last_seen, tg_first_seen, tg_chat_type, tg_chat_id, tg_chat_title
+        FROM users u
+        LEFT JOIN bot_instances b ON b.bot_id = u.bot_id
+        ORDER BY u.bot_id ASC, u.telegram_id ASC
     """)
     rows = cur.fetchall(); conn.close()
 
     users = []
     for r in rows:
-        (uid, active, email,
+        (b_id, uid, active, email, bot_admin_active,
          first, last, uname, lang, is_prem,
          last_seen, first_seen, chat_type, chat_id, chat_title) = r
         users.append({
+            "bot_id": b_id,
             "telegram_id": uid,
             "active": bool(active),
+            "bot_admin_active": bool(bot_admin_active),
             "email": email or "",
             "tg": {
                 "first_name": first or "",
@@ -988,6 +1055,18 @@ def admin_users(Authorization: Optional[str] = Header(default=None)):
             },
         })
     return {"users": users}
+
+# --- Admin: bots listing / activation ---
+@app.get("/admin/bots")
+def admin_bots(Authorization: Optional[str] = Header(default=None)):
+    _require_admin(Authorization)
+    return {"bots": list_bot_instances()}
+
+@app.patch("/admin/bots/{bot_id}")
+def admin_patch_bot(bot_id: str, payload: AdminBotPatch, Authorization: Optional[str] = Header(default=None)):
+    _require_admin(Authorization)
+    set_bot_admin_active(bot_id, bool(payload.admin_active))
+    return {"ok": True}
 
 # --- Admin: list all filters ---
 @app.get("/admin/custom-filters")
@@ -1020,47 +1099,62 @@ def admin_update_filter(slug: str, payload: AdminPatchCF, Authorization: Optiona
 
 # --- Admin: assign/unassign/toggle for a user ---
 @app.get("/admin/users/{telegram_id}/custom-filters")
-def admin_user_filters(telegram_id: int, Authorization: Optional[str] = Header(default=None)):
+def admin_user_filters(telegram_id: int, Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     _require_admin(Authorization)
-    assigned = list_user_custom_filters(telegram_id)
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
+    assigned = list_user_custom_filters(bot_id, telegram_id)
     return {"assigned": assigned, "all": list_all_custom_filters()}
 
 @app.post("/admin/users/{telegram_id}/custom-filters/{slug}")
-def admin_assign_cf(telegram_id: int, slug: str, Authorization: Optional[str] = Header(default=None)):
+def admin_assign_cf(telegram_id: int, slug: str, Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     _require_admin(Authorization)
-    assign_custom_filter(telegram_id, slug, True)
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
+    assign_custom_filter(bot_id, telegram_id, slug, True)
     return {"ok": True}
 
 @app.delete("/admin/users/{telegram_id}/custom-filters/{slug}")
-def admin_unassign_cf(telegram_id: int, slug: str, Authorization: Optional[str] = Header(default=None)):
+def admin_unassign_cf(telegram_id: int, slug: str, Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     _require_admin(Authorization)
-    unassign_custom_filter(telegram_id, slug)
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
+    unassign_custom_filter(bot_id, telegram_id, slug)
     return {"ok": True}
 
 @app.patch("/admin/users/{telegram_id}/custom-filters/{slug}")
-def admin_toggle_user_cf(telegram_id: int, slug: str, payload: AdminToggleUserCF, Authorization: Optional[str] = Header(default=None)):
+def admin_toggle_user_cf(telegram_id: int, slug: str, payload: AdminToggleUserCF, Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     _require_admin(Authorization)
-    toggle_user_custom_filter(telegram_id, slug, payload.enabled)
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
+    toggle_user_custom_filter(bot_id, telegram_id, slug, payload.enabled)
     return {"ok": True}
 
 # --- Admin: endtime formulas for a user ---
 @app.get("/admin/users/{telegram_id}/endtime-formulas")
-def admin_list_formulas(telegram_id: int, Authorization: Optional[str] = Header(default=None)):
+def admin_list_formulas(telegram_id: int, Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     _require_admin(Authorization)
-    return {"user": telegram_id, "formulas": get_endtime_formulas(telegram_id)}
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
+    return {"user": telegram_id, "formulas": get_endtime_formulas(bot_id, telegram_id)}
 
 @app.put("/admin/users/{telegram_id}/endtime-formulas")
-def admin_replace_user_formulas(telegram_id: int, payload: List[EndtimeFormulaIn], Authorization: Optional[str] = Header(default=None)):
+def admin_replace_user_formulas(telegram_id: int, payload: List[EndtimeFormulaIn], Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     _require_admin(Authorization)
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
     items = [p.dict() for p in payload]
-    replace_endtime_formulas(telegram_id, items)
+    replace_endtime_formulas(bot_id, telegram_id, items)
     return {"ok": True, "count": len(items)}
 
 @app.post("/admin/users/{telegram_id}/endtime-formulas")
-def admin_add_user_formula(telegram_id: int, payload: EndtimeFormulaIn, Authorization: Optional[str] = Header(default=None)):
+def admin_add_user_formula(telegram_id: int, payload: EndtimeFormulaIn, Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     _require_admin(Authorization)
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
     p = payload.dict()
     add_endtime_formula(
+        bot_id,
         telegram_id,
         p.get("start"), p.get("end"),
         p["speed_kmh"], p.get("bonus_min", 0),
@@ -1069,7 +1163,9 @@ def admin_add_user_formula(telegram_id: int, payload: EndtimeFormulaIn, Authoriz
     return {"ok": True}
 
 @app.delete("/admin/users/{telegram_id}/endtime-formulas/{formula_id}")
-def admin_delete_user_formula(telegram_id: int, formula_id: int, Authorization: Optional[str] = Header(default=None)):
+def admin_delete_user_formula(telegram_id: int, formula_id: int, Authorization: Optional[str] = Header(default=None), bot_id: Optional[str] = Query(default=None)):
     _require_admin(Authorization)
-    delete_endtime_formula(telegram_id, formula_id)
+    if not bot_id:
+        raise HTTPException(400, "bot_id required")
+    delete_endtime_formula(bot_id, telegram_id, formula_id)
     return {"ok": True}

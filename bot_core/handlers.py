@@ -1,0 +1,701 @@
+import json
+from datetime import datetime
+from typing import Optional
+
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes, ApplicationHandlerStop
+
+from .capture import _capture_from_update
+from .menus import (
+    build_main_menu,
+    build_settings_menu,
+    build_mobile_sessions_menu,
+    build_filters_menu,
+    build_work_schedule_menu,
+    build_work_schedule_start_prompt,
+    build_work_schedule_end_prompt,
+    build_min_km_input_menu,
+    build_max_km_input_menu,
+    build_gap_input_menu,
+    build_min_price_input_menu,
+    build_max_price_input_menu,
+    build_min_duration_input_menu,
+    build_booked_slots_menu,
+    build_schedule_menu,
+    build_classes_menu,
+    build_pickup_blacklist_menu,
+    build_dropoff_blacklist_menu,
+    build_ends_dt_menu,
+    build_stats_view,
+    build_all_filters_view,
+    build_notifications_menu,
+)
+from .state import user_waiting_input, adding_slot_step, work_schedule_state, _ctx_bot_id, _state_key
+from .storage import get_active, set_active, get_filters
+from .utils import normalize_token, validate_mobile_session, validate_datetime, validate_day
+from db import (
+    add_user,
+    assign_bot_owner,
+    update_token,
+    update_filters,
+    add_booked_slot,
+    get_blocked_days,
+    add_blocked_day,
+    delete_blocked_day,
+    toggle_vehicle_class,
+    set_token_status,
+    get_pinned_warnings,
+    clear_pinned_warning,
+    get_notifications,
+    set_notification,
+    get_offer_message,
+    get_bot_instance,
+)
+
+
+def unpin_warning_if_any(bot_id: Optional[str], telegram_id: int, kind: str, bot_token: Optional[str] = None):
+    # kind: "no_token" | "expired"
+    if not bot_token or not bot_id:
+        return
+    ids = get_pinned_warnings(bot_id, telegram_id)
+    message_id = ids["no_token_msg_id"] if kind == "no_token" else ids["expired_msg_id"]
+    if not message_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/unpinChatMessage",
+            json={"chat_id": telegram_id, "message_id": message_id},
+            timeout=10,
+        )
+    except Exception:
+        pass
+    clear_pinned_warning(bot_id, telegram_id, kind)
+
+
+async def open_settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_id = _ctx_bot_id(context)
+    _capture_from_update(update, bot_id)
+    add_user(bot_id, update.effective_user.id)
+    info_text, menu = build_settings_menu(update.effective_user.id, bot_id)
+    await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = (context.application.bot_data or {}).get("role", "user")
+    bot_id = (context.application.bot_data or {}).get("bot_id")
+    user_id = update.effective_user.id
+
+    if role == "admin":
+        if bot_id:
+            ok, reason = assign_bot_owner(bot_id, user_id)
+            if not ok and reason == "bot_already_owned":
+                await update.message.reply_text("⛔ Admin bot is already assigned to another user.")
+                return
+        await update.message.reply_text(
+            "🛠️ *Admin Bot*\n\n"
+            "Commands:\n"
+            "• /addbot <token> [name] [timezone]\n"
+            "• /listbots\n"
+            "• /botinfo <bot_id>\n"
+            "• /listusers\n",
+            parse_mode="Markdown",
+        )
+        return
+
+    if not bot_id:
+        await update.message.reply_text("❌ Bot not registered. Please contact admin.")
+        return
+
+    ok, reason = assign_bot_owner(bot_id, user_id)
+    if not ok:
+        if reason == "bot_already_owned":
+            await update.message.reply_text("⛔ This bot is already assigned to another user.")
+        else:
+            await update.message.reply_text("❌ Bot not registered. Please contact admin.")
+        return
+
+    _capture_from_update(update, bot_id)
+    add_user(bot_id, user_id)
+    is_active = get_active(bot_id, user_id)
+    menu, status_text = build_main_menu(is_active)
+    await update.message.reply_text(
+        f"**Main menu**\n\nBot status: {status_text}\n\nChoose your action:",
+        parse_mode="Markdown",
+        reply_markup=menu,
+    )
+
+
+async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_id = _ctx_bot_id(context)
+    _capture_from_update(update, bot_id)
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /token <your token>\n"
+            "You can paste either `Bearer <JWT>` or just the raw `<JWT>`."
+        )
+        return
+    raw = " ".join(context.args)
+    token = normalize_token(raw)
+    update_token(bot_id, update.effective_user.id, token)
+
+    ok, note = validate_mobile_session(token)
+    set_token_status(
+        bot_id,
+        update.effective_user.id,
+        "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown"),
+    )
+
+    bot_token = context.bot.token if context and context.bot else None
+    unpin_warning_if_any(bot_id, update.effective_user.id, "no_token", bot_token)
+    unpin_warning_if_any(bot_id, update.effective_user.id, "expired", bot_token)
+
+    if ok:
+        await update.message.reply_text("✅ Mobile session token saved and validated.")
+    else:
+        hint = "Token looks invalid." if note.startswith("unauthorized") else "Couldn't verify right now; I'll retry soon."
+        await update.message.reply_text(f"⚠️ Saved, but validation not OK yet. {hint}")
+
+    info_text, menu = build_mobile_sessions_menu(bot_id, update.effective_user.id)
+    await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_id = _ctx_bot_id(context)
+    _capture_from_update(update, bot_id)
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    state_key = _state_key(bot_id, user_id)
+
+    # Activate / Deactivate
+    if query.data == "activate":
+        set_active(bot_id, user_id, True)
+        menu, status_text = build_main_menu(True)
+        await query.edit_message_text(
+            f"**Main menu**\n\nBot status: {status_text}",
+            parse_mode="Markdown",
+            reply_markup=menu,
+        )
+        return
+    if query.data == "deactivate":
+        set_active(bot_id, user_id, False)
+        menu, status_text = build_main_menu(False)
+        await query.edit_message_text(
+            f"**Main menu**\n\nBot status: {status_text}",
+            parse_mode="Markdown",
+            reply_markup=menu,
+        )
+        return
+
+    # Settings
+    if query.data == "settings":
+        info_text, menu = build_settings_menu(user_id, bot_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "change_tz":
+        await query.edit_message_text(
+            "🌍 Timezone is managed by the admin for this bot.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if query.data == "notifications":
+        info_text, menu = build_notifications_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    if query.data.startswith("toggle_n:"):
+        kind = query.data.split(":", 1)[1]
+        prefs = get_notifications(bot_id, user_id)
+        new_val = not prefs.get(kind, True)
+        set_notification(bot_id, user_id, kind, new_val)
+        info_text, menu = build_notifications_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    # Mobile sessions
+    if query.data in ("mobile_sessions", "open_mobile_sessions"):
+        info_text, menu = build_mobile_sessions_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "add_mobile_session":
+        user_waiting_input[state_key] = "set_token"
+        example = "Bearer eyJhbGciOi...<snip>...xyz"
+        await query.edit_message_text(
+            "🔑 *Paste your mobile session token*\n\n"
+            "• Paste *starting from* the word **Bearer** all the way to the end.\n"
+            "• Example:\n"
+            f"`{example}`\n\n"
+            "_Tip: If you only paste the raw JWT (`xxx.yyy.zzz`), I'll add `Bearer` for you._",
+            parse_mode="Markdown",
+        )
+        return
+    if query.data == "show_all_filters":
+        info_text, menu = build_all_filters_view(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
+        return
+
+    if query.data.startswith("show_offer:"):
+        key = query.data.split(":", 1)[1]
+        header, full = get_offer_message(bot_id, user_id, key)
+        if not full:
+            await query.edit_message_text(
+                "No details available for this offer.",
+                parse_mode="HTML",
+            )
+            return
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Hide details", callback_data=f"hide_offer:{key}")]])
+        await query.edit_message_text(full, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if query.data.startswith("hide_offer:"):
+        key = query.data.split(":", 1)[1]
+        header, full = get_offer_message(bot_id, user_id, key)
+        if not header:
+            header = "Details hidden."
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Show details", callback_data=f"show_offer:{key}")]])
+        await query.edit_message_text(header, parse_mode="HTML", reply_markup=kb)
+        return
+
+    # Stats
+    if query.data == "statistic":
+        info_text, menu = build_stats_view(bot_id, user_id, page=0)
+        await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
+        return
+    if query.data.startswith("stats_page:"):
+        try:
+            page = int(query.data.split(":")[1])
+        except Exception:
+            page = 0
+        info_text, menu = build_stats_view(bot_id, user_id, page=page)
+        await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
+        return
+
+    # Filters menu & back
+    if query.data in ("filters", "back_to_filters"):
+        info_text, menu = build_filters_menu(get_filters(bot_id, user_id), user_id, bot_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "back_to_main":
+        menu, status_text = build_main_menu(get_active(bot_id, user_id))
+        await query.edit_message_text(
+            f"**Main menu**\n\nBot status: {status_text}",
+            parse_mode="Markdown",
+            reply_markup=menu,
+        )
+        return
+
+    # Show filters summary
+    if query.data == "show_filters":
+        info_text, menu = build_filters_menu(get_filters(bot_id, user_id), user_id, bot_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    # Gap
+    if query.data == "change_gap":
+        info_text, menu = build_gap_input_menu()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        user_waiting_input[state_key] = "gap"
+        return
+
+    # Min / Max price
+    if query.data == "change_price_min":
+        user_waiting_input[state_key] = "price_min"
+        info_text, menu = build_min_price_input_menu()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "change_price_max":
+        user_waiting_input[state_key] = "price_max"
+        info_text, menu = build_max_price_input_menu()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    # Work schedule submenu & flow
+    if query.data == "work_schedule":
+        info_text, menu = build_work_schedule_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "update_work_schedule":
+        user_waiting_input[state_key] = "work_schedule_start"
+        work_schedule_state[state_key] = {}
+        info_text, menu = build_work_schedule_start_prompt()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    # Min duration
+    if query.data == "change_min_duration":
+        info_text, menu = build_min_duration_input_menu()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        user_waiting_input[state_key] = "min_duration"
+        return
+
+    # Schedule (blocked days)
+    if query.data == "schedule":
+        info_text, menu = build_schedule_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "add_blocked_day":
+        user_waiting_input[state_key] = "add_blocked_day"
+        await query.edit_message_text(
+            "📅 *Enter a day to block* in format `dd/mm/yyyy` (e.g., `31/12/2025`).",
+            parse_mode="Markdown",
+        )
+        return
+    if query.data.startswith("delete_day_"):
+        try:
+            day_id = int(query.data.split("_")[-1])
+            delete_blocked_day(bot_id, day_id)
+        except Exception:
+            pass
+        info_text, menu = build_schedule_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    # Change classes
+    if query.data == "change_classes":
+        info_text, menu = build_classes_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    # Toggle vehicle classes
+    if query.data.startswith("toggle_transfer_") or query.data.startswith("toggle_hourly_"):
+        parts = query.data.split("_")
+        ttype = parts[1]
+        vclass = parts[2]
+        toggle_vehicle_class(bot_id, user_id, ttype, vclass)
+        info_text, menu = build_classes_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    # Blacklists
+    if query.data == "pickup_blacklist":
+        info_text, menu = build_pickup_blacklist_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "dropoff_blacklist":
+        info_text, menu = build_dropoff_blacklist_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "add_pickup_blacklist":
+        user_waiting_input[state_key] = "pickup_blacklist_add"
+        await query.edit_message_text(
+            "✏️ *Send pickup blacklist terms*\n"
+            "• One per message (e.g., `USA`)\n"
+            "• Or multiple separated by commas (e.g., `USA, NYC, Boston`)",
+            parse_mode="Markdown",
+        )
+        return
+    if query.data == "add_dropoff_blacklist":
+        user_waiting_input[state_key] = "dropoff_blacklist_add"
+        await query.edit_message_text(
+            "✏️ *Send dropoff blacklist terms*\n"
+            "• One per message (e.g., `USA`)\n"
+            "• Or multiple separated by commas (e.g., `USA, NYC, Boston`)",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Ends datetime callbacks
+    if query.data == "ends_dt":
+        info_text, menu = build_ends_dt_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "update_ends_dt":
+        user_waiting_input[state_key] = "avg_speed_kmh"
+        await query.edit_message_text(
+            "🚗 *Enter average speed in km/h* (example: `50`)\n\n"
+            "_This will be used to estimate ride end time._",
+            parse_mode="Markdown",
+        )
+        return
+
+    # KM changes
+    if query.data == "change_min_km":
+        user_waiting_input[state_key] = "min_km"
+        info_text, menu = build_min_km_input_menu()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+    if query.data == "change_max_km":
+        user_waiting_input[state_key] = "max_km"
+        info_text, menu = build_max_km_input_menu()
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+
+async def _tap_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    role = (context.application.bot_data or {}).get("role", "user")
+    bot_id = (context.application.bot_data or {}).get("bot_id")
+
+    if role == "admin":
+        return
+
+    user = update.effective_user
+    if not user or not bot_id:
+        return
+
+    bot = get_bot_instance(bot_id)
+    owner_id = bot.get("owner_telegram_id") if bot else None
+
+    is_start = bool(update.message and (update.message.text or "").strip().startswith("/start"))
+    if owner_id is None:
+        if not is_start:
+            msg = update.effective_message
+            if msg:
+                await msg.reply_text("⚠️ This bot is not linked yet. Send /start to link it.")
+            raise ApplicationHandlerStop
+        return
+
+    if int(owner_id) != int(user.id):
+        msg = update.effective_message
+        if msg:
+            await msg.reply_text("⛔ This bot is already assigned to another user.")
+        raise ApplicationHandlerStop
+
+    _capture_from_update(update, bot_id)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_id = _ctx_bot_id(context)
+    _capture_from_update(update, bot_id)
+    user_id = update.effective_user.id
+    state_key = _state_key(bot_id, user_id)
+    text = update.message.text.strip()
+
+    # Token input (Mobile Sessions)
+    if user_waiting_input.get(state_key) == "set_token":
+        token = normalize_token(text)
+        update_token(bot_id, user_id, token)
+
+        ok, note = validate_mobile_session(token)
+        set_token_status(bot_id, user_id, "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown"))
+
+        bot_token = context.bot.token if context and context.bot else None
+        unpin_warning_if_any(bot_id, user_id, "no_token", bot_token)
+        unpin_warning_if_any(bot_id, user_id, "expired", bot_token)
+
+        if ok:
+            await update.message.reply_text("✅ Mobile session token saved and validated.")
+        else:
+            hint = "Token looks invalid." if note.startswith("unauthorized") else "Couldn't verify right now; I'll retry soon."
+            await update.message.reply_text(f"⚠️ Saved, but validation not OK yet. {hint}")
+
+        info_text, menu = build_mobile_sessions_menu(bot_id, user_id)
+        await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        user_waiting_input.pop(state_key, None)
+        return
+
+    # Booked slot creation
+    if state_key in adding_slot_step:
+        step_info = adding_slot_step[state_key]
+        if step_info["step"] == 1:
+            dt = validate_datetime(text)
+            if not dt:
+                await update.message.reply_text("❌ Format incorrect. Utilise `dd/mm/yyyy hh:mm`.")
+                return
+            step_info["from"] = text
+            step_info["step"] = 2
+            await update.message.reply_text(
+                "📅 Send *end date/time* in format `dd/mm/yyyy hh:mm`:",
+                parse_mode="Markdown",
+            )
+            return
+        if step_info["step"] == 2:
+            dt = validate_datetime(text)
+            if not dt:
+                await update.message.reply_text("❌ Format incorrect. Utilise `dd/mm/yyyy hh:mm`.")
+                return
+            step_info["to"] = text
+            step_info["step"] = 3
+            await update.message.reply_text(
+                "✏️ Optionally send a *name* for this slot, or type `-` to skip:",
+                parse_mode="Markdown",
+            )
+            return
+        if step_info["step"] == 3:
+            name = None if text == "-" else text
+            add_booked_slot(bot_id, user_id, step_info["from"], step_info["to"], name)
+            await update.message.reply_text("✅ Booked slot saved!")
+            del adding_slot_step[state_key]
+            info_text, menu = build_booked_slots_menu(bot_id, user_id)
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+
+    # Work schedule 2-step flow
+    if user_waiting_input.get(state_key) == "work_schedule_start":
+        try:
+            datetime.strptime(text, "%H:%M")
+        except Exception:
+            info_text, menu = build_work_schedule_start_prompt()
+            await update.message.reply_text("❌ Invalid time. Please use `HH:MM` (e.g., `08:00`).", parse_mode="Markdown")
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+        work_schedule_state[state_key] = {"start": text}
+        user_waiting_input[state_key] = "work_schedule_end"
+        info_text, menu = build_work_schedule_end_prompt()
+        await update.message.reply_text("✅ Start time saved.", parse_mode="Markdown")
+        await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    if user_waiting_input.get(state_key) == "work_schedule_end":
+        try:
+            datetime.strptime(text, "%H:%M")
+        except Exception:
+            info_text, menu = build_work_schedule_end_prompt()
+            await update.message.reply_text("❌ Invalid time. Please use `HH:MM` (e.g., `20:00`).", parse_mode="Markdown")
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+        start = (work_schedule_state.get(state_key) or {}).get("start")
+        if not start:
+            user_waiting_input[state_key] = "work_schedule_start"
+            info_text, menu = build_work_schedule_start_prompt()
+            await update.message.reply_text("⚠️ Let's try again. Please enter work START.", parse_mode="Markdown")
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+        filters_data = get_filters(bot_id, user_id)
+        filters_data["work_start"] = start
+        filters_data["work_end"] = text
+        update_filters(bot_id, user_id, json.dumps(filters_data))
+        user_waiting_input.pop(state_key, None)
+        work_schedule_state.pop(state_key, None)
+        await update.message.reply_text(f"✅ Work schedule updated to `{start} – {text}`.", parse_mode="Markdown")
+        info_text, menu = build_filters_menu(filters_data, user_id, bot_id)
+        await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    # Field updates & special inputs
+    if state_key in user_waiting_input:
+        field = user_waiting_input.pop(state_key)
+
+        # Add a blocked day
+        if field == "add_blocked_day":
+            if not validate_day(text):
+                await update.message.reply_text("❌ Wrong format. Please send a date like `31/12/2025`.")
+                return
+            existing = [d["day"] for d in get_blocked_days(bot_id, user_id)]
+            if text in existing:
+                await update.message.reply_text(f"ℹ️ `{text}` is already blocked.")
+            else:
+                add_blocked_day(bot_id, user_id, text)
+                await update.message.reply_text(f"✅ Day `{text}` added to blocked days.")
+            info_text, menu = build_schedule_menu(bot_id, user_id)
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+
+        # Add to blacklists (single value or comma-separated list)
+        if field in ("pickup_blacklist_add", "dropoff_blacklist_add"):
+            items = [p.strip() for p in text.split(",") if p.strip()]
+            if not items:
+                await update.message.reply_text(
+                    "❌ Please send at least one value (e.g., `USA` or `USA, NYC`).",
+                    parse_mode="Markdown",
+                )
+                user_waiting_input[state_key] = field
+                return
+
+            filters_data = get_filters(bot_id, user_id)
+            key = "pickup_blacklist" if field == "pickup_blacklist_add" else "dropoff_blacklist"
+            current = filters_data.get(key, []) or []
+
+            current_lower = {x.lower() for x in current}
+            added, skipped = [], []
+            for item in items:
+                if item.lower() in current_lower:
+                    skipped.append(item)
+                else:
+                    current.append(item)
+                    current_lower.add(item.lower())
+                    added.append(item)
+
+            filters_data[key] = current
+            update_filters(bot_id, user_id, json.dumps(filters_data))
+
+            msg_lines = []
+            if added:
+                msg_lines.append("✅ Added: " + ", ".join(f"`{a}`" for a in added))
+            if skipped:
+                msg_lines.append("ℹ️ Already present: " + ", ".join(f"`{s}`" for s in skipped))
+            await update.message.reply_text(
+                "\n".join(msg_lines) if msg_lines else "Nothing to add.",
+                parse_mode="Markdown",
+            )
+
+            if key == "pickup_blacklist":
+                info_text, menu = build_pickup_blacklist_menu(bot_id, user_id)
+            else:
+                info_text, menu = build_dropoff_blacklist_menu(bot_id, user_id)
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+
+        # Ends datetime step 1 (speed)
+        if field == "avg_speed_kmh":
+            try:
+                speed = float(text)
+                if speed <= 0:
+                    raise ValueError()
+            except Exception:
+                await update.message.reply_text("❌ Please send a float greater than 0 for *average speed (km/h)*.")
+                user_waiting_input[state_key] = "avg_speed_kmh"
+                return
+            filters_data = get_filters(bot_id, user_id)
+            filters_data["avg_speed_kmh"] = speed
+            update_filters(bot_id, user_id, json.dumps(filters_data))
+            user_waiting_input[state_key] = "bonus_time_min"
+            await update.message.reply_text(
+                "⏱️ *Enter bonus time in minutes* (example: `60`)\n\n"
+                "_This is added to the estimated duration._",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Ends datetime step 2 (bonus)
+        if field == "bonus_time_min":
+            try:
+                bonus = float(text)
+                if bonus < 0:
+                    raise ValueError()
+            except Exception:
+                await update.message.reply_text("❌ Please send a non-negative float for *bonus time (minutes)*.")
+                user_waiting_input[state_key] = "bonus_time_min"
+                return
+            filters_data = get_filters(bot_id, user_id)
+            filters_data["bonus_time_min"] = bonus
+            update_filters(bot_id, user_id, json.dumps(filters_data))
+            await update.message.reply_text("✅ Ends datetime parameters saved.")
+            info_text, menu = build_ends_dt_menu(bot_id, user_id)
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+
+        # Work start/end (legacy direct, not used in UI now)
+        if field in ("work_start", "work_end"):
+            try:
+                datetime.strptime(text, "%H:%M")
+            except Exception:
+                await update.message.reply_text("❌ Please send time as `HH:MM` (e.g., `08:00`).")
+                return
+            filters_data = get_filters(bot_id, user_id)
+            filters_data[field] = text
+            update_filters(bot_id, user_id, json.dumps(filters_data))
+            await update.message.reply_text(f"✅ Updated {field} to {text}")
+            info_text, menu = build_filters_menu(filters_data, user_id, bot_id)
+            await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+            return
+
+        # Numeric fields
+        value = text
+        if field in ["price_min", "price_max", "gap", "min_duration", "min_km", "max_km"]:
+            try:
+                val = float(value)
+                if val <= 0:
+                    raise ValueError()
+            except Exception:
+                await update.message.reply_text("❌ Please send a float greater than 0 (e.g., `50`).")
+                return
+            value = val
+
+        filters_data = get_filters(bot_id, user_id)
+        filters_data[field] = value
+        update_filters(bot_id, user_id, json.dumps(filters_data))
+        await update.message.reply_text(f"✅ Updated {field} to {value}")
+        info_text, menu = build_filters_menu(filters_data, user_id, bot_id)
+        await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
