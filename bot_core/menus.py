@@ -48,7 +48,7 @@ def build_main_menu(is_active: bool):
     return InlineKeyboardMarkup(keyboard), status_text
 
 
-def build_settings_menu(user_id: int, bot_id: Optional[str] = None):
+def build_settings_menu(user_id: int, bot_id: Optional[str] = None, allow_tz_change: bool = False):
     tz = get_user_timezone(bot_id, user_id) if bot_id else "—"
     token_status = get_token_status(bot_id, user_id) if bot_id else "unknown"
     dot = "🟢" if token_status == "valid" else ("🔴" if token_status == "expired" else "⚪")
@@ -99,6 +99,8 @@ def build_settings_menu(user_id: int, bot_id: Optional[str] = None):
         [InlineKeyboardButton("📱 Mobile sessions", callback_data="mobile_sessions")],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
     ]
+    if allow_tz_change:
+        keyboard.insert(0, [InlineKeyboardButton("🌍 Change timezone", callback_data="change_tz")])
     return info_text, InlineKeyboardMarkup(keyboard)
 
 

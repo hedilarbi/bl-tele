@@ -9,6 +9,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from .utils import mask_secret, mask_email
+from .menus import build_main_menu
+from .storage import get_active
 from db import (
     get_bot_instance,
     add_bot_instance,
@@ -122,11 +124,11 @@ async def admin_list_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"admin_active={admin_active} token=<code>{token_mask}</code>"
         )
         btn_label = f"{b.get('bot_id') or '—'} • {b.get('bot_name') or 'Bot'}"
-        buttons.append([InlineKeyboardButton(btn_label, callback_data=f"admin_botinfo:{b.get('bot_id')}")])
+        buttons.append([InlineKeyboardButton(btn_label, callback_data=f"admin_manage:{b.get('bot_id')}")])
     reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
     if reply_markup:
-        await update.message.reply_text("Select a bot to view details:", reply_markup=reply_markup)
+        await update.message.reply_text("Select a bot to manage:", reply_markup=reply_markup)
 
 
 async def admin_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,6 +213,38 @@ async def admin_botinfo_callback(update: Update, context: ContextTypes.DEFAULT_T
             await msg.reply_text("Bot not found.")
         return
     await _send_bot_info(update, bot_id, show_full_token=False)
+
+
+async def admin_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if not _admin_owner_ok(update, context):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    data = query.data or ""
+    if not data.startswith("admin_manage:"):
+        await query.answer()
+        return
+    bot_id = data.split(":", 1)[1].strip()
+    await query.answer()
+    bot = get_bot_instance(bot_id)
+    if not bot:
+        await query.edit_message_text("Bot not found.")
+        return
+    owner_id = bot.get("owner_telegram_id")
+    if not owner_id:
+        await query.edit_message_text("No user linked to this bot yet.")
+        return
+    context.user_data["admin_target_bot_id"] = bot_id
+    context.user_data["admin_target_user_id"] = int(owner_id)
+    is_active = get_active(bot_id, int(owner_id))
+    menu, status_text = build_main_menu(is_active)
+    await query.edit_message_text(
+        f"**Admin mode**\n\nBot: `{bot_id}`\nUser: `{owner_id}`\nBot status: {status_text}\n\nChoose your action:",
+        parse_mode="Markdown",
+        reply_markup=menu,
+    )
 
 
 async def _send_bot_info(update: Update, bot_id: str, show_full_token: bool = False):

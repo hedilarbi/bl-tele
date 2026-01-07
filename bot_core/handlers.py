@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 import requests
+from dateutil.tz import gettz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ApplicationHandlerStop
 
@@ -44,6 +45,7 @@ from db import (
     add_blocked_day,
     delete_blocked_day,
     toggle_vehicle_class,
+    set_user_timezone,
     set_token_status,
     get_pinned_warnings,
     clear_pinned_warning,
@@ -52,6 +54,18 @@ from db import (
     get_offer_message,
     get_bot_instance,
 )
+
+
+def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    app_bot_id = _ctx_bot_id(context)
+    role = (context.application.bot_data or {}).get("role", "user")
+    if role == "admin":
+        target_bot_id = (context.user_data or {}).get("admin_target_bot_id")
+        target_user_id = (context.user_data or {}).get("admin_target_user_id")
+        if target_bot_id and target_user_id:
+            return app_bot_id, target_bot_id, int(target_user_id), True
+        return app_bot_id, None, None, False
+    return app_bot_id, app_bot_id, update.effective_user.id, False
 
 
 def unpin_warning_if_any(bot_id: Optional[str], telegram_id: int, kind: str, bot_token: Optional[str] = None):
@@ -74,10 +88,13 @@ def unpin_warning_if_any(bot_id: Optional[str], telegram_id: int, kind: str, bot
 
 
 async def open_settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_id = _ctx_bot_id(context)
-    _capture_from_update(update, bot_id)
-    add_user(bot_id, update.effective_user.id)
-    info_text, menu = build_settings_menu(update.effective_user.id, bot_id)
+    app_bot_id, bot_id, user_id, admin_mode = _resolve_target(update, context)
+    _capture_from_update(update, app_bot_id)
+    if bot_id is None or user_id is None:
+        await update.message.reply_text("Select a bot first with /listbots.")
+        return
+    add_user(bot_id, user_id)
+    info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode)
     await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
 
 
@@ -161,11 +178,13 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_id = _ctx_bot_id(context)
-    _capture_from_update(update, bot_id)
+    app_bot_id, bot_id, user_id, admin_mode = _resolve_target(update, context)
+    _capture_from_update(update, app_bot_id)
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    if bot_id is None or user_id is None:
+        await query.edit_message_text("Select a bot first with /listbots.", parse_mode="Markdown")
+        return
     state_key = _state_key(bot_id, user_id)
 
     # Activate / Deactivate
@@ -190,12 +209,19 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Settings
     if query.data == "settings":
-        info_text, menu = build_settings_menu(user_id, bot_id)
+        info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
     if query.data == "change_tz":
+        if not admin_mode:
+            await query.edit_message_text(
+                "🌍 Timezone is managed by the admin for this bot.",
+                parse_mode="Markdown",
+            )
+            return
+        user_waiting_input[state_key] = "set_timezone"
         await query.edit_message_text(
-            "🌍 Timezone is managed by the admin for this bot.",
+            "🌍 *Send timezone* as IANA name (e.g., `Africa/Casablanca`, `America/Toronto`).",
             parse_mode="Markdown",
         )
         return
@@ -456,11 +482,25 @@ async def _tap_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_id = _ctx_bot_id(context)
-    _capture_from_update(update, bot_id)
-    user_id = update.effective_user.id
+    app_bot_id, bot_id, user_id, admin_mode = _resolve_target(update, context)
+    _capture_from_update(update, app_bot_id)
+    if bot_id is None or user_id is None:
+        await update.message.reply_text("Select a bot first with /listbots.")
+        return
     state_key = _state_key(bot_id, user_id)
     text = update.message.text.strip()
+
+    if user_waiting_input.get(state_key) == "set_timezone":
+        tz = text.strip()
+        if tz.upper() not in ("UTC", "GMT") and gettz(tz) is None:
+            await update.message.reply_text("❌ Unknown timezone. Please send a valid IANA name like `America/Toronto`.")
+            return
+        set_user_timezone(bot_id, user_id, tz)
+        await update.message.reply_text(f"✅ Timezone set to `{tz}`.", parse_mode="Markdown")
+        info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode)
+        await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        user_waiting_input.pop(state_key, None)
+        return
 
     # Token input (Mobile Sessions)
     if user_waiting_input.get(state_key) == "set_token":

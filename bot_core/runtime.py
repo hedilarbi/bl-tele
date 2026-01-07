@@ -5,7 +5,14 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 
 from .config import ADMIN_BOT_TOKEN, ADMIN_BOT_ID, ADMIN_BOT_NAME, BOT_REFRESH_INTERVAL_S
 from .handlers import start, set_token, open_settings_cmd, handle_buttons, handle_text, _tap_all
-from .admin import admin_add_bot, admin_list_bots, admin_list_users, admin_bot_info, admin_botinfo_callback
+from .admin import (
+    admin_add_bot,
+    admin_list_bots,
+    admin_list_users,
+    admin_bot_info,
+    admin_botinfo_callback,
+    admin_manage_callback,
+)
 from db import init_db, add_bot_instance, list_bot_instances
 
 
@@ -30,7 +37,10 @@ def _build_application(bot_row: dict):
         app.add_handler(CommandHandler("botinfo", admin_bot_info))
         app.add_handler(CommandHandler("bot", admin_bot_info))
         app.add_handler(CommandHandler("listusers", admin_list_users))
+        app.add_handler(CallbackQueryHandler(admin_manage_callback, pattern=r"^admin_manage:"))
         app.add_handler(CallbackQueryHandler(admin_botinfo_callback, pattern=r"^admin_botinfo:"))
+        app.add_handler(CallbackQueryHandler(handle_buttons))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
         return app
 
     app.add_handler(MessageHandler(filters.ALL, _tap_all), group=-1)
