@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -27,6 +28,7 @@ from .menus import (
     build_classes_menu,
     build_pickup_blacklist_menu,
     build_dropoff_blacklist_menu,
+    build_flight_blacklist_menu,
     build_ends_dt_menu,
     build_stats_view,
     build_all_filters_view,
@@ -403,6 +405,10 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info_text, menu = build_dropoff_blacklist_menu(bot_id, user_id)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
+    if query.data == "flight_blacklist":
+        info_text, menu = build_flight_blacklist_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
     if query.data == "add_pickup_blacklist":
         user_waiting_input[state_key] = "pickup_blacklist_add"
         await query.edit_message_text(
@@ -418,6 +424,15 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✏️ *Send dropoff blacklist terms*\n"
             "• One per message (e.g., `USA`)\n"
             "• Or multiple separated by commas (e.g., `USA, NYC, Boston`)",
+            parse_mode="Markdown",
+        )
+        return
+    if query.data == "add_flight_blacklist":
+        user_waiting_input[state_key] = "flight_blacklist_add"
+        await query.edit_message_text(
+            "✏️ *Send flight numbers to block*\n"
+            "• One per message (e.g., `EK 243`)\n"
+            "• Or multiple separated by commas (e.g., `EK 243, BA 002`)",
             parse_mode="Markdown",
         )
         return
@@ -623,7 +638,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Add to blacklists (single value or comma-separated list)
-        if field in ("pickup_blacklist_add", "dropoff_blacklist_add"):
+        if field in ("pickup_blacklist_add", "dropoff_blacklist_add", "flight_blacklist_add"):
             items = [p.strip() for p in text.split(",") if p.strip()]
             if not items:
                 await update.message.reply_text(
@@ -634,18 +649,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             filters_data = get_filters(bot_id, user_id)
-            key = "pickup_blacklist" if field == "pickup_blacklist_add" else "dropoff_blacklist"
+            if field == "pickup_blacklist_add":
+                key = "pickup_blacklist"
+            elif field == "dropoff_blacklist_add":
+                key = "dropoff_blacklist"
+            else:
+                key = "flight_blacklist"
             current = filters_data.get(key, []) or []
 
-            current_lower = {x.lower() for x in current}
+            def _norm_flight(s: str) -> str:
+                return re.sub(r"[^A-Za-z0-9]", "", s or "").upper()
+
+            if key == "flight_blacklist":
+                current_norm = {_norm_flight(x): x for x in current if _norm_flight(x)}
+            else:
+                current_lower = {x.lower() for x in current}
             added, skipped = [], []
             for item in items:
-                if item.lower() in current_lower:
-                    skipped.append(item)
+                if key == "flight_blacklist":
+                    norm = _norm_flight(item)
+                    if not norm:
+                        continue
+                    disp = re.sub(r"\s+", " ", item.strip()).upper()
+                    if norm in current_norm:
+                        skipped.append(disp)
+                    else:
+                        current.append(disp)
+                        current_norm[norm] = disp
+                        added.append(disp)
                 else:
-                    current.append(item)
-                    current_lower.add(item.lower())
-                    added.append(item)
+                    if item.lower() in current_lower:
+                        skipped.append(item)
+                    else:
+                        current.append(item)
+                        current_lower.add(item.lower())
+                        added.append(item)
 
             filters_data[key] = current
             update_filters(bot_id, user_id, json.dumps(filters_data))
@@ -662,8 +700,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if key == "pickup_blacklist":
                 info_text, menu = build_pickup_blacklist_menu(bot_id, user_id)
-            else:
+            elif key == "dropoff_blacklist":
                 info_text, menu = build_dropoff_blacklist_menu(bot_id, user_id)
+            else:
+                info_text, menu = build_flight_blacklist_menu(bot_id, user_id)
             await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
             return
 

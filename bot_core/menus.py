@@ -198,6 +198,7 @@ def build_filters_menu(filters_data: dict, user_id: int, bot_id: Optional[str] =
             InlineKeyboardButton("🚫 Pickup blacklist", callback_data="pickup_blacklist"),
             InlineKeyboardButton("🚫 Dropoff blacklist", callback_data="dropoff_blacklist"),
         ],
+        [InlineKeyboardButton("✈️ Block flights", callback_data="flight_blacklist")],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
     ]
     return info_text, InlineKeyboardMarkup(keyboard)
@@ -370,6 +371,21 @@ def build_dropoff_blacklist_menu(bot_id: str, user_id: int):
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
+def build_flight_blacklist_menu(bot_id: str, user_id: int):
+    filters_data = get_filters(bot_id, user_id)
+    items = (filters_data.get("flight_blacklist") or [])
+    if items:
+        lines = "\n".join([f"• {x}" for x in items])
+        info_text = f"✈️ *Blocked flights*\n\n{lines}"
+    else:
+        info_text = "✈️ *Blocked flights*\n\n_Aucune entrée pour le moment._"
+    keyboard = [
+        [InlineKeyboardButton("➕ Add flight number", callback_data="add_flight_blacklist")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")],
+    ]
+    return info_text, InlineKeyboardMarkup(keyboard)
+
+
 # --- NEW: Ends datetime menu ---
 def build_ends_dt_menu(bot_id: str, user_id: int):
     f = get_filters(bot_id, user_id)
@@ -497,6 +513,7 @@ def build_all_filters_view(bot_id: str, user_id: int):
     # === Basics from user filters ===
     pickup_bl   = f.get("pickup_blacklist")  or []
     dropoff_bl  = f.get("dropoff_blacklist") or []
+    flight_bl   = f.get("flight_blacklist") or []
     ws_from     = f.get("work_start") or "—"
     ws_to       = f.get("work_end")   or "—"
     gap         = f.get("gap")
@@ -547,6 +564,9 @@ def build_all_filters_view(bot_id: str, user_id: int):
     lines.append("")
     lines.append("🚫 <b>Dropoff blacklist</b>:")
     lines.append(_csv_quoted(dropoff_bl))
+    lines.append("")
+    lines.append("✈️ <b>Flight blacklist</b>:")
+    lines.append(_csv_quoted(flight_bl))
     lines.append("")
 
     # Prices

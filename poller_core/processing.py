@@ -1,5 +1,6 @@
 import uuid
 import json
+import re
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, timezone, timedelta
 from datetime import time as dt_time
@@ -127,6 +128,17 @@ def _build_offer_header_line(
     if forced_accept and status == "accepted":
         status_word = "valid (override)"
     return f"🔥 New offer - {price_disp} - {status_icon} {status_word} {plat_icon}"
+
+
+def _build_reject_summary_lines(filter_results: List[dict]) -> str:
+    failed = [fr for fr in (filter_results or []) if not fr.get("ok")]
+    if not failed:
+        return ""
+    lines = []
+    for fr in failed:
+        detail = fr.get("detail") or fr.get("name") or "rejected"
+        lines.append(f"❌ {_esc(detail)}")
+    return "\n".join(lines)
 
 
 def debug_print_offers(telegram_id: int, offers: list):
@@ -363,6 +375,22 @@ def _process_offers_for_user(
         if dropoff_terms and do_addr:
             record_result("Dropoff blacklist", hit_do is None, None if hit_do is None else f"dropoff contient «{hit_do}»")
 
+        # 3.5) Flight blocklist
+        flight_terms = (filters.get("flight_blacklist") or [])
+        flight_no = None
+        if isinstance(rid.get("flight"), dict):
+            flight_no = rid.get("flight", {}).get("number")
+        if flight_terms:
+            def _norm_flight(s: str) -> str:
+                return re.sub(r"[^A-Za-z0-9]", "", str(s or "")).upper()
+
+            if flight_no:
+                target = _norm_flight(flight_no)
+                hit = next((t for t in flight_terms if _norm_flight(t) == target and target), None)
+                record_result("Vols bloqués", hit is None, None if hit is None else f"vol {flight_no} bloqué")
+            else:
+                record_result("Vols bloqués", True, "aucun numéro de vol")
+
         # 4) Class filter
         otype_dict = class_state.get(otype, {})
         matched_vc = next((cls for cls in otype_dict.keys() if cls.lower() == raw_vc.lower()), None)
@@ -444,6 +472,8 @@ def _process_offers_for_user(
                 forced_accept=False,
             )
             header_line = _build_offer_header_line(offer, "rejected", platform, forced_accept=False)
+            reject_lines = _build_reject_summary_lines(filter_results)
+            notify_text = f"{header_line}\n{reject_lines}" if reject_lines else header_line
             details_key = uuid.uuid4().hex[:16]
             save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
             kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
@@ -451,7 +481,7 @@ def _process_offers_for_user(
                 bot_id,
                 telegram_id,
                 "rejected",
-                header_line,
+                notify_text,
                 platform,
                 reply_markup=kb,
             )
