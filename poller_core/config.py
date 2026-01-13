@@ -10,7 +10,7 @@ ATHENA_BASE = "https://athena.blacklane.com"          # Platform 2 (Portal)
 PORTAL_CLIENT_ID = os.getenv("BL_PORTAL_CLIENT_ID", "7qL5jGGai6MqBCatVeoihQx5dKEhrNCh")
 PORTAL_PAGE_SIZE = 50
 
-POLL_INTERVAL = 5
+POLL_INTERVAL = 2
 MAX_WORKERS = 10
 RIDES_REFRESH_INTERVAL_S = int(os.getenv("RIDES_REFRESH_INTERVAL_S", "30"))
 

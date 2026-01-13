@@ -15,12 +15,17 @@ def normalize_token(s: str) -> str:
     Accepts:
       - 'Bearer <JWT>'
       - 'authorization: Bearer <JWT>'
+      - full HTTP request dumps (extracts Authorization header)
       - raw '<JWT>' (xxx.yyy.zzz)
       - quoted / multiline pastes
     """
     if not s:
         return ""
-    s = str(s).strip()
+    raw = str(s).strip()
+
+    # If a full HTTP request was pasted, extract the Authorization header line.
+    auth_match = re.search(r"(?im)^\s*authorization\s*:\s*(.+)$", raw)
+    s = auth_match.group(1).strip() if auth_match else raw
 
     # remove surrounding quotes
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
@@ -35,13 +40,18 @@ def normalize_token(s: str) -> str:
 
     # already Bearer? keep but normalize capitalization/spacing
     if s.lower().startswith("bearer "):
-        tok = s[7:].strip()
+        tok = s[7:].strip().replace(" ", "")
         return f"Bearer {tok}"
 
     # plain JWT pattern?
-    is_jwt = bool(re.match(r"^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$", s))
-    if is_jwt:
+    if re.match(r"^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$", s):
         return f"Bearer {s}"
+
+    # If the token was wrapped across lines in a HTTP dump, recover from raw text.
+    compact = re.sub(r"\s+", "", raw)
+    jwt_match = re.search(r"[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+", compact)
+    if jwt_match:
+        return f"Bearer {jwt_match.group(0)}"
 
     # fallback: return as-is (some exotic formats)
     return s
