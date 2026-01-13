@@ -251,12 +251,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_waiting_input[state_key] = "set_token"
         example = "Bearer eyJhbGciOi...<snip>...xyz"
         await query.edit_message_text(
-            "🔑 *Paste your mobile session token*\n\n"
-            "• Paste *starting from* the word **Bearer** all the way to the end.\n"
-            "• Or paste the full HTTP request; I will extract the Authorization header.\n"
-            "• Example:\n"
-            f"`{example}`\n\n"
-            "_Tip: If you only paste the raw JWT (`xxx.yyy.zzz`), I'll add `Bearer` for you._",
+            "🔑 *Paste your mobile session dump*",
             parse_mode="Markdown",
         )
         return
