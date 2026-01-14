@@ -147,6 +147,7 @@ def get_all_users_with_bot_admin_active():
         SELECT u.bot_id, u.telegram_id, u.token, u.filters, u.active, COALESCE(b.admin_active, 0)
         FROM users u
         LEFT JOIN bot_instances b ON b.bot_id = u.bot_id
+        WHERE COALESCE(b.role, 'user') != 'admin'
     """
     )
     users = c.fetchall()
