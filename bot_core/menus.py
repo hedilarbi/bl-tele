@@ -1,5 +1,7 @@
 import sqlite3
 from typing import Optional
+from datetime import datetime, timedelta, timezone
+from dateutil.tz import gettz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 from .config import BOOKED_SLOTS_URL, SCHEDULE_URL, CURRENT_SCHEDULE_URL, BL_ACCOUNT_URL, MINI_APP_BASE, _with_bot_id
@@ -26,6 +28,7 @@ from db import (
     get_endtime_formulas,
     get_offer_logs_counts,
     get_offer_logs,
+    get_offer_stats,
 )
 
 
@@ -410,12 +413,142 @@ def build_ends_dt_menu(bot_id: str, user_id: int):
 PAGE_SIZE = 5
 
 
+def _start_of_day(dt: datetime) -> datetime:
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _range_to_utc(range_key: str, tz_name: str):
+    tz = gettz(tz_name) or timezone.utc
+    now = datetime.now(tz)
+    label = "All time"
+    start = end = None
+
+    if range_key == "today":
+        start = _start_of_day(now)
+        end = start + timedelta(days=1)
+        label = "Today"
+    elif range_key == "yesterday":
+        start = _start_of_day(now - timedelta(days=1))
+        end = start + timedelta(days=1)
+        label = "Yesterday"
+    elif range_key == "3d":
+        start = _start_of_day(now - timedelta(days=2))
+        end = _start_of_day(now) + timedelta(days=1)
+        label = "Last 3 days"
+    elif range_key == "7d":
+        start = _start_of_day(now - timedelta(days=6))
+        end = _start_of_day(now) + timedelta(days=1)
+        label = "Last 7 days"
+    elif range_key == "30d":
+        start = _start_of_day(now - timedelta(days=29))
+        end = _start_of_day(now) + timedelta(days=1)
+        label = "Last 30 days"
+    elif range_key == "3mo":
+        start = _start_of_day(now - timedelta(days=90))
+        end = _start_of_day(now) + timedelta(days=1)
+        label = "Last 3 months"
+    elif range_key == "this_month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        label = "Current month"
+    elif range_key == "prev_month":
+        this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if this_month.month == 1:
+            start = this_month.replace(year=this_month.year - 1, month=12)
+        else:
+            start = this_month.replace(month=this_month.month - 1)
+        end = this_month
+        label = "Prev month"
+
+    def _to_utc_str(dt: datetime | None):
+        if not dt:
+            return None
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    return _to_utc_str(start), _to_utc_str(end), label
+
+
+def _pct(part: int, total: int) -> int:
+    if total <= 0:
+        return 0
+    return int(round((part / total) * 100))
+
+
+def build_stats_summary(bot_id: str, user_id: int, range_key: str = "today"):
+    tz = get_user_timezone(bot_id, user_id)
+    start_utc, end_utc, label = _range_to_utc(range_key, tz)
+    stats = get_offer_stats(bot_id, user_id, start_utc=start_utc, end_utc=end_utc)
+
+    total = stats.get("total", 0)
+    accepted = stats.get("accepted", 0)
+    rejected = stats.get("rejected", 0)
+    not_accepted = stats.get("not_accepted", 0)
+    accepted_amount = stats.get("accepted_amount", 0) or 0
+    acc_currency = stats.get("accepted_currency")
+    if accepted_amount and acc_currency and acc_currency != "multi":
+        acc_amount_txt = f"{accepted_amount:.2f} {acc_currency}"
+    elif accepted_amount and acc_currency == "multi":
+        acc_amount_txt = f"{accepted_amount:.2f} (multi)"
+    else:
+        acc_amount_txt = f"{accepted_amount:.2f}"
+
+    type_counts = stats.get("type_counts", {})
+    transfer = type_counts.get("transfer", 0)
+    hourly = type_counts.get("hourly", 0)
+
+    class_counts = stats.get("class_counts", {})
+    class_order = ["Business", "Van", "Suv", "First", "Sprinter", "Electric"]
+
+    lines = [
+        f"📊 <b>Statistics</b> — {label}",
+        "",
+        f"Total offers: {total}",
+        "",
+        "By status:",
+        f"├ Accepted: {accepted} ({acc_amount_txt})",
+        f"├ Not valid: {rejected}",
+        f"└ Not accepted: {not_accepted}",
+        "",
+        "By type:",
+        f"├ Transfer: {transfer} [{_pct(transfer, total)}%]",
+        f"└ Hourly: {hourly} [{_pct(hourly, total)}%]",
+        "",
+        "By class:",
+    ]
+    for i, cls in enumerate(class_order):
+        count = class_counts.get(cls, 0)
+        prefix = "└" if i == (len(class_order) - 1) else "├"
+        lines.append(f"{prefix} {cls}: {count} [{_pct(count, total)}%]")
+
+    info_text = "\n".join(lines)
+
+    def _btn(label_txt: str, key: str):
+        mark = "✅ " if key == range_key else ""
+        return InlineKeyboardButton(f"{mark}{label_txt}", callback_data=f"stats_range:{key}")
+
+    keyboard = [
+        [_btn("All time", "all"), _btn("Today", "today"), _btn("Yesterday", "yesterday")],
+        [_btn("3 days", "3d"), _btn("7 days", "7d"), _btn("30 days", "30d")],
+        [_btn("3 months", "3mo"), _btn("Current month", "this_month"), _btn("Prev month", "prev_month")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
+    ]
+    return info_text, InlineKeyboardMarkup(keyboard)
+
+
 def _build_stats_block(r: dict, tz: str) -> str:
     """
     Build one HTML block with the same look & fields as offer messages.
     """
     status = r.get("status")
-    header = "✅ <b>Offer accepted</b>" if status == "accepted" else "⛔ <b>Offer rejected</b>"
+    if status == "accepted":
+        header = "✅ <b>Offer accepted</b>"
+    elif status == "not_accepted":
+        header = "⚠️ <b>Offer not accepted</b>"
+    else:
+        header = "⛔ <b>Offer rejected</b>"
     reason = r.get("rejection_reason")
 
     typ = safe(r.get("type"), "—").lower()
@@ -435,7 +568,7 @@ def _build_stats_block(r: dict, tz: str) -> str:
     end_time = _esc(fmt_dt_local(r.get("ends_at"), tz))
 
     lines = [header]
-    if status == "rejected" and reason:
+    if status in ("rejected", "not_accepted") and reason:
         lines.append(f"<i>Reason:</i> {_esc(reason)}")
 
     lines += [
@@ -472,13 +605,14 @@ def build_stats_view(bot_id: str, user_id: int, page: int = 0):
     total = counts.get("total", 0)
     accepted = counts.get("accepted", 0)
     rejected = counts.get("rejected", 0)
+    not_accepted = counts.get("not_accepted", 0)
 
     offset = page * PAGE_SIZE
     rows = get_offer_logs(bot_id, user_id, limit=PAGE_SIZE, offset=offset)
 
     header = (
         "📊 <b>Your offers</b>\n\n"
-        f"Total: <b>{total}</b>  |  ✅ <b>{accepted}</b>  |  ❌ <b>{rejected}</b>\n"
+        f"Total: <b>{total}</b>  |  ✅ <b>{accepted}</b>  |  ❌ <b>{rejected}</b>  |  ⚠️ <b>{not_accepted}</b>\n"
     )
     if not rows:
         info_text = header + "\n<i>No data yet.</i>"

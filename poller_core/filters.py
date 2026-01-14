@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Optional, Tuple, List
 from datetime import datetime
 from dateutil import parser
@@ -27,6 +28,79 @@ def _filter_pickup_airport_reject(offer: dict) -> Tuple[Optional[str], Optional[
             except Exception:
                 pass
         return "reject", "pickup contains 'airport'"
+    return None, None
+
+
+def _filter_block_baby_seat(offer: dict) -> Tuple[Optional[str], Optional[str]]:
+    rid = (offer.get("rides") or [{}])[0]
+    texts: List[str] = []
+
+    def _collect_strings(val, out: List[str], depth: int = 0):
+        if depth > 4:
+            return
+        if isinstance(val, str):
+            if val:
+                out.append(val)
+            return
+        if isinstance(val, dict):
+            for v in val.values():
+                _collect_strings(v, out, depth + 1)
+            return
+        if isinstance(val, (list, tuple, set)):
+            for item in val:
+                _collect_strings(item, out, depth + 1)
+
+    def _collect_request_fields(obj):
+        if not isinstance(obj, dict):
+            return
+        for key in (
+            "guestRequests",
+            "guest_requests",
+            "guestRequest",
+            "guest_request",
+            "special_requests",
+            "specialRequests",
+            "specialRequest",
+            "special_request",
+            "requests",
+            "request",
+        ):
+            if key in obj:
+                _collect_strings(obj.get(key), texts)
+
+    _collect_request_fields(rid)
+    _collect_request_fields(offer)
+
+    ride_obj = offer.get("ride") or offer.get("rideData") or offer.get("ride_data")
+    if isinstance(ride_obj, dict):
+        _collect_request_fields(ride_obj)
+
+    def _walk_for_request_keys(obj, depth: int = 0):
+        if depth > 4:
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(k, str) and (
+                    "request" in k.lower()
+                    or "special" in k.lower()
+                    or "seat" in k.lower()
+                    or "extra" in k.lower()
+                    or "option" in k.lower()
+                ):
+                    _collect_strings(v, texts, depth + 1)
+                _walk_for_request_keys(v, depth + 1)
+        elif isinstance(obj, (list, tuple, set)):
+            for item in obj:
+                _walk_for_request_keys(item, depth + 1)
+    _walk_for_request_keys(offer)
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+    for t in texts:
+        if "babyseat" in _norm(t):
+            return "reject", "baby seat blocked"
+
     return None, None
 
 
@@ -70,6 +144,12 @@ def _run_custom_filters(offer: dict, enabled_map: dict, tz_name: str):
         if d:
             if CF_DEBUG:
                 print(f"[{datetime.now()}] 🔔 Decision from CF 'pickup_airport_reject': {d} – {r}")
+            return d, r
+    if "block_baby_seat" in enabled_map:
+        d, r = _filter_block_baby_seat(offer)
+        if d:
+            if CF_DEBUG:
+                print(f"[{datetime.now()}] 🔔 Decision from CF 'block_baby_seat': {d} – {r}")
             return d, r
     if "reject_under_90_between_20_22" in enabled_map:
         try:

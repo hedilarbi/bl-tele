@@ -15,8 +15,8 @@ MAX_WORKERS = 10
 RIDES_REFRESH_INTERVAL_S = int(os.getenv("RIDES_REFRESH_INTERVAL_S", "30"))
 
 # Toggle mock data for development (default: real polling)
-USE_MOCK_P1 = False    
-USE_MOCK_P2 = False     
+USE_MOCK_P1 = True    
+USE_MOCK_P2 = True     
 ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when available)
 # When enabled, accepted offers will be actually reserved via API calls (P1/P2).
 AUTO_RESERVE_ENABLED = False

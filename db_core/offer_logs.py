@@ -33,6 +33,8 @@ def log_offer_decision(bot_id: str, telegram_id: int, offer: dict, status: str, 
     else:
         guest_requests = guest_raw if guest_raw is not None else None
     flight_number = (rid.get("flight") or {}).get("number") if isinstance(rid.get("flight"), dict) else None
+    if not flight_number:
+        flight_number = rid.get("flight_number")
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -155,5 +157,91 @@ def get_offer_logs_counts(bot_id: str, telegram_id: int):
         (bot_id, telegram_id),
     )
     rejected = c.fetchone()[0] or 0
+    c.execute(
+        "SELECT COUNT(*) FROM offer_logs WHERE bot_id = ? AND telegram_id = ? AND status = 'not_accepted'",
+        (bot_id, telegram_id),
+    )
+    not_accepted = c.fetchone()[0] or 0
     conn.close()
-    return {"total": total, "accepted": accepted, "rejected": rejected}
+    return {"total": total, "accepted": accepted, "rejected": rejected, "not_accepted": not_accepted}
+
+
+def get_offer_stats(
+    bot_id: str,
+    telegram_id: int,
+    start_utc: str | None = None,
+    end_utc: str | None = None,
+):
+    """
+    Aggregate stats for offers in an optional UTC time window.
+    start_utc/end_utc should be 'YYYY-MM-DD HH:MM:SS' in UTC.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    query = (
+        "SELECT status, type, vehicle_class, price, currency "
+        "FROM offer_logs WHERE bot_id = ? AND telegram_id = ?"
+    )
+    params = [bot_id, telegram_id]
+    if start_utc:
+        query += " AND datetime(created_at) >= datetime(?)"
+        params.append(start_utc)
+    if end_utc:
+        query += " AND datetime(created_at) < datetime(?)"
+        params.append(end_utc)
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+
+    stats = {
+        "total": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "not_accepted": 0,
+        "accepted_amount": 0.0,
+        "accepted_currency": None,
+        "type_counts": {},
+        "class_counts": {},
+    }
+
+    def _norm_type(t: str | None) -> str:
+        val = (t or "").strip().lower()
+        return val if val in ("transfer", "hourly") else (val or "other")
+
+    def _norm_class(cname: str | None) -> str:
+        val = (cname or "").strip().lower()
+        mapping = {
+            "business": "Business",
+            "van": "Van",
+            "suv": "Suv",
+            "first": "First",
+            "sprinter": "Sprinter",
+            "electric": "Electric",
+        }
+        return mapping.get(val, cname or "—")
+
+    for status, otype, vclass, price, currency in rows:
+        stats["total"] += 1
+        if status == "accepted":
+            stats["accepted"] += 1
+            try:
+                stats["accepted_amount"] += float(price or 0)
+            except Exception:
+                pass
+            if currency:
+                if stats["accepted_currency"] is None:
+                    stats["accepted_currency"] = currency
+                elif stats["accepted_currency"] != currency:
+                    stats["accepted_currency"] = "multi"
+        elif status == "not_accepted":
+            stats["not_accepted"] += 1
+        else:
+            stats["rejected"] += 1
+
+        tkey = _norm_type(otype)
+        stats["type_counts"][tkey] = stats["type_counts"].get(tkey, 0) + 1
+
+        ckey = _norm_class(vclass)
+        stats["class_counts"][ckey] = stats["class_counts"].get(ckey, 0) + 1
+
+    return stats

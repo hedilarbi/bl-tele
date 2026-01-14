@@ -180,6 +180,11 @@ def _process_offers_for_user(
     p2_token: Optional[str] = None,
 ):
     user_cfilters = _get_enabled_filter_slugs(bot_id, telegram_id)
+    if user_cfilters:
+        slugs = ", ".join(sorted(user_cfilters.keys()))
+        print(f"[{datetime.now()}] 🧩 Custom filters for {bot_id}/{telegram_id}: {slugs}")
+    else:
+        print(f"[{datetime.now()}] 🧩 Custom filters for {bot_id}/{telegram_id}: none")
 
     for offer in offers:
         oid = offer.get("id")
@@ -380,6 +385,8 @@ def _process_offers_for_user(
         flight_no = None
         if isinstance(rid.get("flight"), dict):
             flight_no = rid.get("flight", {}).get("number")
+        if not flight_no:
+            flight_no = rid.get("flight_number") or offer.get("flight_number")
         if flight_terms:
             def _norm_flight(s: str) -> str:
                 return re.sub(r"[^A-Za-z0-9]", "", str(s or "")).upper()
@@ -518,11 +525,18 @@ def _process_offers_for_user(
 
         # Optionally auto-reserve the offer upstream
         if AUTO_RESERVE_ENABLED:
+            reserve_attempted = False
+            reserve_ok = True
+            reserve_reason = None
             try:
                 if platform == "p1":
                     if p1_token:
+                        reserve_attempted = True
                         rs, rb = reserve_offer_p1(p1_token, oid)
                         print(f"[{datetime.now()}] 🎯 P1 reserve {oid} -> {rs} | {rb}")
+                        reserve_ok = 200 <= (rs or 0) < 300
+                        if not reserve_ok:
+                            reserve_reason = f"reserve_failed:{rs}"
                     else:
                         print(f"[{datetime.now()}] ⚠️ P1 reserve skipped (no token) for user {telegram_id}")
                 else:  # p2
@@ -531,12 +545,22 @@ def _process_offers_for_user(
                         if bid_price is None:
                             print(f"[{datetime.now()}] ⚠️ P2 reserve skipped (no price) for {oid}")
                         else:
+                            reserve_attempted = True
                             rs, rb = reserve_offer_p2(p2_token, oid, float(bid_price))
                             print(f"[{datetime.now()}] 🎯 P2 reserve {oid} -> {rs} | {rb}")
+                            reserve_ok = 200 <= (rs or 0) < 300
+                            if not reserve_ok:
+                                reserve_reason = f"reserve_failed:{rs}"
                     else:
                         print(f"[{datetime.now()}] ⚠️ P2 reserve skipped (no portal token) for user {telegram_id}")
             except Exception as e:
                 print(f"[{datetime.now()}] ❌ Auto-reserve error for {oid}: {e}")
+                reserve_attempted = True
+                reserve_ok = False
+                reserve_reason = f"reserve_error:{type(e).__name__}"
+
+            if reserve_attempted and not reserve_ok:
+                log_offer_decision(bot_id, telegram_id, offer_to_log, "not_accepted", reserve_reason)
 
         try:
             new_end_dt = parser.isoparse(offer_to_log["rides"][0].get("endsAt")) if offer_to_log["rides"][0].get("endsAt") else None

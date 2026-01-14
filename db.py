@@ -43,6 +43,7 @@ from db_core.offer_logs import (
     get_processed_offer_ids,
     get_offer_logs,
     get_offer_logs_counts,
+    get_offer_stats,
 )
 from db_core.pinned_warnings import get_pinned_warnings, save_pinned_warning, clear_pinned_warning
 from db_core.custom_filters import (

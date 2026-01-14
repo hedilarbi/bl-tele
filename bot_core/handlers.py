@@ -31,6 +31,7 @@ from .menus import (
     build_flight_blacklist_menu,
     build_ends_dt_menu,
     build_stats_view,
+    build_stats_summary,
     build_all_filters_view,
     build_notifications_menu,
 )
@@ -284,6 +285,15 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Stats
     if query.data == "statistic":
+        info_text, menu = build_stats_summary(bot_id, user_id, range_key="today")
+        await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
+        return
+    if query.data.startswith("stats_range:"):
+        range_key = query.data.split(":", 1)[1]
+        info_text, menu = build_stats_summary(bot_id, user_id, range_key=range_key)
+        await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
+        return
+    if query.data == "checked_statistic":
         info_text, menu = build_stats_view(bot_id, user_id, page=0)
         await query.edit_message_text(info_text, parse_mode="HTML", reply_markup=menu)
         return

@@ -137,6 +137,7 @@ def _map_portal_offer(raw: dict, included: list) -> Optional[dict]:
         ride["durationMinutes"] = est_dur_min
     if flight_no:
         ride["flight"] = {"number": str(flight_no)}
+        ride["flight_number"] = str(flight_no)
     if special_reqs:
         ride["guestRequests"] = special_reqs
 
@@ -149,6 +150,8 @@ def _map_portal_offer(raw: dict, included: list) -> Optional[dict]:
         "rides": [ride],
         "_platform": "p2",         # mark platform explicitly
     }
+    if flight_no:
+        mapped["flight_number"] = str(flight_no)
     return mapped
 
 
