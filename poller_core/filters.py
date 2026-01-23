@@ -10,6 +10,12 @@ from .utils import _parse_hhmm, _to_str, _esc
 from db import list_user_custom_filters
 
 
+def _quiet_print(*args, **kwargs):
+    return None
+
+
+print = _quiet_print
+
 def _get_enabled_filter_slugs(bot_id: str, telegram_id: int):
     items = list_user_custom_filters(bot_id, telegram_id)
     return {it["slug"]: it for it in items if it["global_enabled"] and it["user_enabled"]}

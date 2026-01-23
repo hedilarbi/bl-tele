@@ -13,6 +13,12 @@ from db import (
 )
 
 
+def _quiet_print(*args, **kwargs):
+    return None
+
+
+print = _quiet_print
+
 def _platform_icon(offer_or_platform) -> str:
     # accepts offer dict or plain "p1"/"p2" string
     plat = offer_or_platform

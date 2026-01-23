@@ -5,6 +5,12 @@ from datetime import datetime
 
 from .config import API_HOST
 
+def _quiet_print(*args, **kwargs):
+    return None
+
+
+print = _quiet_print
+
 
 def get_rides_p1(token: str) -> Tuple[Optional[int], Optional[list]]:
     headers = {

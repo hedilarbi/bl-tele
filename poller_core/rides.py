@@ -15,6 +15,12 @@ from .notify import maybe_send_message
 from .p2_client import _safe_attr, _find_included, _extract_loc_from_included
 
 
+def _quiet_print(*args, **kwargs):
+    return None
+
+
+print = _quiet_print
+
 def _extract_intervals_from_rides(rides: list) -> List[Tuple[datetime, Optional[datetime]]]:
     out: List[Tuple[datetime, Optional[datetime]]] = []
     for it in (rides or []):

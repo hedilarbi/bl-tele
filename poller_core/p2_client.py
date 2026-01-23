@@ -14,6 +14,12 @@ from .config import (
 from db import get_portal_token, update_portal_token
 
 
+def _quiet_print(*args, **kwargs):
+    return None
+
+
+print = _quiet_print
+
 def _safe_attr(d, *keys, default=None):
     cur = d
     for k in keys:

@@ -345,7 +345,7 @@ def _fmt_local_iso(iso_or_none: Optional[str], tz_name: str) -> str:
 
 
 def _log(msg: str):
-    print(f"[{datetime.now()}] {msg}")
+    return None
 
 
 def _extract_addr(loc: dict) -> str:

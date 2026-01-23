@@ -52,6 +52,16 @@ from db import (
     get_bl_account_full,
 )
 
+def _quiet_print(*args, **kwargs):
+    return None
+
+
+def _quiet_exc(*args, **kwargs):
+    return None
+
+
+print = _quiet_print
+
 
 def _read_portal_creds(bot_id: str, telegram_id: int) -> Tuple[Optional[str], Optional[str]]:
     try:
@@ -500,5 +510,5 @@ def run():
                         print(f"[{datetime.now()}] ✅ {res}")
                 except Exception as e:
                     print(f"[{datetime.now()}] ❌ Poll error: {e}")
-                    traceback.print_exc()
+                    _quiet_exc()
         time.sleep(POLL_INTERVAL)

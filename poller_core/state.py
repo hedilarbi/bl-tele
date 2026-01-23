@@ -3,6 +3,13 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional
 import threading
 
+
+def _quiet_print(*args, **kwargs):
+    return None
+
+
+print = _quiet_print
+
 inmem_lock = threading.Lock()
 
 # Athena token/etag helpers

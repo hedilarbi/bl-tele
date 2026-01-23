@@ -1,6 +1,7 @@
 import uuid
 import json
 import re
+import builtins as _builtins
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, timezone, timedelta
 from datetime import time as dt_time
@@ -32,6 +33,13 @@ from .state import accepted_per_user, rejected_per_user
 from .p1_client import reserve_offer_p1
 from .p2_client import reserve_offer_p2
 from db import log_offer_decision, save_offer_message
+
+
+def _quiet_print(*args, **kwargs):
+    return None
+
+
+print = _quiet_print
 
 
 def _build_user_message(
@@ -533,10 +541,10 @@ def _process_offers_for_user(
                     if p1_token:
                         reserve_attempted = True
                         rs, rb = reserve_offer_p1(p1_token, oid)
-                        print(f"[{datetime.now()}] 🎯 P1 reserve {oid} -> {rs} | {rb}")
+                        _builtins.print(f"[{datetime.now()}] 🎯 P1 reserve {oid} -> {rs} | {rb}")
                         reserve_ok = 200 <= (rs or 0) < 300
                         if not reserve_ok:
-                            print(f"[{datetime.now()}] ❌ P1 reserve failed {oid} (status={rs}) body={rb}")
+                            _builtins.print(f"[{datetime.now()}] ❌ P1 reserve failed {oid} (status={rs}) body={rb}")
                             reserve_reason = f"reserve_failed:{rs}"
                     else:
                         print(f"[{datetime.now()}] ⚠️ P1 reserve skipped (no token) for user {telegram_id}")
@@ -548,10 +556,10 @@ def _process_offers_for_user(
                         else:
                             reserve_attempted = True
                             rs, rb = reserve_offer_p2(p2_token, oid, float(bid_price))
-                            print(f"[{datetime.now()}] 🎯 P2 reserve {oid} -> {rs} | {rb}")
+                            _builtins.print(f"[{datetime.now()}] 🎯 P2 reserve {oid} -> {rs} | {rb}")
                             reserve_ok = 200 <= (rs or 0) < 300
                             if not reserve_ok:
-                                print(f"[{datetime.now()}] ❌ P2 reserve failed {oid} (status={rs}) body={rb}")
+                                _builtins.print(f"[{datetime.now()}] ❌ P2 reserve failed {oid} (status={rs}) body={rb}")
                                 reserve_reason = f"reserve_failed:{rs}"
                     else:
                         print(f"[{datetime.now()}] ⚠️ P2 reserve skipped (no portal token) for user {telegram_id}")
