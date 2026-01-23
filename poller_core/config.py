@@ -19,7 +19,7 @@ USE_MOCK_P1 = False
 USE_MOCK_P2 = False     
 ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when available)
 # When enabled, accepted offers will be actually reserved via API calls (P1/P2).
-AUTO_RESERVE_ENABLED = False
+AUTO_RESERVE_ENABLED = True
 
 # Diagnostics
 DEBUG_PRINT_OFFERS = False   # print raw offers

@@ -536,6 +536,7 @@ def _process_offers_for_user(
                         print(f"[{datetime.now()}] 🎯 P1 reserve {oid} -> {rs} | {rb}")
                         reserve_ok = 200 <= (rs or 0) < 300
                         if not reserve_ok:
+                            print(f"[{datetime.now()}] ❌ P1 reserve failed {oid} (status={rs}) body={rb}")
                             reserve_reason = f"reserve_failed:{rs}"
                     else:
                         print(f"[{datetime.now()}] ⚠️ P1 reserve skipped (no token) for user {telegram_id}")
@@ -550,6 +551,7 @@ def _process_offers_for_user(
                             print(f"[{datetime.now()}] 🎯 P2 reserve {oid} -> {rs} | {rb}")
                             reserve_ok = 200 <= (rs or 0) < 300
                             if not reserve_ok:
+                                print(f"[{datetime.now()}] ❌ P2 reserve failed {oid} (status={rs}) body={rb}")
                                 reserve_reason = f"reserve_failed:{rs}"
                     else:
                         print(f"[{datetime.now()}] ⚠️ P2 reserve skipped (no portal token) for user {telegram_id}")
