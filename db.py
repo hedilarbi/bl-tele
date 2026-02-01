@@ -7,6 +7,7 @@ from db_core.users import (
     set_token_status,
     update_portal_token,
     get_portal_token,
+    get_mobile_headers,
     get_token_status,
     update_filters,
     get_all_users,

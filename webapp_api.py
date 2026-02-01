@@ -16,6 +16,7 @@ if sys.version_info >= (3, 13):
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request, Query
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, validator
@@ -83,6 +84,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------- Error logging -----------------
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    try:
+        logging.warning(
+            "HTTPException %s %s?%s -> %s | detail=%s",
+            request.method,
+            request.url.path,
+            request.url.query or "",
+            exc.status_code,
+            exc.detail,
+        )
+    except Exception:
+        pass
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    try:
+        logging.warning(
+            "ValidationError %s %s?%s -> %s",
+            request.method,
+            request.url.path,
+            request.url.query or "",
+            exc.errors(),
+        )
+    except Exception:
+        pass
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 # ----------------- Startup -----------------
 @app.on_event("startup")
 async def _startup():
@@ -124,6 +156,44 @@ def _resolve_bot_token(init_data_raw: str, bot_id: Optional[str]) -> Optional[st
             return tok
     return None
 
+def _get_admin_bot_info() -> Optional[dict]:
+    try:
+        bots = list_bot_instances() or []
+    except Exception:
+        return None
+    for b in bots:
+        if (b or {}).get("role") == "admin" and (b or {}).get("bot_token"):
+            return b
+    return None
+
+def _resolve_user_from_init(init_data_raw: str, bot_id: Optional[str], as_user: Optional[int] = None) -> int:
+    # First, try validating against the target bot token.
+    try:
+        bot_token = _resolve_bot_token(init_data_raw, bot_id)
+        user = _validate_init_data(init_data_raw, bot_token)
+        uid = int(user["id"])
+        if as_user is not None and int(as_user) != uid:
+            raise HTTPException(403, "Not allowed")
+        return int(as_user) if as_user is not None else uid
+    except HTTPException as e:
+        # Fallback: allow admin bot initData to act on a target user.
+        admin_bot = _get_admin_bot_info()
+        if not admin_bot:
+            raise e
+        try:
+            logging.info("Auth fallback: trying admin bot token for bot_id=%s as_user=%s", bot_id, as_user)
+            user = _validate_init_data(init_data_raw, admin_bot.get("bot_token"))
+            uid = int(user["id"])
+            owner_id = admin_bot.get("owner_telegram_id")
+            if owner_id is None or int(owner_id) != uid:
+                raise HTTPException(403, "Not admin")
+            if as_user is not None:
+                return int(as_user)
+            return uid
+        except HTTPException:
+            logging.warning("Auth fallback failed for bot_id=%s as_user=%s", bot_id, as_user)
+            raise e
+
 def _validate_init_data(init_data_raw: str, bot_token: Optional[str], max_age_sec: int = 600) -> dict:
     if not bot_token:
         logging.warning("initData validation failed: unknown bot token")
@@ -163,27 +233,23 @@ def _validate_init_data(init_data_raw: str, bot_token: Optional[str], max_age_se
         raise HTTPException(401, "No user in initData")
     return user
 
-def _require_user(auth_header: Optional[str], bot_id: Optional[str] = None) -> int:
+def _require_user(auth_header: Optional[str], bot_id: Optional[str] = None, as_user: Optional[int] = None) -> int:
     if not bot_id:
         raise HTTPException(400, "bot_id required")
     if not auth_header or not auth_header.startswith("tma "):
         raise HTTPException(401, "Use header: Authorization: tma <initData>")
     init_data_raw = auth_header[4:]
-    bot_token = _resolve_bot_token(init_data_raw, bot_id)
-    user = _validate_init_data(init_data_raw, bot_token)
-    uid = int(user["id"])
+    uid = _resolve_user_from_init(init_data_raw, bot_id, as_user=as_user)
     logging.info("🔑 Auth OK for user_id=%s", uid)
     return uid
 
-def _require_user_from_any(auth_header: Optional[str], tma_qs: Optional[str], bot_id: Optional[str]) -> int:
+def _require_user_from_any(auth_header: Optional[str], tma_qs: Optional[str], bot_id: Optional[str], as_user: Optional[int] = None) -> int:
     if not bot_id:
         raise HTTPException(400, "bot_id required")
     if auth_header and auth_header.startswith("tma "):
-        return _require_user(auth_header, bot_id)
+        return _require_user(auth_header, bot_id, as_user=as_user)
     if tma_qs:
-        bot_token = _resolve_bot_token(tma_qs, bot_id)
-        user = _validate_init_data(tma_qs, bot_token)
-        uid = int(user["id"])
+        uid = _resolve_user_from_init(tma_qs, bot_id, as_user=as_user)
         logging.info("🔑 Auth OK (query) uid=%s", uid)
         return uid
     raise HTTPException(401, "Provide Authorization: tma <initData> or ?tma=<initData>")
@@ -695,6 +761,38 @@ def _get_mobile_token(bot_id: str, uid: int) -> Optional[str]:
     except Exception:
         return None
 
+
+def _get_mobile_headers(bot_id: str, uid: int) -> Optional[dict]:
+    try:
+        conn = sqlite3.connect(DB_FILE); cur = conn.cursor()
+        cur.execute("SELECT mobile_headers FROM users WHERE bot_id = ? AND telegram_id = ?", (bot_id, uid))
+        row = cur.fetchone(); conn.close()
+        if not row or not row[0]:
+            return None
+        val = json.loads(row[0])
+        return val if isinstance(val, dict) else None
+    except Exception:
+        return None
+
+
+def _merge_mobile_headers(token: str, base_headers: Optional[dict]) -> dict:
+    if base_headers:
+        headers = dict(base_headers)
+        if not any(k.lower() == "host" for k in headers):
+            headers["Host"] = API_HOST.replace("https://", "")
+        if not any(k.lower() == "accept" for k in headers):
+            headers["Accept"] = "*/*"
+        if not any(k.lower() == "content-type" for k in headers):
+            headers["Content-Type"] = "application/json"
+    else:
+        headers = {
+            "Host": API_HOST.replace("https://", ""),
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+        }
+    headers["Authorization"] = token
+    return headers
+
 # ----------------- Endpoints -----------------
 @app.get("/debug/ping")
 def ping():
@@ -714,8 +812,9 @@ def list_slots(
     Authorization: Optional[str] = Header(default=None),
     tma: Optional[str] = Query(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
 ):
-    uid = _require_user_from_any(Authorization, tma, bot_id)
+    uid = _require_user_from_any(Authorization, tma, bot_id, as_user=as_user)
     rows = get_booked_slots(bot_id, uid)
     logging.info("📦 list_slots user=%s -> %d rows", uid, len(rows or []))
     return {"slots": rows}
@@ -725,8 +824,9 @@ def create_slot(
     payload: CreateSlotIn,
     Authorization: Optional[str] = Header(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
 ):
-    uid = _require_user(Authorization, bot_id)
+    uid = _require_user(Authorization, bot_id, as_user=as_user)
     dt_start = _parse_dt(payload.start); dt_end = _parse_dt(payload.end)
     if not (dt_start and dt_end):
         raise HTTPException(400, detail={
@@ -743,8 +843,9 @@ def delete_slot(
     slot_id: int,
     Authorization: Optional[str] = Header(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
 ):
-    uid = _require_user(Authorization, bot_id)
+    uid = _require_user(Authorization, bot_id, as_user=as_user)
     if delete_booked_slot:
         try:
             delete_booked_slot(bot_id, slot_id)
@@ -768,8 +869,9 @@ def list_blocked_days(
     Authorization: Optional[str] = Header(default=None),
     tma: Optional[str] = Query(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
 ):
-    uid = _require_user_from_any(Authorization, tma, bot_id)
+    uid = _require_user_from_any(Authorization, tma, bot_id, as_user=as_user)
     rows = get_blocked_days(bot_id, uid)
     return {"days": [r["day"] for r in rows]}
 
@@ -778,8 +880,9 @@ def toggle_blocked_day(
     payload: ToggleDayIn,
     Authorization: Optional[str] = Header(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
 ):
-    uid = _require_user(Authorization, bot_id)
+    uid = _require_user(Authorization, bot_id, as_user=as_user)
     dt = _parse_day_ddmmyyyy((payload.day or "").strip())
     if not dt:
         raise HTTPException(400, detail={"error": "bad_day_format", "expected": "dd/mm/YYYY", "got": payload.day})
@@ -800,11 +903,12 @@ def toggle_blocked_day(
 def list_user_rides(
     Authorization: Optional[str] = Header(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
     page: int = Query(1, ge=1),
     limit: int = Query(30, ge=1, le=200),
     status: Optional[str] = Query(default=None),
 ):
-    uid = _require_user(Authorization, bot_id)
+    uid = _require_user(Authorization, bot_id, as_user=as_user)
 
     tz_name = get_user_timezone(bot_id, uid) or "UTC"
     formulas = _normalize_formulas(get_endtime_formulas(bot_id, uid))
@@ -858,14 +962,8 @@ def list_user_rides(
     if not token:
         raise HTTPException(401, detail={"error": "no_token", "hint": "Add your mobile session token or portal account."})
 
-    headers = {
-        "Host": API_HOST.replace("https://", ""),
-        "Content-Type": "application/json",
-        "Accept": "*/*",
-        "Authorization": token,
-        "X-Request-ID": str(uuid.uuid4()),
-        "X-Correlation-ID": str(uuid.uuid4()),
-    }
+    base_headers = _get_mobile_headers(bot_id, uid)
+    headers = _merge_mobile_headers(token, base_headers)
 
     try:
         r = requests.get(f"{API_HOST}/rides", headers=headers, timeout=15)
@@ -927,8 +1025,9 @@ def webapp_list_my_filters(
     Authorization: Optional[str] = Header(default=None),
     tma: Optional[str] = Query(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
 ):
-    uid = _require_user_from_any(Authorization, tma, bot_id)
+    uid = _require_user_from_any(Authorization, tma, bot_id, as_user=as_user)
     rows = list_user_custom_filters(bot_id, uid)
     items = []
     for r in rows:
@@ -942,8 +1041,9 @@ def webapp_toggle_my_filter(
     payload: ToggleMyCF,
     Authorization: Optional[str] = Header(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
 ):
-    uid = _require_user(Authorization, bot_id)
+    uid = _require_user(Authorization, bot_id, as_user=as_user)
     toggle_user_custom_filter(bot_id, uid, slug, bool(payload.enabled))
     return {"ok": True}
 
@@ -953,8 +1053,9 @@ def webapp_get_bl_account(
     Authorization: Optional[str] = Header(default=None),
     tma: Optional[str] = Query(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
 ):
-    uid = _require_user_from_any(Authorization, tma, bot_id)
+    uid = _require_user_from_any(Authorization, tma, bot_id, as_user=as_user)
     acc = get_bl_account(bot_id, uid) or {}
     return {"email": acc.get("email")}
 
@@ -964,8 +1065,9 @@ def webapp_save_bl_account(
     Authorization: Optional[str] = Header(default=None),
     tma: Optional[str] = Query(default=None),
     bot_id: Optional[str] = Query(default=None),
+    as_user: Optional[int] = Query(default=None),
 ):
-    uid = _require_user_from_any(Authorization, tma, bot_id)
+    uid = _require_user_from_any(Authorization, tma, bot_id, as_user=as_user)
 
     email = (payload.email or "").strip()
     password = (payload.password or "").strip()

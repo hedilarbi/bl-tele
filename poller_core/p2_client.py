@@ -1,11 +1,13 @@
 import base64
 import json
+import builtins as _builtins
 from typing import Optional, Tuple
 from datetime import datetime
 import requests
 
 from .config import (
     ATHENA_BASE,
+    PARTNER_API_BASE,
     PORTAL_CLIENT_ID,
     PORTAL_PAGE_SIZE,
     ATHENA_RELOGIN_SKEW_S,
@@ -19,6 +21,10 @@ def _quiet_print(*args, **kwargs):
 
 
 print = _quiet_print
+
+
+def _log_poll_response(label: str, status: int, body: str):
+    return None
 
 def _safe_attr(d, *keys, default=None):
     cur = d
@@ -161,36 +167,51 @@ def _map_portal_offer(raw: dict, included: list) -> Optional[dict]:
     return mapped
 
 
-def reserve_offer_p2(access_token: str, offer_id: str, price: float):
+def reserve_offer_p2(
+    access_token: str,
+    offer_id: str,
+    price: float,
+    bl_user_id: Optional[str] = None,
+    roles: Optional[str] = None,
+    extra_headers: Optional[dict] = None,
+):
     """
-    Place a bid for an offer on Platform 2 (Athena/Portal).
+    Accept an offer on Platform 2 (Partner Portal).
 
     Returns: (status_code, json_or_text)
     """
-    url = f"{ATHENA_BASE}/hades/bids"
+    url = f"{PARTNER_API_BASE}/chauffeur/offers"
     headers = {
         "Authorization": f"Bearer {access_token}",
-        "Accept": "application/vnd.api+json",
-        "Content-Type": "application/vnd.api+json",
-        "User-Agent": "BLPortal/1.0 (+poller)",
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Origin": "https://partner.blacklane.com",
+        "Referer": "https://partner.blacklane.com/",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        "X-User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        "Blacklane-User-Id": str(bl_user_id or ""),
+        "Blacklane-User-Roles": roles or "dispatcher,driver,provider,admin,reviewer",
+        "X-Datadog-Origin": "rum",
+        "X-Datadog-Sampling-Priority": "1",
     }
-    payload = {
-        "data": {
-            "type": "bids",
-            "attributes": {"price": float(price)},
-            "relationships": {
-                "offer": {"data": {"id": str(offer_id), "type": "offers"}}
-            },
-        },
-        "meta": {},
-    }
+    if extra_headers:
+        for k, v in extra_headers.items():
+            if v is not None:
+                headers[k] = v
 
-    r = requests.post(url, headers=headers, json=payload, timeout=15)
+    payload = {"action": "accept", "id": str(offer_id), "price": float(price)}
+
     try:
-        body = r.json()
-    except Exception:
-        body = r.text
-    return r.status_code, body
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return r.status_code, body
+    except requests.exceptions.RequestException as e:
+        return None, {"error": f"{type(e).__name__}: {e}"}
 
 
 def _athena_login(email: str, password: str) -> Tuple[bool, Optional[str], str]:
@@ -291,12 +312,17 @@ def _athena_get_offers(
         headers["If-None-Match"] = etag
     try:
         r = requests.get(url, headers=headers, timeout=15)
+        raw_text = r.text
+        _log_poll_response("P2 poll /hades/offers", r.status_code, raw_text)
         new_etag = r.headers.get("etag") or r.headers.get("ETag")
         if r.status_code == 304:
             return 304, None, new_etag
         if 200 <= r.status_code < 300:
             try:
-                return r.status_code, r.json(), new_etag
+                payload = r.json()
+                if isinstance(payload, dict) and (payload.get("data") or []):
+                    _builtins.print(f"[{datetime.now()}] 🛰️ P2 poll /hades/offers full response -> {raw_text}")
+                return r.status_code, payload, new_etag
             except Exception:
                 return r.status_code, None, new_etag
         return r.status_code, None, new_etag
@@ -332,6 +358,8 @@ def _athena_get_rides(
         headers["If-None-Match"] = etag
     try:
         r = requests.get(url, headers=headers, timeout=15)
+        raw_text = r.text
+        _log_poll_response("P2 poll /hades/rides", r.status_code, raw_text)
         new_etag = r.headers.get("etag") or r.headers.get("ETag")
         if r.status_code == 304:
             return 304, None, new_etag

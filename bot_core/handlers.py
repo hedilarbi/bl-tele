@@ -37,7 +37,7 @@ from .menus import (
 )
 from .state import user_waiting_input, adding_slot_step, work_schedule_state, _ctx_bot_id, _state_key
 from .storage import get_active, set_active, get_filters
-from .utils import normalize_token, validate_mobile_session, validate_datetime, validate_day
+from .utils import normalize_token, parse_mobile_session_dump, validate_mobile_session, validate_datetime, validate_day
 from db import (
     add_user,
     assign_bot_owner,
@@ -97,7 +97,7 @@ async def open_settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Select a bot first with /listbots.")
         return
     add_user(bot_id, user_id)
-    info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode)
+    info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode, as_user_id=user_id)
     await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
 
 
@@ -156,10 +156,16 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     raw = " ".join(context.args)
-    token = normalize_token(raw)
-    update_token(bot_id, update.effective_user.id, token)
+    if not re.search(r"(?im)^\s*authorization\s*:", raw):
+        await update.message.reply_text("❌ Paste the full HTTP dump (with Authorization header). Token only is not accepted.")
+        return
+    token, headers = parse_mobile_session_dump(raw)
+    if not headers:
+        await update.message.reply_text("❌ Paste the full HTTP dump (with headers). Token only is not accepted.")
+        return
+    update_token(bot_id, update.effective_user.id, token, headers)
 
-    ok, note = validate_mobile_session(token)
+    ok, note = validate_mobile_session(token, headers if headers else None)
     set_token_status(
         bot_id,
         update.effective_user.id,
@@ -212,7 +218,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Settings
     if query.data == "settings":
-        info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode)
+        info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode, as_user_id=user_id)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
     if query.data == "change_tz":
@@ -308,7 +314,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Filters menu & back
     if query.data in ("filters", "back_to_filters"):
-        info_text, menu = build_filters_menu(get_filters(bot_id, user_id), user_id, bot_id)
+        info_text, menu = build_filters_menu(get_filters(bot_id, user_id), user_id, bot_id, as_user_id=user_id)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
     if query.data == "back_to_main":
@@ -322,7 +328,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Show filters summary
     if query.data == "show_filters":
-        info_text, menu = build_filters_menu(get_filters(bot_id, user_id), user_id, bot_id)
+        info_text, menu = build_filters_menu(get_filters(bot_id, user_id), user_id, bot_id, as_user_id=user_id)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
@@ -518,17 +524,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         set_user_timezone(bot_id, user_id, tz)
         await update.message.reply_text(f"✅ Timezone set to `{tz}`.", parse_mode="Markdown")
-        info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode)
+        info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode, as_user_id=user_id)
         await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
         user_waiting_input.pop(state_key, None)
         return
 
     # Token input (Mobile Sessions)
     if user_waiting_input.get(state_key) == "set_token":
-        token = normalize_token(text)
-        update_token(bot_id, user_id, token)
+        if not re.search(r"(?im)^\s*authorization\s*:", text):
+            await update.message.reply_text("❌ Paste the full HTTP dump (with Authorization header). Token only is not accepted.")
+            return
+        token, headers = parse_mobile_session_dump(text)
+        if not headers:
+            await update.message.reply_text("❌ Paste the full HTTP dump (with headers). Token only is not accepted.")
+            return
+        update_token(bot_id, user_id, token, headers)
 
-        ok, note = validate_mobile_session(token)
+        ok, note = validate_mobile_session(token, headers if headers else None)
         set_token_status(bot_id, user_id, "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown"))
 
         bot_token = context.bot.token if context and context.bot else None
@@ -620,7 +632,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_waiting_input.pop(state_key, None)
         work_schedule_state.pop(state_key, None)
         await update.message.reply_text(f"✅ Work schedule updated to `{start} – {text}`.", parse_mode="Markdown")
-        info_text, menu = build_filters_menu(filters_data, user_id, bot_id)
+        info_text, menu = build_filters_menu(filters_data, user_id, bot_id, as_user_id=user_id)
         await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
@@ -763,7 +775,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filters_data[field] = text
             update_filters(bot_id, user_id, json.dumps(filters_data))
             await update.message.reply_text(f"✅ Updated {field} to {text}")
-            info_text, menu = build_filters_menu(filters_data, user_id, bot_id)
+            info_text, menu = build_filters_menu(filters_data, user_id, bot_id, as_user_id=user_id)
             await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)
             return
 
@@ -783,5 +795,5 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filters_data[field] = value
         update_filters(bot_id, user_id, json.dumps(filters_data))
         await update.message.reply_text(f"✅ Updated {field} to {value}")
-        info_text, menu = build_filters_menu(filters_data, user_id, bot_id)
+        info_text, menu = build_filters_menu(filters_data, user_id, bot_id, as_user_id=user_id)
         await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)

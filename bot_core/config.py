@@ -20,11 +20,16 @@ def _ensure_https_base(url: str) -> str:
     return url
 
 
-def _with_bot_id(url: str, bot_id: str | None) -> str:
-    if not bot_id:
+def _with_bot_id(url: str, bot_id: str | None, as_user: int | None = None) -> str:
+    qs = {}
+    if bot_id:
+        qs["bot_id"] = str(bot_id)
+    if as_user is not None:
+        qs["as_user"] = str(as_user)
+    if not qs:
         return url
     sep = "&" if "?" in url else "?"
-    return f"{url}{sep}bot_id={urllib.parse.quote(str(bot_id))}"
+    return f"{url}{sep}{urllib.parse.urlencode(qs)}"
 
 
 ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "").strip()

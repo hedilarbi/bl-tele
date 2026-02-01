@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from datetime import datetime
 
 from .config import DB_FILE
@@ -71,13 +72,23 @@ def add_user(bot_id: str, telegram_id: int):
     conn.close()
 
 
-def update_token(bot_id: str, telegram_id: int, token: str):
+def update_token(bot_id: str, telegram_id: int, token: str, headers: dict | None = None):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute(
-        "UPDATE users SET token = ?, token_status = 'unknown' WHERE bot_id = ? AND telegram_id = ?",
-        (token, bot_id, telegram_id),
-    )
+    if headers is None:
+        c.execute(
+            "UPDATE users SET token = ?, token_status = 'unknown' WHERE bot_id = ? AND telegram_id = ?",
+            (token, bot_id, telegram_id),
+        )
+    else:
+        try:
+            headers_json = json.dumps(headers, ensure_ascii=True)
+        except Exception:
+            headers_json = None
+        c.execute(
+            "UPDATE users SET token = ?, mobile_headers = ?, token_status = 'unknown' WHERE bot_id = ? AND telegram_id = ?",
+            (token, headers_json, bot_id, telegram_id),
+        )
     conn.commit()
     conn.close()
 
@@ -111,6 +122,21 @@ def get_portal_token(bot_id: str, telegram_id: int) -> str | None:
     row = c.fetchone()
     conn.close()
     return row[0] if row and row[0] else None
+
+
+def get_mobile_headers(bot_id: str, telegram_id: int) -> dict | None:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT mobile_headers FROM users WHERE bot_id = ? AND telegram_id = ?", (bot_id, telegram_id))
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        val = json.loads(row[0])
+        return val if isinstance(val, dict) else None
+    except Exception:
+        return None
 
 
 def get_token_status(bot_id: str, telegram_id: int) -> str:

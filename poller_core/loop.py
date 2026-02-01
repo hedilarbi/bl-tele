@@ -1,6 +1,7 @@
 import json
 import time
 import traceback
+import builtins as _builtins
 from typing import Optional, List, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,12 +10,16 @@ from .config import (
     ALWAYS_POLL_REAL_ORDERS,
     USE_MOCK_P1,
     USE_MOCK_P2,
+    ENABLE_P1,
     ATHENA_PRINT_DEBUG,
     POLL_INTERVAL,
     MAX_WORKERS,
+    RIDES_REFRESH_INTERVAL_S,
 )
 from .state import (
     maybe_reset_inmem_caches,
+    get_rides_cache,
+    set_rides_cache,
 )
 from .utils import _normalize_formulas
 from .p1_client import get_rides_p1, get_offers_p1
@@ -50,7 +55,9 @@ from db import (
     get_endtime_formulas,
     get_bl_uuid,
     get_bl_account_full,
+    get_mobile_headers,
 )
+
 
 def _quiet_print(*args, **kwargs):
     return None
@@ -61,6 +68,22 @@ def _quiet_exc(*args, **kwargs):
 
 
 print = _quiet_print
+
+
+def _poll_log(msg: str):
+    _builtins.print(f"[{datetime.now()}] {msg}")
+
+
+def _log_offers_found(platform: str, telegram_id: int, offers: List[dict]):
+    if not offers:
+        return
+    try:
+        payload = json.dumps(offers, ensure_ascii=True, default=str)
+    except Exception:
+        payload = str(offers)
+    _builtins.print(
+        f"[{datetime.now()}] ✅ {platform} offers found for user {telegram_id}: {len(offers)} | {payload}"
+    )
 
 
 def _read_portal_creds(bot_id: str, telegram_id: int) -> Tuple[Optional[str], Optional[str]]:
@@ -84,10 +107,8 @@ def poll_user(user):
     bot_id, telegram_id, token, filters_json, active, bot_admin_active = user
 
     tz_name = get_user_timezone(bot_id, telegram_id) or "UTC"
-    print(
-        f"[{datetime.now()}] 🔍 Polling {bot_id}/{telegram_id} "
-        f"(active={active}, admin_active={bot_admin_active}) tz={tz_name}"
-    )
+    _poll_log(f"🔍 Polling {bot_id}/{telegram_id} (active={active}, admin_active={bot_admin_active})")
+    mobile_headers = get_mobile_headers(bot_id, telegram_id)
 
     if not bot_admin_active:
         print(f"[{datetime.now()}] ⏩ Skipping inactive bot {bot_id} (admin inactive)")
@@ -110,6 +131,7 @@ def poll_user(user):
 
     bl_uuid = get_bl_uuid(bot_id, telegram_id)
     email, password = _read_portal_creds(bot_id, telegram_id)
+    has_portal_creds = bool(email and password)
     portal_token = None
     if email and password:
         portal_token = _ensure_portal_token(bot_id, telegram_id, email, password)
@@ -152,7 +174,7 @@ def poll_user(user):
     def _fetch_p1_rides():
         if not token or not str(token).strip():
             return [], False
-        status_code, ride_results = get_rides_p1(token)
+        status_code, ride_results = get_rides_p1(token, headers=mobile_headers)
         if status_code == 200 and isinstance(ride_results, list):
             kept = _filter_rides_by_bl_uuid(ride_results, bl_uuid) if bl_uuid else ride_results
             snap = _rides_snapshot_from_p1_list(kept, tz_name)
@@ -173,36 +195,18 @@ def poll_user(user):
                     clear_pinned_warning(bot_id, telegram_id, "no_token")
                 pin_warning_if_needed(bot_id, telegram_id, "expired")
         elif status_code is None:
-            print(f"[{datetime.now()}] ⚠️ P1 /rides network error for user {telegram_id}")
+            err_detail = ride_results.get("error") if isinstance(ride_results, dict) else None
+            if err_detail:
+                print(f"[{datetime.now()}] ⚠️ P1 /rides network error for user {telegram_id} | {err_detail}")
+            else:
+                print(f"[{datetime.now()}] ⚠️ P1 /rides network error for user {telegram_id}")
         else:
             print(f"[{datetime.now()}] ⚠️ P1 /rides returned status {status_code} for user {telegram_id}")
         return [], False
 
-    if poll_real_orders:
-        p1_intervals: List[Tuple[datetime, Optional[datetime]]] = []
-        p2_intervals: List[Tuple[datetime, Optional[datetime]]] = []
-        tasks = {}
-        with ThreadPoolExecutor(max_workers=2) as ride_exec:
-            if portal_token:
-                tasks["p2"] = ride_exec.submit(_fetch_p2_rides)
-            if token and str(token).strip():
-                tasks["p1"] = ride_exec.submit(_fetch_p1_rides)
-            for name, fut in tasks.items():
-                intervals, _ok = fut.result()
-                if name == "p1":
-                    p1_intervals = intervals
-                else:
-                    p2_intervals = intervals
-        accepted_intervals = p1_intervals + p2_intervals
-
-        if not portal_token and not (token and str(token).strip()):
-            existing = get_pinned_warnings(bot_id, telegram_id)
-            if not existing["expired_msg_id"] and not existing["no_token_msg_id"]:
-                pin_warning_if_needed(bot_id, telegram_id, "no_token")
-
     # ---------- PLATFORM 1 OFFERS ----------
     offers_p1: List[dict] = []
-    if USE_MOCK_P1:
+    if ENABLE_P1 and USE_MOCK_P1:
         offers_p1 = [
             {
                 "type": "ride",
@@ -264,7 +268,7 @@ def poll_user(user):
 
     def _fetch_p1_offers_real():
         if token and str(token).strip():
-            status_code, results = get_offers_p1(token)
+            status_code, results = get_offers_p1(token, headers=mobile_headers)
             if status_code in (401, 403):
                 set_token_status(bot_id, telegram_id, "expired")
                 existing = get_pinned_warnings(bot_id, telegram_id)
@@ -281,9 +285,16 @@ def poll_user(user):
                 unpin_warning_if_any(bot_id, telegram_id, "expired")
                 unpin_warning_if_any(bot_id, telegram_id, "no_token")
                 offers = results or []
-                print(f"[{datetime.now()}] 📥 P1 offers for user {telegram_id}: {len(offers)}")
+                _log_offers_found("P1", telegram_id, offers)
                 return offers
-            print(f"[{datetime.now()}] ⚠️ P1 offers returned {status_code} for user {telegram_id} | body={results}")
+            if status_code is None:
+                err_detail = results.get("error") if isinstance(results, dict) else None
+                if err_detail:
+                    print(f"[{datetime.now()}] ⚠️ P1 offers error for user {telegram_id} | {err_detail}")
+                else:
+                    print(f"[{datetime.now()}] ⚠️ P1 offers returned None for user {telegram_id} | body={results}")
+            else:
+                print(f"[{datetime.now()}] ⚠️ P1 offers returned {status_code} for user {telegram_id} | body={results}")
             return []
 
         existing = get_pinned_warnings(bot_id, telegram_id)
@@ -448,13 +459,13 @@ def poll_user(user):
                 mapped = _map_portal_offer(raw, included)
                 if mapped:
                     offers.append(mapped)
-            print(f"[{datetime.now()}] 📥 P2 offers for user {telegram_id}: {len(offers)}")
+            _log_offers_found("P2", telegram_id, offers)
         elif status_code == 304 and ATHENA_PRINT_DEBUG:
             print(f"[{datetime.now()}] 📦 Athena offers 304 Not Modified for user {telegram_id}")
         return offers, tok
 
     if not USE_MOCK_P1 or not USE_MOCK_P2:
-        if not USE_MOCK_P1 and not USE_MOCK_P2:
+        if ENABLE_P1 and not USE_MOCK_P1 and not USE_MOCK_P2:
             tasks = {}
             with ThreadPoolExecutor(max_workers=2) as offer_exec:
                 tasks["p1"] = offer_exec.submit(_fetch_p1_offers_real)
@@ -465,7 +476,7 @@ def poll_user(user):
                     else:
                         offers_p2, portal_token = fut.result()
         else:
-            if not USE_MOCK_P1:
+            if ENABLE_P1 and not USE_MOCK_P1:
                 offers_p1 = _fetch_p1_offers_real()
             if not USE_MOCK_P2:
                 offers_p2, portal_token = _fetch_p2_offers_real()
@@ -475,6 +486,43 @@ def poll_user(user):
     if not all_offers:
         print(f"[{datetime.now()}] ℹ️ No offers for user {telegram_id} this cycle")
         return f"Done with user {telegram_id}"
+    now_ts = time.time()
+    for offer in all_offers:
+        if isinstance(offer, dict) and offer.get("_poll_ts") is None:
+            offer["_poll_ts"] = now_ts
+
+    if poll_real_orders:
+        now_ts = time.time()
+        cached_intervals, cached_ts = get_rides_cache(bot_id, telegram_id)
+        refresh = True
+        if cached_intervals is not None and cached_ts is not None:
+            if (now_ts - cached_ts) < RIDES_REFRESH_INTERVAL_S:
+                accepted_intervals = cached_intervals or []
+                refresh = False
+
+        if refresh:
+            if not portal_token and not (token and str(token).strip()):
+                if cached_intervals is not None:
+                    accepted_intervals = cached_intervals or []
+                # nothing to refresh without tokens
+            else:
+                p1_intervals: List[Tuple[datetime, Optional[datetime]]] = []
+                p2_intervals: List[Tuple[datetime, Optional[datetime]]] = []
+                tasks = {}
+                with ThreadPoolExecutor(max_workers=2) as ride_exec:
+                    if portal_token:
+                        tasks["p2"] = ride_exec.submit(_fetch_p2_rides)
+                    # Only use P1 /rides when no portal credentials are set
+                    if (not has_portal_creds) and token and str(token).strip():
+                        tasks["p1"] = ride_exec.submit(_fetch_p1_rides)
+                    for name, fut in tasks.items():
+                        intervals, _ok = fut.result()
+                        if name == "p1":
+                            p1_intervals = intervals
+                        else:
+                            p2_intervals = intervals
+                accepted_intervals = p1_intervals + p2_intervals
+                set_rides_cache(bot_id, telegram_id, accepted_intervals, ts=now_ts)
 
     debug_print_offers(telegram_id, all_offers)
 
@@ -489,6 +537,7 @@ def poll_user(user):
         accepted_intervals,
         tz_name,
         p1_token=token,
+        p1_headers=mobile_headers,
         p2_token=portal_token,
     )
 
@@ -496,10 +545,10 @@ def poll_user(user):
 
 
 def run():
-    print(f"[{datetime.now()}] 🚀 Poller started")
+    _poll_log("🚀 Poller started")
     while True:
         maybe_reset_inmem_caches()
-        print(f"[{datetime.now()}] 🔄 Starting polling cycle")
+        _poll_log("🔄 Starting polling cycle")
         users = get_all_users_with_bot_admin_active()
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = [executor.submit(poll_user, u) for u in users]

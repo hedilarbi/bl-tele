@@ -1,7 +1,8 @@
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 import threading
+import time
 
 
 def _quiet_print(*args, **kwargs):
@@ -22,6 +23,26 @@ _ACCEPTED_RESET_INTERVAL = timedelta(hours=24)
 _REJECTED_RESET_INTERVAL = timedelta(minutes=1)
 _accepted_last_reset = datetime.now(timezone.utc)
 _rejected_last_reset = datetime.now(timezone.utc)
+
+_rides_cache: Dict[Tuple[str, int], Dict[str, object]] = {}
+
+
+def get_rides_cache(bot_id: str, telegram_id: int):
+    entry = _rides_cache.get((bot_id, telegram_id))
+    if not entry:
+        return None, None
+    return entry.get("intervals"), entry.get("ts")
+
+
+def set_rides_cache(bot_id: str, telegram_id: int, intervals: List[Tuple[datetime, Optional[datetime]]], ts: Optional[float] = None):
+    _rides_cache[(bot_id, telegram_id)] = {
+        "intervals": intervals or [],
+        "ts": time.time() if ts is None else ts,
+    }
+
+
+def invalidate_rides_cache(bot_id: str, telegram_id: int):
+    _rides_cache.pop((bot_id, telegram_id), None)
 
 
 def maybe_reset_inmem_caches():

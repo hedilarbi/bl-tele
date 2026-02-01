@@ -57,6 +57,32 @@ def normalize_token(s: str) -> str:
     return s
 
 
+def parse_mobile_session_dump(raw: str) -> tuple[str, dict]:
+    """
+    Parse a full HTTP dump and return (token, headers).
+    Authorization is returned separately; headers excludes Authorization.
+    """
+    token = normalize_token(raw)
+    headers: dict = {}
+    if not raw:
+        return token, headers
+    for line in str(raw).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^[A-Z]+\s+\S+\s+HTTP/[\d.]+$", line):
+            continue
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip()
+        v = v.strip()
+        if not k or k.lower() == "authorization":
+            continue
+        headers[k] = v
+    return token, headers
+
+
 def mask_secret(s: str, keep: int = 4) -> str:
     if not s:
         return "—"
@@ -70,19 +96,21 @@ def _http_ok(status: int) -> bool:
     return 200 <= status < 300
 
 
-def validate_mobile_session(token: str) -> tuple[bool, str]:
+def validate_mobile_session(token: str, headers: Optional[dict] = None) -> tuple[bool, str]:
     """
     Quick upstream probe. Token should already be normalized
     (i.e., 'Bearer <JWT>').
     """
     if not token:
         return (False, "empty_token")
-    headers = {
-        "Authorization": token,          # send exactly what we store
-        "Accept": "application/json",
-    }
+    merged = {"Authorization": token, "Accept": "application/json"}
+    if headers:
+        merged = dict(headers)
+        if not any(k.lower() == "accept" for k in merged):
+            merged["Accept"] = "application/json"
+        merged["Authorization"] = token
     try:
-        r = requests.get(f"{API_HOST}/rides?limit=1", headers=headers, timeout=12)
+        r = requests.get(f"{API_HOST}/rides?limit=1", headers=merged, timeout=12)
         if _http_ok(r.status_code):
             return (True, "ok")
         if r.status_code in (401, 403):

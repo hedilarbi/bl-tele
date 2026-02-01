@@ -51,7 +51,7 @@ def build_main_menu(is_active: bool):
     return InlineKeyboardMarkup(keyboard), status_text
 
 
-def build_settings_menu(user_id: int, bot_id: Optional[str] = None, allow_tz_change: bool = False):
+def build_settings_menu(user_id: int, bot_id: Optional[str] = None, allow_tz_change: bool = False, as_user_id: Optional[int] = None):
     tz = get_user_timezone(bot_id, user_id) if bot_id else "—"
     token_status = get_token_status(bot_id, user_id) if bot_id else "unknown"
     dot = "🟢" if token_status == "valid" else ("🔴" if token_status == "expired" else "⚪")
@@ -98,7 +98,7 @@ def build_settings_menu(user_id: int, bot_id: Optional[str] = None, allow_tz_cha
 
     keyboard = [
         [InlineKeyboardButton("🔔 Notifications", callback_data="notifications")],
-        [InlineKeyboardButton("🪪 BL account", web_app=WebAppInfo(url=_with_bot_id(BL_ACCOUNT_URL, bot_id)))],
+        [InlineKeyboardButton("🪪 BL account", web_app=WebAppInfo(url=_with_bot_id(BL_ACCOUNT_URL, bot_id, as_user_id)))],
         [InlineKeyboardButton("📱 Mobile sessions", callback_data="mobile_sessions")],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
     ]
@@ -135,7 +135,7 @@ def build_mobile_sessions_menu(bot_id: str, user_id: int):
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
-def build_filters_menu(filters_data: dict, user_id: int, bot_id: Optional[str] = None):
+def build_filters_menu(filters_data: dict, user_id: int, bot_id: Optional[str] = None, as_user_id: Optional[int] = None):
     min_price   = filters_data.get("price_min", 0)
     max_price   = filters_data.get("price_max", 0)
     work_start  = filters_data.get("work_start", "00:00")
@@ -176,14 +176,14 @@ def build_filters_menu(filters_data: dict, user_id: int, bot_id: Optional[str] =
     )
 
     keyboard = [
-        [InlineKeyboardButton("📦 Booked slots", web_app=WebAppInfo(url=_with_bot_id(BOOKED_SLOTS_URL, bot_id)))],
-        [InlineKeyboardButton("📅 Schedule (blocked days)", web_app=WebAppInfo(url=_with_bot_id(SCHEDULE_URL, bot_id)))],
-        [InlineKeyboardButton("🗓️ Show current schedule", web_app=WebAppInfo(url=_with_bot_id(CURRENT_SCHEDULE_URL, bot_id)))],
+        [InlineKeyboardButton("📦 Booked slots", web_app=WebAppInfo(url=_with_bot_id(BOOKED_SLOTS_URL, bot_id, as_user_id)))],
+        [InlineKeyboardButton("📅 Schedule (blocked days)", web_app=WebAppInfo(url=_with_bot_id(SCHEDULE_URL, bot_id, as_user_id)))],
+        [InlineKeyboardButton("🗓️ Show current schedule", web_app=WebAppInfo(url=_with_bot_id(CURRENT_SCHEDULE_URL, bot_id, as_user_id)))],
        
         [InlineKeyboardButton("🚗 Change classes", callback_data="change_classes")],
         [InlineKeyboardButton("⚖️ Show current filters",  callback_data="show_all_filters")],
         [InlineKeyboardButton("🕒 Work schedule", callback_data="work_schedule")],
-        [InlineKeyboardButton("🧩 Custom filters", web_app=WebAppInfo(url=_with_bot_id(f"{MINI_APP_BASE}/custom-filters", bot_id)))],
+        [InlineKeyboardButton("🧩 Custom filters", web_app=WebAppInfo(url=_with_bot_id(f"{MINI_APP_BASE}/custom-filters", bot_id, as_user_id)))],
 
         [
             InlineKeyboardButton("💸 Change min price", callback_data="change_price_min"),
