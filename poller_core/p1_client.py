@@ -1,10 +1,11 @@
 import uuid
+import threading
 import requests
 import builtins as _builtins
 from typing import Optional, Tuple
 from datetime import datetime
 
-from .config import API_HOST
+from .config import API_HOST, P1_POLL_TIMEOUT_S, P1_RESERVE_TIMEOUT_S
 
 
 def _quiet_print(*args, **kwargs):
@@ -16,6 +17,17 @@ print = _quiet_print
 
 def _log_poll_response(label: str, status: int, body: str):
     return None
+
+
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    sess = getattr(_thread_local, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        _thread_local.session = sess
+    return sess
 
 
 def _has_header(headers: dict, name: str) -> bool:
@@ -66,7 +78,7 @@ def _merge_headers(token: str, base_headers: Optional[dict] = None) -> dict:
 def get_rides_p1(token: str, headers: Optional[dict] = None) -> Tuple[Optional[int], Optional[list]]:
     headers = _merge_headers(token, headers)
     try:
-        r = requests.get(f"{API_HOST}/rides", headers=headers, timeout=12)
+        r = _get_session().get(f"{API_HOST}/rides", headers=headers, timeout=P1_POLL_TIMEOUT_S)
         raw_text = r.text
         _log_poll_response("P1 poll /rides", r.status_code, raw_text)
         if 200 <= r.status_code < 300:
@@ -93,7 +105,7 @@ def get_rides_p1(token: str, headers: Optional[dict] = None) -> Tuple[Optional[i
 def get_offers_p1(token: str, headers: Optional[dict] = None):
     headers = _merge_headers(token, headers)
     try:
-        r = requests.get(f"{API_HOST}/offers", headers=headers, timeout=12)
+        r = _get_session().get(f"{API_HOST}/offers", headers=headers, timeout=P1_POLL_TIMEOUT_S)
         raw_text = r.text
         _log_poll_response("P1 poll /offers", r.status_code, raw_text)
         try:
@@ -141,7 +153,7 @@ def reserve_offer_p1(token: str, offer_id: str, price: Optional[float] = None, h
         except Exception:
             payload["price"] = price
     try:
-        r = requests.post(f"{API_HOST}/offers", headers=headers, json=payload, timeout=12)
+        r = _get_session().post(f"{API_HOST}/offers", headers=headers, json=payload, timeout=P1_RESERVE_TIMEOUT_S)
         try:
             body = r.json()
         except Exception:

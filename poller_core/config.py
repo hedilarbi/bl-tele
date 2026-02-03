@@ -11,9 +11,15 @@ PARTNER_API_BASE = "https://partner-portal-api.blacklane.com"
 PORTAL_CLIENT_ID = os.getenv("BL_PORTAL_CLIENT_ID", "7qL5jGGai6MqBCatVeoihQx5dKEhrNCh")
 PORTAL_PAGE_SIZE = 50
 
-POLL_INTERVAL = 1
+POLL_INTERVAL = 0.5
 MAX_WORKERS = 10
 RIDES_REFRESH_INTERVAL_S = int(os.getenv("RIDES_REFRESH_INTERVAL_S", "86400"))
+
+# HTTP timeouts (seconds)
+P1_POLL_TIMEOUT_S = int(os.getenv("P1_POLL_TIMEOUT_S", "8"))
+P1_RESERVE_TIMEOUT_S = int(os.getenv("P1_RESERVE_TIMEOUT_S", "8"))
+P2_POLL_TIMEOUT_S = int(os.getenv("P2_POLL_TIMEOUT_S", "8"))
+P2_RESERVE_TIMEOUT_S = int(os.getenv("P2_RESERVE_TIMEOUT_S", "8"))
 
 # Toggle mock data for development (default: real polling)
 USE_MOCK_P1 = False    

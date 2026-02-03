@@ -2,6 +2,7 @@ import uuid
 import json
 import re
 import time
+import concurrent.futures
 import builtins as _builtins
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, timezone, timedelta
@@ -10,7 +11,7 @@ from dateutil import parser
 from dateutil.tz import gettz
 from copy import deepcopy
 
-from .config import DEBUG_PRINT_OFFERS, DEBUG_ENDS, AUTO_RESERVE_ENABLED
+from .config import DEBUG_PRINT_OFFERS, DEBUG_ENDS, AUTO_RESERVE_ENABLED, P1_RESERVE_TIMEOUT_S, P2_RESERVE_TIMEOUT_S
 from .utils import (
     _esc,
     _fmt_money,
@@ -77,6 +78,17 @@ def _refresh_rides_cache_now(
             intervals.extend(_extract_intervals_from_rides(kept))
 
     set_rides_cache(bot_id, telegram_id, intervals)
+
+
+_reserve_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def _reserve_with_timeout(fn, timeout_s: int, *args, **kwargs):
+    fut = _reserve_executor.submit(fn, *args, **kwargs)
+    try:
+        return fut.result(timeout=timeout_s)
+    except concurrent.futures.TimeoutError:
+        return None, {"error": f"timeout:{timeout_s}s"}
 
 
 def _poll_latency_ms(offer: dict) -> Optional[int]:
@@ -154,7 +166,12 @@ def _build_user_message(
     if do_addr:
         lines += ["", f"⬇️ <b>Dropoff:</b>\n{_esc(do_addr)}"]
 
-    status_icon = "🟢" if status == "accepted" else "🔴"
+    if status == "accepted":
+        status_icon = "🟢"
+    elif status == "not_accepted":
+        status_icon = "🟠"
+    else:
+        status_icon = "🔴"
     plat_icon = _platform_icon(platform or "p1")
     if status == "accepted":
         status_word = "Offer Accepted"
@@ -182,7 +199,12 @@ def _build_offer_header_line(
     rid = (offer.get("rides") or [{}])[0]
     otype = (rid.get("type") or "").lower()
     price_disp = _fmt_money(offer.get("price"), offer.get("currency"))
-    status_icon = "🟢" if status == "accepted" else "🔴"
+    if status == "accepted":
+        status_icon = "🟢"
+    elif status == "not_accepted":
+        status_icon = "🟠"
+    else:
+        status_icon = "🔴"
     plat_icon = _platform_icon(platform or "p1")
     if status == "accepted":
         status_word = "Offer Accepted"
@@ -583,7 +605,9 @@ def _process_offers_for_user(
                 if platform == "p1":
                     if p1_token:
                         reserve_attempted = True
-                        rs, rb = reserve_offer_p1(
+                        rs, rb = _reserve_with_timeout(
+                            reserve_offer_p1,
+                            P1_RESERVE_TIMEOUT_S,
                             p1_token,
                             oid,
                             price=offer_to_log.get("price"),
@@ -617,7 +641,9 @@ def _process_offers_for_user(
                             _builtins.print(f"[{datetime.now()}] ⚠️ P2 reserve skipped (no price) for {oid}")
                         else:
                             reserve_attempted = True
-                            rs, rb = reserve_offer_p2(
+                            rs, rb = _reserve_with_timeout(
+                                reserve_offer_p2,
+                                P2_RESERVE_TIMEOUT_S,
                                 p2_token,
                                 oid,
                                 float(bid_price),

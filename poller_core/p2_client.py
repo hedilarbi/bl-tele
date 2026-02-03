@@ -1,5 +1,6 @@
 import base64
 import json
+import threading
 import builtins as _builtins
 from typing import Optional, Tuple
 from datetime import datetime
@@ -12,6 +13,8 @@ from .config import (
     PORTAL_PAGE_SIZE,
     ATHENA_RELOGIN_SKEW_S,
     ATHENA_PRINT_DEBUG,
+    P2_POLL_TIMEOUT_S,
+    P2_RESERVE_TIMEOUT_S,
 )
 from db import get_portal_token, update_portal_token
 
@@ -25,6 +28,17 @@ print = _quiet_print
 
 def _log_poll_response(label: str, status: int, body: str):
     return None
+
+
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    sess = getattr(_thread_local, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        _thread_local.session = sess
+    return sess
 
 def _safe_attr(d, *keys, default=None):
     cur = d
@@ -204,7 +218,7 @@ def reserve_offer_p2(
     payload = {"action": "accept", "id": str(offer_id), "price": float(price)}
 
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r = _get_session().post(url, headers=headers, json=payload, timeout=P2_RESERVE_TIMEOUT_S)
         try:
             body = r.json()
         except Exception:
@@ -225,7 +239,7 @@ def _athena_login(email: str, password: str) -> Tuple[bool, Optional[str], str]:
     }
     headers = {"Accept": "application/json"}
     try:
-        r = requests.post(url, data=payload, headers=headers, timeout=15)
+        r = _get_session().post(url, data=payload, headers=headers, timeout=P2_POLL_TIMEOUT_S)
         if 200 <= r.status_code < 300:
             try:
                 j = r.json() or {}
@@ -311,7 +325,7 @@ def _athena_get_offers(
     if etag:
         headers["If-None-Match"] = etag
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = _get_session().get(url, headers=headers, timeout=P2_POLL_TIMEOUT_S)
         raw_text = r.text
         _log_poll_response("P2 poll /hades/offers", r.status_code, raw_text)
         new_etag = r.headers.get("etag") or r.headers.get("ETag")
@@ -357,7 +371,7 @@ def _athena_get_rides(
     if etag:
         headers["If-None-Match"] = etag
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = _get_session().get(url, headers=headers, timeout=P2_POLL_TIMEOUT_S)
         raw_text = r.text
         _log_poll_response("P2 poll /hades/rides", r.status_code, raw_text)
         new_etag = r.headers.get("etag") or r.headers.get("ETag")
