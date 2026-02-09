@@ -15,6 +15,7 @@ inmem_lock = threading.Lock()
 
 # Athena token/etag helpers
 _athena_offers_etag: Dict[Tuple[str, int], Optional[str]] = {}  # (bot_id, telegram_id) -> etag (offers)
+_filters_cache: Dict[Tuple[str, int], Dict[str, object]] = {}
 
 # In-memory dedupe for accepted per bot/user and rejected per bot/user/platform.
 accepted_per_user = defaultdict(lambda: defaultdict(set))
@@ -32,6 +33,27 @@ def get_rides_cache(bot_id: str, telegram_id: int):
     if not entry:
         return None, None
     return entry.get("intervals"), entry.get("ts")
+
+
+def get_offers_etag(bot_id: str, telegram_id: int) -> Optional[str]:
+    return _athena_offers_etag.get((bot_id, telegram_id))
+
+
+def set_offers_etag(bot_id: str, telegram_id: int, etag: Optional[str]) -> None:
+    if etag:
+        _athena_offers_etag[(bot_id, telegram_id)] = etag
+
+
+def get_filters_cache(bot_id: str, telegram_id: int):
+    return _filters_cache.get((bot_id, telegram_id))
+
+
+def set_filters_cache(bot_id: str, telegram_id: int, key: str, filters: dict, ts: Optional[float] = None):
+    _filters_cache[(bot_id, telegram_id)] = {
+        "key": key,
+        "filters": filters,
+        "ts": time.time() if ts is None else ts,
+    }
 
 
 def set_rides_cache(bot_id: str, telegram_id: int, intervals: List[Tuple[datetime, Optional[datetime]]], ts: Optional[float] = None):

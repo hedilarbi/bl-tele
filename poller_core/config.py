@@ -15,6 +15,13 @@ POLL_INTERVAL = 0.5
 MAX_WORKERS = 10
 RIDES_REFRESH_INTERVAL_S = int(os.getenv("RIDES_REFRESH_INTERVAL_S", "86400"))
 
+# Filter cache (seconds)
+FILTERS_CACHE_TTL_S = int(os.getenv("FILTERS_CACHE_TTL_S", "15"))
+
+# Burst polling (seconds)
+BURST_POLL_INTERVAL_S = float(os.getenv("BURST_POLL_INTERVAL_S", "0.3"))
+BURST_DURATION_S = float(os.getenv("BURST_DURATION_S", "6"))
+
 # HTTP timeouts (seconds)
 P1_POLL_TIMEOUT_S = int(os.getenv("P1_POLL_TIMEOUT_S", "8"))
 P1_RESERVE_TIMEOUT_S = int(os.getenv("P1_RESERVE_TIMEOUT_S", "8"))

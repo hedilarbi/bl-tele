@@ -336,6 +336,8 @@ def _athena_get_offers(
                 payload = r.json()
                 if isinstance(payload, dict) and (payload.get("data") or []):
                     _builtins.print(f"[{datetime.now()}] 🛰️ P2 poll /hades/offers full response -> {raw_text}")
+                if isinstance(payload, dict) and new_etag:
+                    payload["__etag"] = new_etag
                 return r.status_code, payload, new_etag
             except Exception:
                 return r.status_code, None, new_etag

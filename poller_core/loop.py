@@ -1,6 +1,7 @@
 import json
 import time
 import traceback
+import threading
 import builtins as _builtins
 from typing import Optional, List, Tuple
 from datetime import datetime
@@ -13,6 +14,9 @@ from .config import (
     ENABLE_P1,
     ATHENA_PRINT_DEBUG,
     POLL_INTERVAL,
+    BURST_POLL_INTERVAL_S,
+    BURST_DURATION_S,
+    FILTERS_CACHE_TTL_S,
     MAX_WORKERS,
     RIDES_REFRESH_INTERVAL_S,
 )
@@ -20,6 +24,10 @@ from .state import (
     maybe_reset_inmem_caches,
     get_rides_cache,
     set_rides_cache,
+    get_offers_etag,
+    set_offers_etag,
+    get_filters_cache,
+    set_filters_cache,
 )
 from .utils import _normalize_formulas
 from .p1_client import get_rides_p1, get_offers_p1
@@ -69,6 +77,28 @@ def _quiet_exc(*args, **kwargs):
 
 print = _quiet_print
 
+_burst_until = 0.0
+_burst_lock = threading.Lock()
+
+
+def _bump_burst():
+    global _burst_until
+    if BURST_DURATION_S <= 0:
+        return
+    with _burst_lock:
+        new_until = time.time() + BURST_DURATION_S
+        if new_until > _burst_until:
+            _burst_until = new_until
+
+
+def _sleep_interval() -> float:
+    if BURST_POLL_INTERVAL_S <= 0:
+        return POLL_INTERVAL
+    with _burst_lock:
+        if time.time() < _burst_until:
+            return BURST_POLL_INTERVAL_S
+    return POLL_INTERVAL
+
 
 def _poll_log(msg: str):
     _builtins.print(f"[{datetime.now()}] {msg}")
@@ -77,6 +107,7 @@ def _poll_log(msg: str):
 def _log_offers_found(platform: str, telegram_id: int, offers: List[dict]):
     if not offers:
         return
+    _bump_burst()
     try:
         payload = json.dumps(offers, ensure_ascii=True, default=str)
     except Exception:
@@ -118,9 +149,31 @@ def poll_user(user):
         return
 
     # Load filters + normalize admin formulas once
-    filters = json.loads(filters_json) if filters_json else {}
-    formulas_raw = get_endtime_formulas(bot_id, telegram_id)
-    filters["__endtime_formulas__"] = _normalize_formulas(formulas_raw)
+    filters_key = None
+    cached = get_filters_cache(bot_id, telegram_id)
+    if filters_json:
+        try:
+            formulas_raw = get_endtime_formulas(bot_id, telegram_id)
+            formulas_key = json.dumps(formulas_raw, sort_keys=True, default=str)
+            filters_key = f"{filters_json}|{formulas_key}"
+        except Exception:
+            formulas_raw = get_endtime_formulas(bot_id, telegram_id)
+            formulas_key = ""
+            filters_key = filters_json
+    else:
+        formulas_raw = get_endtime_formulas(bot_id, telegram_id)
+        filters_key = "{}"
+
+    if (
+        cached
+        and cached.get("key") == filters_key
+        and (time.time() - float(cached.get("ts") or 0)) < FILTERS_CACHE_TTL_S
+    ):
+        filters = cached.get("filters") or {}
+    else:
+        filters = json.loads(filters_json) if filters_json else {}
+        filters["__endtime_formulas__"] = _normalize_formulas(formulas_raw)
+        set_filters_cache(bot_id, telegram_id, filters_key, filters)
 
     class_state = get_vehicle_classes_state(bot_id, telegram_id)
     booked_slots = get_booked_slots(bot_id, telegram_id)
@@ -437,7 +490,8 @@ def poll_user(user):
         tok = portal_token
         if not tok:
             return [], tok
-        status_code, payload, _ = _athena_get_offers(tok)
+        etag = get_offers_etag(bot_id, telegram_id)
+        status_code, payload, new_etag = _athena_get_offers(tok, etag=etag)
 
         if ATHENA_PRINT_DEBUG:
             print(f"[{datetime.now()}] 🛰️ Athena offers status={status_code} for user {telegram_id}")
@@ -446,7 +500,7 @@ def poll_user(user):
             print(f"[{datetime.now()}] ⚠️ Athena token unauthorized for user {telegram_id}. Re-logging...")
             tok = _ensure_portal_token(bot_id, telegram_id, email, password)
             if tok:
-                status_code, payload, _ = _athena_get_offers(tok)
+                status_code, payload, new_etag = _athena_get_offers(tok)
                 if ATHENA_PRINT_DEBUG:
                     print(
                         f"[{datetime.now()}] 🛰️ Athena offers (after re-login) status={status_code} for user {telegram_id}"
@@ -454,6 +508,8 @@ def poll_user(user):
 
         offers: List[dict] = []
         if status_code == 200 and isinstance(payload, dict):
+            if new_etag:
+                set_offers_etag(bot_id, telegram_id, new_etag)
             included = payload.get("included") or []
             for raw in (payload.get("data") or []):
                 mapped = _map_portal_offer(raw, included)
@@ -560,4 +616,4 @@ def run():
                 except Exception as e:
                     print(f"[{datetime.now()}] ❌ Poll error: {e}")
                     _quiet_exc()
-        time.sleep(POLL_INTERVAL)
+        time.sleep(_sleep_interval())

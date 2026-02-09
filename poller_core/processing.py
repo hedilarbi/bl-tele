@@ -81,6 +81,24 @@ def _refresh_rides_cache_now(
 
 
 _reserve_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+
+def _refresh_rides_cache_async(
+    bot_id: str,
+    telegram_id: int,
+    tz_name: str,
+    p1_token: Optional[str],
+    p1_headers: Optional[dict],
+    p2_token: Optional[str],
+):
+    def _job():
+        try:
+            _refresh_rides_cache_now(bot_id, telegram_id, tz_name, p1_token, p1_headers, p2_token)
+        except Exception:
+            invalidate_rides_cache(bot_id, telegram_id)
+
+    _bg_executor.submit(_job)
 
 
 def _reserve_with_timeout(fn, timeout_s: int, *args, **kwargs):
@@ -621,17 +639,14 @@ def _process_offers_for_user(
                             )
                             reserve_reason = f"reserve_failed:{rs}"
                         else:
-                            try:
-                                _refresh_rides_cache_now(
-                                    bot_id,
-                                    telegram_id,
-                                    tz_name,
-                                    p1_token,
-                                    p1_headers,
-                                    p2_token,
-                                )
-                            except Exception:
-                                invalidate_rides_cache(bot_id, telegram_id)
+                            _refresh_rides_cache_async(
+                                bot_id,
+                                telegram_id,
+                                tz_name,
+                                p1_token,
+                                p1_headers,
+                                p2_token,
+                            )
                     else:
                         _builtins.print(f"[{datetime.now()}] ⚠️ P1 reserve skipped (no token) for user {telegram_id}")
                 else:  # p2
@@ -655,17 +670,14 @@ def _process_offers_for_user(
                             _builtins.print(f"[{datetime.now()}] ❌ P2 reserve failed {oid} (status={rs}) body={rb}{latency_note}")
                             reserve_reason = f"reserve_failed:{rs}"
                         else:
-                            try:
-                                _refresh_rides_cache_now(
-                                    bot_id,
-                                    telegram_id,
-                                    tz_name,
-                                    p1_token,
-                                    p1_headers,
-                                    p2_token,
-                                )
-                            except Exception:
-                                invalidate_rides_cache(bot_id, telegram_id)
+                            _refresh_rides_cache_async(
+                                bot_id,
+                                telegram_id,
+                                tz_name,
+                                p1_token,
+                                p1_headers,
+                                p2_token,
+                            )
                     else:
                         _builtins.print(f"[{datetime.now()}] ⚠️ P2 reserve skipped (no portal token) for user {telegram_id}")
             except Exception as e:
