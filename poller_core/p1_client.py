@@ -5,7 +5,7 @@ import builtins as _builtins
 from typing import Optional, Tuple
 from datetime import datetime
 
-from .config import API_HOST, P1_POLL_TIMEOUT_S, P1_RESERVE_TIMEOUT_S
+from .config import API_HOST, P1_POLL_TIMEOUT_S, P1_RESERVE_TIMEOUT_S, LOG_RAW_API_RESPONSES
 
 
 def _quiet_print(*args, **kwargs):
@@ -115,7 +115,7 @@ def get_offers_p1(token: str, headers: Optional[dict] = None):
 
         if r.status_code == 200 and isinstance(body, dict):
             results = body.get("results", []) or []
-            if results:
+            if results and LOG_RAW_API_RESPONSES:
                 _builtins.print(f"[{datetime.now()}] 🛰️ P1 poll /offers full response -> {raw_text}")
             for it in results:
                 try:

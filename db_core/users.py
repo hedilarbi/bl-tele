@@ -174,6 +174,8 @@ def get_all_users_with_bot_admin_active():
         FROM users u
         LEFT JOIN bot_instances b ON b.bot_id = u.bot_id
         WHERE COALESCE(b.role, 'user') != 'admin'
+          AND COALESCE(u.active, 0) = 1
+          AND COALESCE(b.admin_active, 0) = 1
     """
     )
     users = c.fetchall()

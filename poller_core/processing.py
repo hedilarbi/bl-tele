@@ -720,7 +720,12 @@ def _process_offers_for_user(
             platform,
             reply_markup=kb,
         )
-        accepted_per_user[bot_id][telegram_id].add(oid)
+        if final_status == "accepted":
+            accepted_per_user[bot_id][telegram_id].add(oid)
+        else:
+            # Keep a short-lived per-platform backoff, but do not globally lock
+            # the offer id as "accepted" after a failed reserve.
+            rejected_per_user[bot_id][telegram_id][platform].add(oid)
 
         try:
             new_end_dt = parser.isoparse(offer_to_log["rides"][0].get("endsAt")) if offer_to_log["rides"][0].get("endsAt") else None

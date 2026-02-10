@@ -42,6 +42,9 @@ CF_DEBUG = False             # custom filters debug
 ATHENA_PRINT_DEBUG = True   # print portal token and raw payloads
 DEBUG_ENDS = False           # log endsAt math for each offer
 APPLY_GAP_TO_BUSY_INTERVALS = False  # gap will NOT extend busy intervals
+LOG_OFFERS_PAYLOAD = os.getenv("LOG_OFFERS_PAYLOAD", "0") == "1"
+LOG_RAW_API_RESPONSES = os.getenv("LOG_RAW_API_RESPONSES", "0") == "1"
+MAX_LOGGED_OFFERS = int(os.getenv("MAX_LOGGED_OFFERS", "3"))
 
 # --- Rides visibility ---
 DUMP_RIDES_IN_LOGS = True         # print polled rides to stdout

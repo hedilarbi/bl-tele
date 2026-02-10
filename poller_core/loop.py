@@ -19,6 +19,8 @@ from .config import (
     FILTERS_CACHE_TTL_S,
     MAX_WORKERS,
     RIDES_REFRESH_INTERVAL_S,
+    LOG_OFFERS_PAYLOAD,
+    MAX_LOGGED_OFFERS,
 )
 from .state import (
     maybe_reset_inmem_caches,
@@ -79,6 +81,8 @@ print = _quiet_print
 
 _burst_until = 0.0
 _burst_lock = threading.Lock()
+_user_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+_io_executor = ThreadPoolExecutor(max_workers=max(4, MAX_WORKERS * 2))
 
 
 def _bump_burst():
@@ -108,12 +112,25 @@ def _log_offers_found(platform: str, telegram_id: int, offers: List[dict]):
     if not offers:
         return
     _bump_burst()
-    try:
-        payload = json.dumps(offers, ensure_ascii=True, default=str)
-    except Exception:
-        payload = str(offers)
+    if LOG_OFFERS_PAYLOAD:
+        try:
+            payload = json.dumps(offers, ensure_ascii=True, default=str)
+        except Exception:
+            payload = str(offers)
+        _builtins.print(
+            f"[{datetime.now()}] ✅ {platform} offers found for user {telegram_id}: {len(offers)} | {payload}"
+        )
+        return
+
+    sample = []
+    for off in (offers or [])[: max(0, MAX_LOGGED_OFFERS)]:
+        oid = off.get("id")
+        price = off.get("price")
+        curr = off.get("currency") or ""
+        sample.append(f"{oid}:{price}{curr}")
+    suffix = f" | sample={sample}" if sample else ""
     _builtins.print(
-        f"[{datetime.now()}] ✅ {platform} offers found for user {telegram_id}: {len(offers)} | {payload}"
+        f"[{datetime.now()}] ✅ {platform} offers found for user {telegram_id}: {len(offers)}{suffix}"
     )
 
 
@@ -522,15 +539,15 @@ def poll_user(user):
 
     if not USE_MOCK_P1 or not USE_MOCK_P2:
         if ENABLE_P1 and not USE_MOCK_P1 and not USE_MOCK_P2:
-            tasks = {}
-            with ThreadPoolExecutor(max_workers=2) as offer_exec:
-                tasks["p1"] = offer_exec.submit(_fetch_p1_offers_real)
-                tasks["p2"] = offer_exec.submit(_fetch_p2_offers_real)
-                for name, fut in tasks.items():
-                    if name == "p1":
-                        offers_p1 = fut.result()
-                    else:
-                        offers_p2, portal_token = fut.result()
+            tasks = {
+                "p1": _io_executor.submit(_fetch_p1_offers_real),
+                "p2": _io_executor.submit(_fetch_p2_offers_real),
+            }
+            for name, fut in tasks.items():
+                if name == "p1":
+                    offers_p1 = fut.result()
+                else:
+                    offers_p2, portal_token = fut.result()
         else:
             if ENABLE_P1 and not USE_MOCK_P1:
                 offers_p1 = _fetch_p1_offers_real()
@@ -565,18 +582,17 @@ def poll_user(user):
                 p1_intervals: List[Tuple[datetime, Optional[datetime]]] = []
                 p2_intervals: List[Tuple[datetime, Optional[datetime]]] = []
                 tasks = {}
-                with ThreadPoolExecutor(max_workers=2) as ride_exec:
-                    if portal_token:
-                        tasks["p2"] = ride_exec.submit(_fetch_p2_rides)
-                    # Only use P1 /rides when no portal credentials are set
-                    if (not has_portal_creds) and token and str(token).strip():
-                        tasks["p1"] = ride_exec.submit(_fetch_p1_rides)
-                    for name, fut in tasks.items():
-                        intervals, _ok = fut.result()
-                        if name == "p1":
-                            p1_intervals = intervals
-                        else:
-                            p2_intervals = intervals
+                if portal_token:
+                    tasks["p2"] = _io_executor.submit(_fetch_p2_rides)
+                # Only use P1 /rides when no portal credentials are set
+                if (not has_portal_creds) and token and str(token).strip():
+                    tasks["p1"] = _io_executor.submit(_fetch_p1_rides)
+                for name, fut in tasks.items():
+                    intervals, _ok = fut.result()
+                    if name == "p1":
+                        p1_intervals = intervals
+                    else:
+                        p2_intervals = intervals
                 accepted_intervals = p1_intervals + p2_intervals
                 set_rides_cache(bot_id, telegram_id, accepted_intervals, ts=now_ts)
 
@@ -606,14 +622,13 @@ def run():
         maybe_reset_inmem_caches()
         _poll_log("🔄 Starting polling cycle")
         users = get_all_users_with_bot_admin_active()
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(poll_user, u) for u in users]
-            for f in as_completed(futures):
-                try:
-                    res = f.result()
-                    if res:
-                        print(f"[{datetime.now()}] ✅ {res}")
-                except Exception as e:
-                    print(f"[{datetime.now()}] ❌ Poll error: {e}")
-                    _quiet_exc()
+        futures = [_user_executor.submit(poll_user, u) for u in users]
+        for f in as_completed(futures):
+            try:
+                res = f.result()
+                if res:
+                    print(f"[{datetime.now()}] ✅ {res}")
+            except Exception as e:
+                print(f"[{datetime.now()}] ❌ Poll error: {e}")
+                _quiet_exc()
         time.sleep(_sleep_interval())

@@ -12,7 +12,6 @@ class _Tee:
         for s in self.streams:
             try:
                 s.write(data)
-                s.flush()
             except Exception:
                 pass
 

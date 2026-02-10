@@ -15,6 +15,7 @@ from .config import (
     ATHENA_PRINT_DEBUG,
     P2_POLL_TIMEOUT_S,
     P2_RESERVE_TIMEOUT_S,
+    LOG_RAW_API_RESPONSES,
 )
 from db import get_portal_token, update_portal_token
 
@@ -334,7 +335,7 @@ def _athena_get_offers(
         if 200 <= r.status_code < 300:
             try:
                 payload = r.json()
-                if isinstance(payload, dict) and (payload.get("data") or []):
+                if LOG_RAW_API_RESPONSES and isinstance(payload, dict) and (payload.get("data") or []):
                     _builtins.print(f"[{datetime.now()}] 🛰️ P2 poll /hades/offers full response -> {raw_text}")
                 if isinstance(payload, dict) and new_etag:
                     payload["__etag"] = new_etag
