@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import re
 import threading
@@ -158,6 +159,22 @@ def _redact_sensitive_text(raw: str, max_len: int = 800) -> str:
     return text
 
 
+def _mask_value(val: Optional[str], keep: int = 4) -> str:
+    s = str(val or "").strip()
+    if not s:
+        return "—"
+    if len(s) <= keep * 2:
+        return s[:keep] + "..." if len(s) > keep else s
+    return f"{s[:keep]}...{s[-keep:]}"
+
+
+def _fp8(val: Optional[str]) -> str:
+    s = str(val or "").strip()
+    if not s:
+        return "—"
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:8]
+
+
 def refresh_p1_access_token(
     refresh_token: str,
     client_id: str,
@@ -178,7 +195,8 @@ def refresh_p1_access_token(
     timeout_s = max(5, int(P1_POLL_TIMEOUT_S))
     _builtins.print(
         f"[{datetime.now()}] 🔐 P1 refresh call -> POST {url} "
-        f"(client_id={'set' if client_id else 'missing'}, refresh_token={'set' if refresh_token else 'missing'})"
+        f"(client_id={_mask_value(client_id, keep=5)} fp={_fp8(client_id)}, "
+        f"refresh_token={_mask_value(refresh_token, keep=6)} len={len(str(refresh_token or ''))} fp={_fp8(refresh_token)})"
     )
     try:
         r = _session_request("POST", url, headers=headers, json=payload, timeout=timeout_s)
@@ -233,7 +251,9 @@ def maybe_refresh_p1_session(
 
     _builtins.print(
         f"[{datetime.now()}] 🔄 P1 refresh attempt for {bot_id}/{telegram_id} "
-        f"trigger={trigger} force={force} token_present={'yes' if current_token else 'no'}"
+        f"trigger={trigger} force={force} token_present={'yes' if current_token else 'no'} "
+        f"client_id={_mask_value(client_id, keep=5)} fp={_fp8(client_id)} "
+        f"refresh_fp={_fp8(refresh_token)}"
     )
     req_headers = _build_oauth_headers(mobile_headers, oauth_headers)
     ok, new_token, new_refresh, note = refresh_p1_access_token(
