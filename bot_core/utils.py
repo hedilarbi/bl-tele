@@ -62,17 +62,22 @@ def parse_mobile_session_dump(raw: str) -> tuple[str, dict]:
     Parse a full HTTP dump and return (token, headers).
     Authorization is returned separately; headers excludes Authorization.
     """
-    token = normalize_token(raw)
+    token = ""
     headers: dict = {}
     if not raw:
         return token, headers
+    auth_match = re.search(r"(?im)^\s*authorization\s*:\s*(.+)$", str(raw))
+    if auth_match:
+        token = normalize_token(auth_match.group(1).strip())
     for line in str(raw).splitlines():
         line = line.strip()
         if not line:
             continue
+        if line.startswith(("{", "}", "[", "]", '"', "'")):
+            continue
         if re.match(r"^[A-Z]+\s+\S+\s+HTTP/[\d.]+$", line):
             continue
-        if ":" not in line:
+        if not re.match(r"^[A-Za-z0-9_-]+\s*:\s*.+$", line):
             continue
         k, v = line.split(":", 1)
         k = k.strip()
@@ -81,6 +86,68 @@ def parse_mobile_session_dump(raw: str) -> tuple[str, dict]:
             continue
         headers[k] = v
     return token, headers
+
+
+def parse_mobile_auth_material(raw: str) -> dict:
+    """
+    Extract auth material from flexible input shapes.
+
+    Returns optional keys:
+      - token          (normalized Bearer JWT)
+      - refresh_token
+      - client_id
+    """
+    out: dict = {}
+    if not raw:
+        return out
+
+    s = str(raw).strip()
+
+    # 1) JSON payload/response
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            root = parsed.get("result") if isinstance(parsed.get("result"), dict) else parsed
+            access = root.get("access_token") or parsed.get("access_token")
+            refresh = root.get("refresh_token") or parsed.get("refresh_token")
+            client_id = root.get("client_id") or parsed.get("client_id")
+            if isinstance(access, str) and access.strip():
+                out["token"] = normalize_token(access.strip())
+            if isinstance(refresh, str) and refresh.strip():
+                out["refresh_token"] = refresh.strip()
+            if isinstance(client_id, str) and client_id.strip():
+                out["client_id"] = client_id.strip()
+    except Exception:
+        pass
+
+    # 2) key/value fallback
+    access_kv = _extract_auth_value(s, "access_token")
+    refresh_kv = _extract_auth_value(s, "refresh_token")
+    client_kv = _extract_auth_value(s, "client_id")
+    auth_kv = _extract_auth_value(s, "authorization")
+    if auth_kv and "token" not in out:
+        out["token"] = normalize_token(auth_kv)
+    if access_kv and "token" not in out:
+        out["token"] = normalize_token(access_kv)
+    if refresh_kv and "refresh_token" not in out:
+        out["refresh_token"] = refresh_kv
+    if client_kv and "client_id" not in out:
+        out["client_id"] = client_kv
+
+    # 3) bare value fallback (single-line paste)
+    if "\n" not in s and "\r" not in s:
+        bare = s.strip().strip('"').strip("'")
+        if bare:
+            if bare.lower().startswith("bearer ") and "token" not in out:
+                out["token"] = normalize_token(bare)
+            elif re.match(r"^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$", bare) and "token" not in out:
+                out["token"] = normalize_token(bare)
+            elif bare.startswith("v1.") and "refresh_token" not in out:
+                out["refresh_token"] = bare
+            elif re.match(r"^[A-Za-z0-9_-]{12,128}$", bare) and ("client_id" not in out) and ("refresh_token" not in out):
+                out["client_id"] = bare
+
+    return out
 
 
 def _extract_auth_value(raw: str, key: str) -> Optional[str]:
