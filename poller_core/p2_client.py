@@ -41,6 +41,17 @@ def _get_session() -> requests.Session:
         _thread_local.session = sess
     return sess
 
+
+def _session_request(method: str, url: str, **kwargs):
+    sess = _get_session()
+    # Keep connection pooling but avoid cross-user cookie bleed on shared worker threads.
+    try:
+        sess.cookies.clear()
+    except Exception:
+        pass
+    return sess.request(method=method, url=url, **kwargs)
+
+
 def _safe_attr(d, *keys, default=None):
     cur = d
     for k in keys:
@@ -219,7 +230,7 @@ def reserve_offer_p2(
     payload = {"action": "accept", "id": str(offer_id), "price": float(price)}
 
     try:
-        r = _get_session().post(url, headers=headers, json=payload, timeout=P2_RESERVE_TIMEOUT_S)
+        r = _session_request("POST", url, headers=headers, json=payload, timeout=P2_RESERVE_TIMEOUT_S)
         try:
             body = r.json()
         except Exception:
@@ -240,7 +251,7 @@ def _athena_login(email: str, password: str) -> Tuple[bool, Optional[str], str]:
     }
     headers = {"Accept": "application/json"}
     try:
-        r = _get_session().post(url, data=payload, headers=headers, timeout=P2_POLL_TIMEOUT_S)
+        r = _session_request("POST", url, data=payload, headers=headers, timeout=P2_POLL_TIMEOUT_S)
         if 200 <= r.status_code < 300:
             try:
                 j = r.json() or {}
@@ -326,7 +337,7 @@ def _athena_get_offers(
     if etag:
         headers["If-None-Match"] = etag
     try:
-        r = _get_session().get(url, headers=headers, timeout=P2_POLL_TIMEOUT_S)
+        r = _session_request("GET", url, headers=headers, timeout=P2_POLL_TIMEOUT_S)
         raw_text = r.text
         _log_poll_response("P2 poll /hades/offers", r.status_code, raw_text)
         new_etag = r.headers.get("etag") or r.headers.get("ETag")
@@ -374,7 +385,7 @@ def _athena_get_rides(
     if etag:
         headers["If-None-Match"] = etag
     try:
-        r = _get_session().get(url, headers=headers, timeout=P2_POLL_TIMEOUT_S)
+        r = _session_request("GET", url, headers=headers, timeout=P2_POLL_TIMEOUT_S)
         raw_text = r.text
         _log_poll_response("P2 poll /hades/rides", r.status_code, raw_text)
         new_etag = r.headers.get("etag") or r.headers.get("ETag")

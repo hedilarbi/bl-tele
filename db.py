@@ -8,6 +8,7 @@ from db_core.users import (
     update_portal_token,
     get_portal_token,
     get_mobile_headers,
+    get_mobile_auth,
     get_token_status,
     update_filters,
     get_all_users,

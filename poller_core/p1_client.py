@@ -30,6 +30,16 @@ def _get_session() -> requests.Session:
     return sess
 
 
+def _session_request(method: str, url: str, **kwargs):
+    sess = _get_session()
+    # Keep connection pooling but avoid cross-user cookie bleed on shared worker threads.
+    try:
+        sess.cookies.clear()
+    except Exception:
+        pass
+    return sess.request(method=method, url=url, **kwargs)
+
+
 def _has_header(headers: dict, name: str) -> bool:
     lname = name.lower()
     return any(k.lower() == lname for k in headers.keys())
@@ -78,7 +88,7 @@ def _merge_headers(token: str, base_headers: Optional[dict] = None) -> dict:
 def get_rides_p1(token: str, headers: Optional[dict] = None) -> Tuple[Optional[int], Optional[list]]:
     headers = _merge_headers(token, headers)
     try:
-        r = _get_session().get(f"{API_HOST}/rides", headers=headers, timeout=P1_POLL_TIMEOUT_S)
+        r = _session_request("GET", f"{API_HOST}/rides", headers=headers, timeout=P1_POLL_TIMEOUT_S)
         raw_text = r.text
         _log_poll_response("P1 poll /rides", r.status_code, raw_text)
         if 200 <= r.status_code < 300:
@@ -105,7 +115,7 @@ def get_rides_p1(token: str, headers: Optional[dict] = None) -> Tuple[Optional[i
 def get_offers_p1(token: str, headers: Optional[dict] = None):
     headers = _merge_headers(token, headers)
     try:
-        r = _get_session().get(f"{API_HOST}/offers", headers=headers, timeout=P1_POLL_TIMEOUT_S)
+        r = _session_request("GET", f"{API_HOST}/offers", headers=headers, timeout=P1_POLL_TIMEOUT_S)
         raw_text = r.text
         _log_poll_response("P1 poll /offers", r.status_code, raw_text)
         try:
@@ -153,7 +163,13 @@ def reserve_offer_p1(token: str, offer_id: str, price: Optional[float] = None, h
         except Exception:
             payload["price"] = price
     try:
-        r = _get_session().post(f"{API_HOST}/offers", headers=headers, json=payload, timeout=P1_RESERVE_TIMEOUT_S)
+        r = _session_request(
+            "POST",
+            f"{API_HOST}/offers",
+            headers=headers,
+            json=payload,
+            timeout=P1_RESERVE_TIMEOUT_S,
+        )
         try:
             body = r.json()
         except Exception:

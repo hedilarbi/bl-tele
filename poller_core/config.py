@@ -6,13 +6,15 @@ load_dotenv()  # reads .env in project root
 # -------- Config --------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_HOST = "https://chauffeur-app-api.blacklane.com"  # Platform 1 (mobile)
+MOBILE_AUTH_BASE = os.getenv("BL_MOBILE_AUTH_BASE", "https://login-chauffeur.blacklane.com")
 ATHENA_BASE = "https://athena.blacklane.com"          # Platform 2 (Portal)
 PARTNER_API_BASE = "https://partner-portal-api.blacklane.com"
 PORTAL_CLIENT_ID = os.getenv("BL_PORTAL_CLIENT_ID", "7qL5jGGai6MqBCatVeoihQx5dKEhrNCh")
+MOBILE_CLIENT_ID = os.getenv("BL_MOBILE_CLIENT_ID", "")
 PORTAL_PAGE_SIZE = 50
 
-POLL_INTERVAL = 0.5
-MAX_WORKERS = 10
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_S", "0.5"))
+MAX_WORKERS = max(1, int(os.getenv("MAX_WORKERS", "10")))
 RIDES_REFRESH_INTERVAL_S = int(os.getenv("RIDES_REFRESH_INTERVAL_S", "86400"))
 
 # Filter cache (seconds)
@@ -27,6 +29,7 @@ P1_POLL_TIMEOUT_S = int(os.getenv("P1_POLL_TIMEOUT_S", "8"))
 P1_RESERVE_TIMEOUT_S = int(os.getenv("P1_RESERVE_TIMEOUT_S", "8"))
 P2_POLL_TIMEOUT_S = int(os.getenv("P2_POLL_TIMEOUT_S", "8"))
 P2_RESERVE_TIMEOUT_S = int(os.getenv("P2_RESERVE_TIMEOUT_S", "8"))
+P1_REFRESH_SKEW_S = int(os.getenv("P1_REFRESH_SKEW_S", "90"))
 
 # Toggle mock data for development (default: real polling)
 USE_MOCK_P1 = False    
@@ -37,19 +40,19 @@ ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when a
 AUTO_RESERVE_ENABLED = True
 
 # Diagnostics
-DEBUG_PRINT_OFFERS = False   # print raw offers
-CF_DEBUG = False             # custom filters debug
-ATHENA_PRINT_DEBUG = True   # print portal token and raw payloads
-DEBUG_ENDS = False           # log endsAt math for each offer
+DEBUG_PRINT_OFFERS = os.getenv("DEBUG_PRINT_OFFERS", "0") == "1"
+CF_DEBUG = os.getenv("CF_DEBUG", "0") == "1"
+ATHENA_PRINT_DEBUG = os.getenv("ATHENA_PRINT_DEBUG", "0") == "1"
+DEBUG_ENDS = os.getenv("DEBUG_ENDS", "0") == "1"
 APPLY_GAP_TO_BUSY_INTERVALS = False  # gap will NOT extend busy intervals
 LOG_OFFERS_PAYLOAD = os.getenv("LOG_OFFERS_PAYLOAD", "0") == "1"
 LOG_RAW_API_RESPONSES = os.getenv("LOG_RAW_API_RESPONSES", "0") == "1"
 MAX_LOGGED_OFFERS = int(os.getenv("MAX_LOGGED_OFFERS", "3"))
 
 # --- Rides visibility ---
-DUMP_RIDES_IN_LOGS = True         # print polled rides to stdout
-DUMP_RIDES_IN_TELEGRAM = False    # also send a compact snapshot to the user
-MAX_RIDES_SHOWN = 20              # cap to avoid spam
+DUMP_RIDES_IN_LOGS = os.getenv("DUMP_RIDES_IN_LOGS", "0") == "1"
+DUMP_RIDES_IN_TELEGRAM = os.getenv("DUMP_RIDES_IN_TELEGRAM", "0") == "1"
+MAX_RIDES_SHOWN = int(os.getenv("MAX_RIDES_SHOWN", "20"))
 
 # Athena token/etag helpers
 ATHENA_RELOGIN_SKEW_S = int(os.getenv("ATHENA_RELOGIN_SKEW_S", "3600"))

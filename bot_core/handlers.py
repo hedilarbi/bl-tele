@@ -37,7 +37,13 @@ from .menus import (
 )
 from .state import user_waiting_input, adding_slot_step, work_schedule_state, _ctx_bot_id, _state_key
 from .storage import get_active, set_active, get_filters
-from .utils import normalize_token, parse_mobile_session_dump, validate_mobile_session, validate_datetime, validate_day
+from .utils import (
+    parse_mobile_session_dump,
+    parse_mobile_auth_meta,
+    validate_mobile_session,
+    validate_datetime,
+    validate_day,
+)
 from db import (
     add_user,
     assign_bot_owner,
@@ -151,26 +157,33 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _capture_from_update(update, bot_id)
     if not context.args:
         await update.message.reply_text(
-            "Usage: /token <your token>\n"
-            "You can paste either `Bearer <JWT>` or just the raw `<JWT>`."
+            "Usage: /token <full HTTP dump>\n"
+            "Paste a full request dump with headers (mobile API or oauth/token)."
         )
         return
     raw = " ".join(context.args)
-    if not re.search(r"(?im)^\s*authorization\s*:", raw):
-        await update.message.reply_text("❌ Paste the full HTTP dump (with Authorization header). Token only is not accepted.")
-        return
     token, headers = parse_mobile_session_dump(raw)
     if not headers:
         await update.message.reply_text("❌ Paste the full HTTP dump (with headers). Token only is not accepted.")
         return
-    update_token(bot_id, update.effective_user.id, token, headers)
+    auth_meta = parse_mobile_auth_meta(raw, headers)
+    token = token if isinstance(token, str) and token.lower().startswith("bearer ") else ""
+    has_refresh_material = bool(auth_meta.get("refresh_token") and auth_meta.get("client_id"))
+    if not token and not has_refresh_material:
+        await update.message.reply_text("❌ Missing `Authorization` token and no OAuth refresh payload found.")
+        return
+    update_token(bot_id, update.effective_user.id, token, headers, auth_meta=auth_meta)
 
-    ok, note = validate_mobile_session(token, headers if headers else None)
-    set_token_status(
-        bot_id,
-        update.effective_user.id,
-        "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown"),
-    )
+    if token:
+        ok, note = validate_mobile_session(token, headers if headers else None)
+        set_token_status(
+            bot_id,
+            update.effective_user.id,
+            "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown"),
+        )
+    else:
+        ok, note = False, "refresh_only"
+        set_token_status(bot_id, update.effective_user.id, "unknown")
 
     bot_token = context.bot.token if context and context.bot else None
     unpin_warning_if_any(bot_id, update.effective_user.id, "no_token", bot_token)
@@ -178,6 +191,8 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ok:
         await update.message.reply_text("✅ Mobile session token saved and validated.")
+    elif has_refresh_material and not token:
+        await update.message.reply_text("✅ OAuth refresh material saved. Access token will be renewed automatically.")
     else:
         hint = "Token looks invalid." if note.startswith("unauthorized") else "Couldn't verify right now; I'll retry soon."
         await update.message.reply_text(f"⚠️ Saved, but validation not OK yet. {hint}")
@@ -531,17 +546,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Token input (Mobile Sessions)
     if user_waiting_input.get(state_key) == "set_token":
-        if not re.search(r"(?im)^\s*authorization\s*:", text):
-            await update.message.reply_text("❌ Paste the full HTTP dump (with Authorization header). Token only is not accepted.")
-            return
         token, headers = parse_mobile_session_dump(text)
         if not headers:
             await update.message.reply_text("❌ Paste the full HTTP dump (with headers). Token only is not accepted.")
             return
-        update_token(bot_id, user_id, token, headers)
+        auth_meta = parse_mobile_auth_meta(text, headers)
+        token = token if isinstance(token, str) and token.lower().startswith("bearer ") else ""
+        has_refresh_material = bool(auth_meta.get("refresh_token") and auth_meta.get("client_id"))
+        if not token and not has_refresh_material:
+            await update.message.reply_text("❌ Missing `Authorization` token and no OAuth refresh payload found.")
+            return
+        update_token(bot_id, user_id, token, headers, auth_meta=auth_meta)
 
-        ok, note = validate_mobile_session(token, headers if headers else None)
-        set_token_status(bot_id, user_id, "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown"))
+        if token:
+            ok, note = validate_mobile_session(token, headers if headers else None)
+            set_token_status(bot_id, user_id, "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown"))
+        else:
+            ok, note = False, "refresh_only"
+            set_token_status(bot_id, user_id, "unknown")
 
         bot_token = context.bot.token if context and context.bot else None
         unpin_warning_if_any(bot_id, user_id, "no_token", bot_token)
@@ -549,6 +571,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if ok:
             await update.message.reply_text("✅ Mobile session token saved and validated.")
+        elif has_refresh_material and not token:
+            await update.message.reply_text("✅ OAuth refresh material saved. Access token will be renewed automatically.")
         else:
             hint = "Token looks invalid." if note.startswith("unauthorized") else "Couldn't verify right now; I'll retry soon."
             await update.message.reply_text(f"⚠️ Saved, but validation not OK yet. {hint}")

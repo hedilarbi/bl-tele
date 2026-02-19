@@ -83,6 +83,68 @@ def parse_mobile_session_dump(raw: str) -> tuple[str, dict]:
     return token, headers
 
 
+def _extract_auth_value(raw: str, key: str) -> Optional[str]:
+    if not raw:
+        return None
+    patterns = [
+        rf'"{re.escape(key)}"\s*:\s*"([^"]+)"',
+        rf"{re.escape(key)}\s*[:=]\s*['\"]?([^\s\"',&}}]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, str(raw), flags=re.IGNORECASE)
+        if m and m.group(1):
+            return m.group(1).strip()
+    return None
+
+
+def parse_mobile_auth_meta(raw: str, headers: Optional[dict] = None) -> dict:
+    """
+    Best-effort extraction of OAuth refresh material from a pasted dump.
+
+    Returned dict may include:
+      - refresh_token
+      - client_id
+      - oauth_headers (subset useful for /oauth/token refresh call)
+    """
+    out: dict = {}
+    if not raw and not headers:
+        return out
+
+    refresh_token = _extract_auth_value(raw or "", "refresh_token")
+    client_id = _extract_auth_value(raw or "", "client_id")
+    if refresh_token:
+        out["refresh_token"] = refresh_token
+    if client_id:
+        out["client_id"] = client_id
+
+    src_headers = headers if isinstance(headers, dict) else {}
+    if not src_headers and raw:
+        _, parsed_headers = parse_mobile_session_dump(raw)
+        src_headers = parsed_headers or {}
+
+    if src_headers:
+        wanted = {
+            "auth0-client",
+            "user-agent",
+            "accept",
+            "accept-language",
+            "accept-encoding",
+            "connection",
+            "cookie",
+            "content-type",
+            "host",
+        }
+        oauth_headers = {
+            k: v
+            for k, v in src_headers.items()
+            if k and v is not None and k.lower() in wanted
+        }
+        if oauth_headers:
+            out["oauth_headers"] = oauth_headers
+
+    return out
+
+
 def mask_secret(s: str, keep: int = 4) -> str:
     if not s:
         return "—"

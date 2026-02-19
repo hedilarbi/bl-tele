@@ -72,23 +72,39 @@ def add_user(bot_id: str, telegram_id: int):
     conn.close()
 
 
-def update_token(bot_id: str, telegram_id: int, token: str, headers: dict | None = None):
+def update_token(
+    bot_id: str,
+    telegram_id: int,
+    token: str,
+    headers: dict | None = None,
+    auth_meta: dict | None = None,
+):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    if headers is None:
-        c.execute(
-            "UPDATE users SET token = ?, token_status = 'unknown' WHERE bot_id = ? AND telegram_id = ?",
-            (token, bot_id, telegram_id),
-        )
-    else:
+    updates = ["token = ?", "token_status = 'unknown'"]
+    params = [token]
+
+    if headers is not None:
         try:
             headers_json = json.dumps(headers, ensure_ascii=True)
         except Exception:
             headers_json = None
-        c.execute(
-            "UPDATE users SET token = ?, mobile_headers = ?, token_status = 'unknown' WHERE bot_id = ? AND telegram_id = ?",
-            (token, headers_json, bot_id, telegram_id),
-        )
+        updates.append("mobile_headers = ?")
+        params.append(headers_json)
+
+    if auth_meta is not None:
+        try:
+            auth_json = json.dumps(auth_meta, ensure_ascii=True)
+        except Exception:
+            auth_json = None
+        updates.append("mobile_auth_json = ?")
+        params.append(auth_json)
+
+    params.extend([bot_id, telegram_id])
+    c.execute(
+        f"UPDATE users SET {', '.join(updates)} WHERE bot_id = ? AND telegram_id = ?",
+        tuple(params),
+    )
     conn.commit()
     conn.close()
 
@@ -128,6 +144,21 @@ def get_mobile_headers(bot_id: str, telegram_id: int) -> dict | None:
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT mobile_headers FROM users WHERE bot_id = ? AND telegram_id = ?", (bot_id, telegram_id))
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        val = json.loads(row[0])
+        return val if isinstance(val, dict) else None
+    except Exception:
+        return None
+
+
+def get_mobile_auth(bot_id: str, telegram_id: int) -> dict | None:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT mobile_auth_json FROM users WHERE bot_id = ? AND telegram_id = ?", (bot_id, telegram_id))
     row = c.fetchone()
     conn.close()
     if not row or not row[0]:

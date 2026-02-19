@@ -132,6 +132,11 @@ def init_db():
             c.execute(alter_sql)
         except Exception:
             pass
+    for alter_sql in ["ALTER TABLE users ADD COLUMN mobile_auth_json TEXT"]:
+        try:
+            c.execute(alter_sql)
+        except Exception:
+            pass
     for alter_sql in ["ALTER TABLE users ADD COLUMN bl_uuid TEXT"]:
         try:
             c.execute(alter_sql)

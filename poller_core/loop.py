@@ -3,9 +3,9 @@ import time
 import traceback
 import threading
 import builtins as _builtins
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import (
     ALWAYS_POLL_REAL_ORDERS,
@@ -33,6 +33,7 @@ from .state import (
 )
 from .utils import _normalize_formulas
 from .p1_client import get_rides_p1, get_offers_p1
+from .p1_auth import maybe_refresh_p1_session
 from .p2_client import (
     _map_portal_offer,
     _athena_get_offers,
@@ -208,6 +209,25 @@ def poll_user(user):
 
     poll_real_orders = ALWAYS_POLL_REAL_ORDERS and not (USE_MOCK_P1 and USE_MOCK_P2)
 
+    def _refresh_p1_token(force: bool = False, trigger: str = "unspecified") -> bool:
+        nonlocal token, mobile_headers
+        new_token, new_headers, refreshed, note = maybe_refresh_p1_session(
+            bot_id=bot_id,
+            telegram_id=telegram_id,
+            token=token,
+            mobile_headers=mobile_headers,
+            force=force,
+            trigger=trigger,
+        )
+        if refreshed and new_token:
+            token = new_token
+            mobile_headers = new_headers
+            print(f"[{datetime.now()}] 🔁 P1 token refreshed for user {telegram_id} (trigger={trigger})")
+            return True
+        return False
+
+    _refresh_p1_token(force=False, trigger="poll_cycle_start")
+
     def _fetch_p2_rides():
         if not portal_token:
             return [], False
@@ -245,6 +265,8 @@ def poll_user(user):
         if not token or not str(token).strip():
             return [], False
         status_code, ride_results = get_rides_p1(token, headers=mobile_headers)
+        if status_code in (401, 403) and _refresh_p1_token(force=True, trigger="p1_rides_unauthorized"):
+            status_code, ride_results = get_rides_p1(token, headers=mobile_headers)
         if status_code == 200 and isinstance(ride_results, list):
             kept = _filter_rides_by_bl_uuid(ride_results, bl_uuid) if bl_uuid else ride_results
             snap = _rides_snapshot_from_p1_list(kept, tz_name)
@@ -337,8 +359,12 @@ def poll_user(user):
         ]
 
     def _fetch_p1_offers_real():
+        if not token or not str(token).strip():
+            _refresh_p1_token(force=False, trigger="p1_offers_no_token")
         if token and str(token).strip():
             status_code, results = get_offers_p1(token, headers=mobile_headers)
+            if status_code in (401, 403) and _refresh_p1_token(force=True, trigger="p1_offers_unauthorized"):
+                status_code, results = get_offers_p1(token, headers=mobile_headers)
             if status_code in (401, 403):
                 set_token_status(bot_id, telegram_id, "expired")
                 existing = get_pinned_warnings(bot_id, telegram_id)
@@ -616,19 +642,47 @@ def poll_user(user):
     return f"Done with user {telegram_id}"
 
 
+def _user_key(user_row) -> Tuple[str, int]:
+    return (str(user_row[0]), int(user_row[1]))
+
+
 def run():
     _poll_log("🚀 Poller started")
+    inflight: Dict[Tuple[str, int], tuple] = {}
+
     while True:
         maybe_reset_inmem_caches()
         _poll_log("🔄 Starting polling cycle")
         users = get_all_users_with_bot_admin_active()
-        futures = [_user_executor.submit(poll_user, u) for u in users]
-        for f in as_completed(futures):
+        now_ts = time.time()
+
+        completed = 0
+        for key, entry in list(inflight.items()):
+            fut, _started_ts = entry
+            if not fut.done():
+                continue
+            completed += 1
+            inflight.pop(key, None)
             try:
-                res = f.result()
-                if res:
-                    print(f"[{datetime.now()}] ✅ {res}")
+                res = fut.result()
+                if res and ATHENA_PRINT_DEBUG:
+                    _poll_log(f"✅ {res}")
             except Exception as e:
-                print(f"[{datetime.now()}] ❌ Poll error: {e}")
+                _poll_log(f"❌ Poll error ({key[0]}/{key[1]}): {e}")
                 _quiet_exc()
+
+        launched = 0
+        for user in users:
+            key = _user_key(user)
+            if key in inflight:
+                continue
+            inflight[key] = (_user_executor.submit(poll_user, user), now_ts)
+            launched += 1
+
+        _poll_log(
+            f"👥 Poll scheduler: eligible={len(users)} in_flight={len(inflight)} "
+            f"launched={launched} completed={completed}"
+        )
+        if not users:
+            _poll_log("⚠️ No eligible users (requires users.active=1 and bot_instances.admin_active=1).")
         time.sleep(_sleep_interval())

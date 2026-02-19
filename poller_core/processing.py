@@ -33,9 +33,10 @@ from .filters import (
 from .notify import maybe_send_message, _platform_icon
 from .state import accepted_per_user, rejected_per_user, invalidate_rides_cache, set_rides_cache
 from .p1_client import reserve_offer_p1, get_rides_p1
+from .p1_auth import maybe_refresh_p1_session
 from .p2_client import reserve_offer_p2, _athena_get_rides, _filter_rides_by_bl_uuid
 from .rides import _extract_intervals_from_rides
-from db import log_offer_decision, save_offer_message, get_bl_uuid
+from db import log_offer_decision, save_offer_message, get_bl_uuid, set_token_status
 
 
 def _quiet_print(*args, **kwargs):
@@ -80,7 +81,6 @@ def _refresh_rides_cache_now(
     set_rides_cache(bot_id, telegram_id, intervals)
 
 
-_reserve_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 _bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 
@@ -102,11 +102,10 @@ def _refresh_rides_cache_async(
 
 
 def _reserve_with_timeout(fn, timeout_s: int, *args, **kwargs):
-    fut = _reserve_executor.submit(fn, *args, **kwargs)
-    try:
-        return fut.result(timeout=timeout_s)
-    except concurrent.futures.TimeoutError:
-        return None, {"error": f"timeout:{timeout_s}s"}
+    # Reserve client functions already enforce request-level timeouts.
+    # Avoiding an extra executor queue removes queue-delay timeouts.
+    _ = timeout_s
+    return fn(*args, **kwargs)
 
 
 def _poll_latency_ms(offer: dict) -> Optional[int]:
@@ -117,6 +116,40 @@ def _poll_latency_ms(offer: dict) -> Optional[int]:
         return int((time.time() - float(ts)) * 1000)
     except Exception:
         return None
+
+
+def _reserve_failure_human_reason(status_code: Optional[int], body: Any) -> str:
+    text = ""
+    if isinstance(body, dict):
+        for k in ("detail", "message", "error", "title"):
+            v = body.get(k)
+            if v:
+                text = str(v)
+                break
+        if not text:
+            try:
+                text = json.dumps(body, ensure_ascii=False)
+            except Exception:
+                text = str(body)
+    elif body is not None:
+        text = str(body)
+
+    low = text.lower()
+    if any(k in low for k in ("already taken", "already accepted", "not available", "no longer available")):
+        return "Offer deja prise par un autre chauffeur."
+    if status_code == 409:
+        return "Conflit 409: offre deja prise."
+    if status_code == 422:
+        return "Offre devenue invalide (422)."
+    if status_code in (401, 403):
+        return f"Session expiree (HTTP {status_code})."
+    if status_code is not None and 500 <= int(status_code) < 600:
+        return f"Erreur serveur Blacklane (HTTP {status_code})."
+    if status_code is None:
+        if "timeout" in low:
+            return "Timeout reseau pendant la reservation."
+        return "Erreur reseau pendant la reservation."
+    return f"Reservation refusee (HTTP {status_code})."
 
 
 def _build_user_message(
@@ -183,6 +216,8 @@ def _build_user_message(
     ]
     if do_addr:
         lines += ["", f"⬇️ <b>Dropoff:</b>\n{_esc(do_addr)}"]
+    if status in ("rejected", "not_accepted") and reason:
+        lines += ["", f"⚠️ <b>Reason:</b> {_esc(reason)}"]
 
     if status == "accepted":
         status_icon = "🟢"
@@ -604,13 +639,13 @@ def _process_offers_for_user(
         # Accept (either all filters OK or overridden by custom filter)
         print(f"[{datetime.now()}] ✅ Accepted {oid} [{platform}]")
         offer_to_log = deepcopy(offer)
-        log_offer_decision(bot_id, telegram_id, offer_to_log, "accepted", reason_for_log)
 
         # Optionally auto-reserve the offer upstream
         if AUTO_RESERVE_ENABLED:
             reserve_attempted = False
             reserve_ok = True
             reserve_reason = None
+            reserve_reason_user = None
             latency_ms = _poll_latency_ms(offer_to_log)
             latency_note = f" | latency={latency_ms}ms" if latency_ms is not None else ""
             _builtins.print(
@@ -631,13 +666,43 @@ def _process_offers_for_user(
                             price=offer_to_log.get("price"),
                             headers=p1_headers,
                         )
+                        if rs in (401, 403):
+                            new_tok, new_headers, refreshed, note = maybe_refresh_p1_session(
+                                bot_id=bot_id,
+                                telegram_id=telegram_id,
+                                token=p1_token,
+                                mobile_headers=p1_headers,
+                                force=True,
+                                trigger="p1_reserve_unauthorized",
+                            )
+                            if refreshed and new_tok:
+                                p1_token = new_tok
+                                p1_headers = new_headers
+                                _builtins.print(
+                                    f"[{datetime.now()}] 🔁 P1 token refreshed during reserve retry for user {telegram_id}"
+                                )
+                                rs, rb = _reserve_with_timeout(
+                                    reserve_offer_p1,
+                                    P1_RESERVE_TIMEOUT_S,
+                                    p1_token,
+                                    oid,
+                                    price=offer_to_log.get("price"),
+                                    headers=p1_headers,
+                                )
+                            else:
+                                _builtins.print(
+                                    f"[{datetime.now()}] ⚠️ P1 refresh unavailable during reserve for user {telegram_id}: {note}"
+                                )
                         _builtins.print(f"[{datetime.now()}] 🎯 P1 reserve {oid} -> {rs} | {rb}{latency_note}")
                         reserve_ok = 200 <= (rs or 0) < 300
                         if not reserve_ok:
+                            if rs in (401, 403):
+                                set_token_status(bot_id, telegram_id, "expired")
                             _builtins.print(
                                 f"[{datetime.now()}] ❌ P1 reserve failed {oid} (status={rs}) body={rb}{latency_note}"
                             )
                             reserve_reason = f"reserve_failed:{rs}"
+                            reserve_reason_user = _reserve_failure_human_reason(rs, rb)
                         else:
                             _refresh_rides_cache_async(
                                 bot_id,
@@ -669,6 +734,7 @@ def _process_offers_for_user(
                         if not reserve_ok:
                             _builtins.print(f"[{datetime.now()}] ❌ P2 reserve failed {oid} (status={rs}) body={rb}{latency_note}")
                             reserve_reason = f"reserve_failed:{rs}"
+                            reserve_reason_user = _reserve_failure_human_reason(rs, rb)
                         else:
                             _refresh_rides_cache_async(
                                 bot_id,
@@ -685,18 +751,19 @@ def _process_offers_for_user(
                 reserve_attempted = True
                 reserve_ok = False
                 reserve_reason = f"reserve_error:{type(e).__name__}"
-
-            if reserve_attempted and not reserve_ok:
-                log_offer_decision(bot_id, telegram_id, offer_to_log, "not_accepted", reserve_reason)
+                reserve_reason_user = _reserve_failure_human_reason(None, {"error": f"{type(e).__name__}: {e}"})
 
         final_status = "accepted"
         if AUTO_RESERVE_ENABLED and reserve_attempted and not reserve_ok:
             final_status = "not_accepted"
+        final_reason = reserve_reason_user if final_status == "not_accepted" else None
+        final_reason_for_log = reserve_reason if final_status == "not_accepted" else reason_for_log
+        log_offer_decision(bot_id, telegram_id, offer_to_log, final_status, final_reason_for_log)
 
         full_text = _build_user_message(
             offer_to_log,
             final_status,
-            None,
+            final_reason,
             tz_name,
             summary_text,
             filter_results=filter_results,
@@ -709,6 +776,9 @@ def _process_offers_for_user(
             platform,
             forced_accept=bool(accept_override and failed_filters),
         )
+        notify_line = header_line
+        if final_status == "not_accepted" and final_reason:
+            notify_line = f"{header_line}\n⚠️ {_esc(final_reason)}"
         details_key = uuid.uuid4().hex[:16]
         save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
         kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
@@ -716,7 +786,7 @@ def _process_offers_for_user(
             bot_id,
             telegram_id,
             final_status,
-            header_line,
+            notify_line,
             platform,
             reply_markup=kb,
         )
