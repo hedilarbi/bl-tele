@@ -256,6 +256,15 @@ def maybe_refresh_p1_session(
         f"refresh_fp={_fp8(refresh_token)}"
     )
     req_headers = _build_oauth_headers(mobile_headers, oauth_headers)
+    cookie_raw = _header_get(req_headers, "Cookie") or _header_get(req_headers, "cookie") or ""
+    _builtins.print(
+        f"[{datetime.now()}] 🍪 P1 refresh headers for {bot_id}/{telegram_id} "
+        f"cookie_present={'yes' if bool(cookie_raw) else 'no'} "
+        f"cookie_len={len(str(cookie_raw)) if cookie_raw else 0} "
+        f"cookie_fp={_fp8(cookie_raw)} "
+        f"auth0_client_present={'yes' if bool(_header_get(req_headers, 'Auth0-Client')) else 'no'} "
+        f"user_agent_present={'yes' if bool(_header_get(req_headers, 'User-Agent')) else 'no'}"
+    )
     ok, new_token, new_refresh, note = refresh_p1_access_token(
         refresh_token=str(refresh_token),
         client_id=str(client_id),

@@ -11,7 +11,14 @@ from dateutil import parser
 from dateutil.tz import gettz
 from copy import deepcopy
 
-from .config import DEBUG_PRINT_OFFERS, DEBUG_ENDS, AUTO_RESERVE_ENABLED, P1_RESERVE_TIMEOUT_S, P2_RESERVE_TIMEOUT_S
+from .config import (
+    DEBUG_PRINT_OFFERS,
+    DEBUG_ENDS,
+    AUTO_RESERVE_ENABLED,
+    P1_RESERVE_TIMEOUT_S,
+    P2_RESERVE_TIMEOUT_S,
+    FAST_ACCEPT_MODE,
+)
 from .utils import (
     _esc,
     _fmt_money,
@@ -82,6 +89,7 @@ def _refresh_rides_cache_now(
 
 
 _bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+_notify_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 
 def _refresh_rides_cache_async(
@@ -106,6 +114,30 @@ def _reserve_with_timeout(fn, timeout_s: int, *args, **kwargs):
     # Avoiding an extra executor queue removes queue-delay timeouts.
     _ = timeout_s
     return fn(*args, **kwargs)
+
+
+def _send_notification_async(
+    bot_id: str,
+    telegram_id: int,
+    kind: str,
+    text: str,
+    platform: str,
+    reply_markup: Optional[dict] = None,
+):
+    def _job():
+        try:
+            maybe_send_message(
+                bot_id,
+                telegram_id,
+                kind,
+                text,
+                platform,
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            return None
+
+    _notify_executor.submit(_job)
 
 
 def _poll_latency_ms(offer: dict) -> Optional[int]:
@@ -609,6 +641,10 @@ def _process_offers_for_user(
         if is_rejected:
             print(f"[{datetime.now()}] ⛔ Rejected {oid} – {base_reason or 'filtres non respectés'}")
             log_offer_decision(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
+            if FAST_ACCEPT_MODE:
+                # In race mode, skip heavy Telegram work for rejected offers.
+                rejected_per_user[bot_id][telegram_id][platform].add(oid)
+                continue
             full_text = _build_user_message(
                 offer,
                 "rejected",
@@ -625,7 +661,7 @@ def _process_offers_for_user(
             details_key = uuid.uuid4().hex[:16]
             save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
             kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
-            maybe_send_message(
+            _send_notification_async(
                 bot_id,
                 telegram_id,
                 "rejected",
@@ -782,7 +818,7 @@ def _process_offers_for_user(
         details_key = uuid.uuid4().hex[:16]
         save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
         kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
-        maybe_send_message(
+        _send_notification_async(
             bot_id,
             telegram_id,
             final_status,

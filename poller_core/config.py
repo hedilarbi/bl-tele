@@ -48,6 +48,7 @@ APPLY_GAP_TO_BUSY_INTERVALS = False  # gap will NOT extend busy intervals
 LOG_OFFERS_PAYLOAD = os.getenv("LOG_OFFERS_PAYLOAD", "0") == "1"
 LOG_RAW_API_RESPONSES = os.getenv("LOG_RAW_API_RESPONSES", "0") == "1"
 MAX_LOGGED_OFFERS = int(os.getenv("MAX_LOGGED_OFFERS", "3"))
+FAST_ACCEPT_MODE = os.getenv("FAST_ACCEPT_MODE", "0") == "1"
 
 # --- Rides visibility ---
 DUMP_RIDES_IN_LOGS = os.getenv("DUMP_RIDES_IN_LOGS", "0") == "1"
