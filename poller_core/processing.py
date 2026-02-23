@@ -732,7 +732,7 @@ def _process_offers_for_user(
                         _builtins.print(f"[{datetime.now()}] 🎯 P1 reserve {oid} -> {rs} | {rb}{latency_note}")
                         reserve_ok = 200 <= (rs or 0) < 300
                         if not reserve_ok:
-                            if rs in (401, 403):
+                            if rs == 401:
                                 set_token_status(bot_id, telegram_id, "expired")
                             _builtins.print(
                                 f"[{datetime.now()}] ❌ P1 reserve failed {oid} (status={rs}) body={rb}{latency_note}"

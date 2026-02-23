@@ -278,14 +278,19 @@ def poll_user(user):
             )
             return intervals_p1, True
         if status_code in (401, 403):
-            set_token_status(bot_id, telegram_id, "expired")
-            existing = get_pinned_warnings(bot_id, telegram_id)
-            if not existing["expired_msg_id"]:
-                if existing["no_token_msg_id"]:
-                    bot_token = _resolve_bot_token(bot_id, telegram_id)
-                    tg_unpin_message(bot_token, telegram_id, existing["no_token_msg_id"])
-                    clear_pinned_warning(bot_id, telegram_id, "no_token")
-                pin_warning_if_needed(bot_id, telegram_id, "expired")
+            if status_code == 401:
+                set_token_status(bot_id, telegram_id, "expired")
+                existing = get_pinned_warnings(bot_id, telegram_id)
+                if not existing["expired_msg_id"]:
+                    if existing["no_token_msg_id"]:
+                        bot_token = _resolve_bot_token(bot_id, telegram_id)
+                        tg_unpin_message(bot_token, telegram_id, existing["no_token_msg_id"])
+                        clear_pinned_warning(bot_id, telegram_id, "no_token")
+                    pin_warning_if_needed(bot_id, telegram_id, "expired")
+            else:
+                set_token_status(bot_id, telegram_id, "unknown")
+                unpin_warning_if_any(bot_id, telegram_id, "expired")
+                print(f"[{datetime.now()}] ⚠️ P1 /rides forbidden (403) for user {telegram_id} (not marked expired).")
         elif status_code is None:
             err_detail = ride_results.get("error") if isinstance(ride_results, dict) else None
             if err_detail:
@@ -366,14 +371,19 @@ def poll_user(user):
             if status_code in (401, 403) and _refresh_p1_token(force=True, trigger="p1_offers_unauthorized"):
                 status_code, results = get_offers_p1(token, headers=mobile_headers)
             if status_code in (401, 403):
-                set_token_status(bot_id, telegram_id, "expired")
-                existing = get_pinned_warnings(bot_id, telegram_id)
-                if not existing["expired_msg_id"]:
-                    if existing["no_token_msg_id"]:
-                        bot_token = _resolve_bot_token(bot_id, telegram_id)
-                        tg_unpin_message(bot_token, telegram_id, existing["no_token_msg_id"])
-                        clear_pinned_warning(bot_id, telegram_id, "no_token")
-                    pin_warning_if_needed(bot_id, telegram_id, "expired")
+                if status_code == 401:
+                    set_token_status(bot_id, telegram_id, "expired")
+                    existing = get_pinned_warnings(bot_id, telegram_id)
+                    if not existing["expired_msg_id"]:
+                        if existing["no_token_msg_id"]:
+                            bot_token = _resolve_bot_token(bot_id, telegram_id)
+                            tg_unpin_message(bot_token, telegram_id, existing["no_token_msg_id"])
+                            clear_pinned_warning(bot_id, telegram_id, "no_token")
+                        pin_warning_if_needed(bot_id, telegram_id, "expired")
+                else:
+                    set_token_status(bot_id, telegram_id, "unknown")
+                    unpin_warning_if_any(bot_id, telegram_id, "expired")
+                    print(f"[{datetime.now()}] ⚠️ P1 offers forbidden (403) for user {telegram_id} (not marked expired).")
                 print(f"[{datetime.now()}] ⚠️ P1 offers returned {status_code} for user {telegram_id}")
                 return []
             if status_code == 200:

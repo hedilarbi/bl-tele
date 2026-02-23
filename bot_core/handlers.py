@@ -136,8 +136,10 @@ def _missing_refresh_parts(auth_meta: dict) -> list[str]:
 def _validation_note_hint(note: str) -> str:
     if not note:
         return "Saved but couldn't verify right now."
-    if note.startswith("unauthorized"):
+    if note.startswith("unauthorized:401"):
         return "Token looks invalid or expired."
+    if note.startswith("unauthorized:403"):
+        return "Token seems valid but access is forbidden (403) from this environment/account."
     if note.startswith("upstream:410"):
         return "HTTP 410 means the probe endpoint is gone (token may still be usable for other paths)."
     if note.startswith("upstream:404") or note.startswith("upstream:405"):
@@ -203,10 +205,16 @@ def _save_mobile_input_for_user(
 
     if token_candidate:
         ok, note = validate_mobile_session(final_token, final_headers if final_headers else None)
+        if ok:
+            next_status = "valid"
+        elif note.startswith("unauthorized:401"):
+            next_status = "expired"
+        else:
+            next_status = "unknown"
         set_token_status(
             bot_id,
             user_id,
-            "valid" if ok else ("expired" if note.startswith("unauthorized") else "unknown"),
+            next_status,
         )
         if ok:
             unpin_warning_if_any(bot_id, user_id, "no_token", bot_token)
