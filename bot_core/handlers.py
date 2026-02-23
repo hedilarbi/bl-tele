@@ -133,6 +133,20 @@ def _missing_refresh_parts(auth_meta: dict) -> list[str]:
     return missing
 
 
+def _validation_note_hint(note: str) -> str:
+    if not note:
+        return "Saved but couldn't verify right now."
+    if note.startswith("unauthorized"):
+        return "Token looks invalid or expired."
+    if note.startswith("upstream:410"):
+        return "HTTP 410 means the probe endpoint is gone (token may still be usable for other paths)."
+    if note.startswith("upstream:404") or note.startswith("upstream:405"):
+        return "Probe endpoint/method not available right now."
+    if note.startswith("network:"):
+        return "Validation request hit a network timeout/error."
+    return "Saved but couldn't verify right now."
+
+
 def _save_mobile_input_for_user(
     bot_id: str,
     user_id: int,
@@ -198,8 +212,8 @@ def _save_mobile_input_for_user(
             unpin_warning_if_any(bot_id, user_id, "no_token", bot_token)
             unpin_warning_if_any(bot_id, user_id, "expired", bot_token)
             return "✅ Mobile token saved and validated."
-        hint = "Token looks invalid." if note.startswith("unauthorized") else "Saved but couldn't verify right now."
-        return f"⚠️ Token saved, validation not OK yet. {hint}"
+        hint = _validation_note_hint(note)
+        return f"⚠️ Token saved, validation not OK yet ({note}). {hint}"
 
     # Auth material only: keep previous status until poller refreshes successfully.
     set_token_status(bot_id, user_id, existing_status)
@@ -271,13 +285,17 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bot_id is None or user_id is None:
         await update.message.reply_text("Select a bot first with /listbots.")
         return
-    if not context.args:
+    message_text = (update.message.text or "") if update and update.message else ""
+    raw = re.sub(r"(?is)^/token(?:@\w+)?\s*", "", message_text, count=1).strip()
+    if not raw and context.args:
+        # fallback when command text is not available from adapter
+        raw = " ".join(context.args).strip()
+    if not raw:
         await update.message.reply_text(
             "Usage: /token <full HTTP dump>\n"
             "Accepted: full HTTP dump, OAuth JSON, or refresh_token/client_id pieces."
         )
         return
-    raw = " ".join(context.args)
     bot_token = context.bot.token if context and context.bot else None
     add_user(bot_id, user_id)
     result_msg = _save_mobile_input_for_user(bot_id, user_id, raw, bot_token=bot_token)

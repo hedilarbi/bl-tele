@@ -9,6 +9,63 @@ import requests
 from .config import API_HOST
 
 
+_JWT_PATTERN = r"[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+"
+
+
+def _extract_bearer_jwt(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    m = re.search(rf"(?is)\bbearer\s+({_JWT_PATTERN})", str(raw))
+    if m and m.group(1):
+        return m.group(1).strip()
+    return None
+
+
+def _is_bearer_token(s: str) -> bool:
+    if not s:
+        return False
+    return bool(re.match(rf"(?i)^Bearer\s+{_JWT_PATTERN}$", str(s).strip()))
+
+
+def _iter_header_pairs(raw: str) -> list[tuple[str, str]]:
+    text = str(raw or "")
+    out: list[tuple[str, str]] = []
+
+    # Normal multiline capture.
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(("{", "}", "[", "]", '"', "'")):
+            continue
+        if re.match(r"^[A-Z]+\s+\S+\s+HTTP/[\d.]+$", line):
+            continue
+        if not re.match(r"^[A-Za-z0-9_-]+\s*:\s*.+$", line):
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip()
+        v = v.strip()
+        if k and v:
+            out.append((k, v))
+
+    if out:
+        return out
+
+    # One-line fallback (e.g. `/token` args flattening all lines).
+    flat = " ".join(text.replace("\r", "\n").split())
+    if not flat:
+        return out
+    matches = list(re.finditer(r"(?:^|\s)([A-Za-z0-9_-]+)\s*:\s*", flat))
+    for i, m in enumerate(matches):
+        key = (m.group(1) or "").strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(flat)
+        val = flat[start:end].strip()
+        if key and val:
+            out.append((key, val))
+    return out
+
+
 def normalize_token(s: str) -> str:
     """
     Canonicalize to: 'Bearer <JWT>'.
@@ -21,7 +78,12 @@ def normalize_token(s: str) -> str:
     """
     if not s:
         return ""
-    raw = str(s).strip()
+    raw = str(s).replace("\u200b", "").replace("\ufeff", "").replace("\xa0", " ").strip()
+
+    # Fast path: extract clean Bearer JWT anywhere in the pasted payload.
+    jwt_from_bearer = _extract_bearer_jwt(raw)
+    if jwt_from_bearer:
+        return f"Bearer {jwt_from_bearer}"
 
     # If a full HTTP request was pasted, extract the Authorization header line.
     auth_match = re.search(r"(?im)^\s*authorization\s*:\s*(.+)$", raw)
@@ -40,16 +102,19 @@ def normalize_token(s: str) -> str:
 
     # already Bearer? keep but normalize capitalization/spacing
     if s.lower().startswith("bearer "):
-        tok = s[7:].strip().replace(" ", "")
-        return f"Bearer {tok}"
+        jwt = _extract_bearer_jwt(s)
+        if jwt:
+            return f"Bearer {jwt}"
+        tok = s[7:].strip().split()[0] if s[7:].strip() else ""
+        return f"Bearer {tok}" if tok else ""
 
     # plain JWT pattern?
-    if re.match(r"^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$", s):
+    if re.match(rf"^{_JWT_PATTERN}$", s):
         return f"Bearer {s}"
 
     # If the token was wrapped across lines in a HTTP dump, recover from raw text.
     compact = re.sub(r"\s+", "", raw)
-    jwt_match = re.search(r"[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+", compact)
+    jwt_match = re.search(_JWT_PATTERN, compact)
     if jwt_match:
         return f"Bearer {jwt_match.group(0)}"
 
@@ -66,25 +131,18 @@ def parse_mobile_session_dump(raw: str) -> tuple[str, dict]:
     headers: dict = {}
     if not raw:
         return token, headers
-    auth_match = re.search(r"(?im)^\s*authorization\s*:\s*(.+)$", str(raw))
-    if auth_match:
-        token = normalize_token(auth_match.group(1).strip())
-    for line in str(raw).splitlines():
-        line = line.strip()
-        if not line:
+    for k, v in _iter_header_pairs(raw):
+        if not k:
             continue
-        if line.startswith(("{", "}", "[", "]", '"', "'")):
-            continue
-        if re.match(r"^[A-Z]+\s+\S+\s+HTTP/[\d.]+$", line):
-            continue
-        if not re.match(r"^[A-Za-z0-9_-]+\s*:\s*.+$", line):
-            continue
-        k, v = line.split(":", 1)
-        k = k.strip()
-        v = v.strip()
-        if not k or k.lower() == "authorization":
+        if k.lower() == "authorization":
+            if not token:
+                token = normalize_token(v)
             continue
         headers[k] = v
+    if not token:
+        fallback = normalize_token(str(raw))
+        if _is_bearer_token(fallback):
+            token = fallback
     return token, headers
 
 
@@ -155,7 +213,7 @@ def _extract_auth_value(raw: str, key: str) -> Optional[str]:
         return None
     patterns = [
         rf'"{re.escape(key)}"\s*:\s*"([^"]+)"',
-        rf"{re.escape(key)}\s*[:=]\s*['\"]?([^\s\"',&}}]+)",
+        rf"{re.escape(key)}\s*[:=]\s*['\"]?(Bearer\s+{_JWT_PATTERN}|{_JWT_PATTERN}|[^\s\"',&}}]+)",
     ]
     for pat in patterns:
         m = re.search(pat, str(raw), flags=re.IGNORECASE)
@@ -234,19 +292,39 @@ def validate_mobile_session(token: str, headers: Optional[dict] = None) -> tuple
         return (False, "empty_token")
     merged = {"Authorization": token, "Accept": "application/json"}
     if headers:
-        merged = dict(headers)
-        if not any(k.lower() == "accept" for k in merged):
-            merged["Accept"] = "application/json"
-        merged["Authorization"] = token
-    try:
-        r = requests.get(f"{API_HOST}/rides?limit=1", headers=merged, timeout=12)
+        # Keep validation lean: stale copied headers can trigger false negatives.
+        for k, v in dict(headers).items():
+            if not k or v is None:
+                continue
+            if k.lower() in {"user-agent", "x-operating-system", "accept-language"}:
+                merged[k] = v
+
+    unauthorized_status: Optional[int] = None
+    upstream_statuses: list[int] = []
+    network_error: Optional[str] = None
+    for path in ("/offers?limit=1", "/rides?limit=1"):
+        try:
+            r = requests.get(f"{API_HOST}{path}", headers=merged, timeout=12)
+        except requests.exceptions.RequestException as e:
+            if not network_error:
+                network_error = f"network:{type(e).__name__}"
+            continue
+
         if _http_ok(r.status_code):
-            return (True, "ok")
+            return (True, f"ok:{path}")
         if r.status_code in (401, 403):
-            return (False, f"unauthorized:{r.status_code}")
-        return (False, f"upstream:{r.status_code}")
-    except requests.exceptions.RequestException as e:
-        return (False, f"network:{type(e).__name__}")
+            unauthorized_status = r.status_code
+            continue
+        upstream_statuses.append(r.status_code)
+
+    if unauthorized_status is not None:
+        return (False, f"unauthorized:{unauthorized_status}")
+    if upstream_statuses:
+        uniq = ",".join(str(x) for x in sorted(set(upstream_statuses)))
+        return (False, f"upstream:{uniq}")
+    if network_error:
+        return (False, network_error)
+    return (False, "validation_failed")
 
 
 def mask_email(email: str | None) -> str:
