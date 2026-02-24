@@ -283,6 +283,26 @@ def _http_ok(status: int) -> bool:
     return 200 <= status < 300
 
 
+def _is_cloudfront_blocked_response(resp) -> bool:
+    try:
+        status = int(getattr(resp, "status_code", 0) or 0)
+    except Exception:
+        status = 0
+    if status != 403:
+        return False
+    try:
+        headers = getattr(resp, "headers", {}) or {}
+        server = str(headers.get("server", "")).lower()
+        x_cache = str(headers.get("x-cache", "")).lower()
+        has_cf = "cloudfront" in server or "cloudfront" in x_cache or ("x-amz-cf-id" in headers)
+        if not has_cf:
+            return False
+        body = str(getattr(resp, "text", "") or "")[:1200].lower()
+        return ("request blocked" in body) or ("request could not be satisfied" in body)
+    except Exception:
+        return False
+
+
 def validate_mobile_session(token: str, headers: Optional[dict] = None) -> tuple[bool, str]:
     """
     Quick upstream probe. Token should already be normalized
@@ -312,8 +332,13 @@ def validate_mobile_session(token: str, headers: Optional[dict] = None) -> tuple
 
         if _http_ok(r.status_code):
             return (True, f"ok:{path}")
-        if r.status_code in (401, 403):
+        if r.status_code == 403 and _is_cloudfront_blocked_response(r):
+            return (False, "blocked:cloudfront_403")
+        if r.status_code == 401:
             unauthorized_status = r.status_code
+            continue
+        if r.status_code == 403:
+            return (False, "forbidden:403")
             continue
         upstream_statuses.append(r.status_code)
 

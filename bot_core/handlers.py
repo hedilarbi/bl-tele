@@ -136,9 +136,11 @@ def _missing_refresh_parts(auth_meta: dict) -> list[str]:
 def _validation_note_hint(note: str) -> str:
     if not note:
         return "Saved but couldn't verify right now."
+    if note.startswith("blocked:cloudfront_403"):
+        return "CloudFront blocked this server IP/traffic profile. Token is likely OK; egress needs to change."
     if note.startswith("unauthorized:401"):
         return "Token looks invalid or expired."
-    if note.startswith("unauthorized:403"):
+    if note.startswith("unauthorized:403") or note.startswith("forbidden:403"):
         return "Token seems valid but access is forbidden (403) from this environment/account."
     if note.startswith("upstream:410"):
         return "HTTP 410 means the probe endpoint is gone (token may still be usable for other paths)."

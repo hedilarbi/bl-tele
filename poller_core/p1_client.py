@@ -5,7 +5,14 @@ import builtins as _builtins
 from typing import Optional, Tuple
 from datetime import datetime
 
-from .config import API_HOST, P1_POLL_TIMEOUT_S, P1_RESERVE_TIMEOUT_S, LOG_RAW_API_RESPONSES
+from .config import (
+    API_HOST,
+    P1_POLL_TIMEOUT_S,
+    P1_RESERVE_TIMEOUT_S,
+    LOG_RAW_API_RESPONSES,
+    P1_STRIP_VOLATILE_HEADERS,
+    P1_FORCE_FRESH_REQUEST_IDS,
+)
 
 
 def _quiet_print(*args, **kwargs):
@@ -45,9 +52,36 @@ def _has_header(headers: dict, name: str) -> bool:
     return any(k.lower() == lname for k in headers.keys())
 
 
+def _header_drop(headers: dict, name: str):
+    lname = name.lower()
+    for k in list(headers.keys()):
+        if str(k).lower() == lname:
+            headers.pop(k, None)
+
+
+def _is_volatile_header(name: str) -> bool:
+    lname = str(name or "").lower()
+    if lname.startswith("x-datadog-"):
+        return True
+    return lname in {
+        "x-request-id",
+        "x-correlation-id",
+        "traceparent",
+        "tracestate",
+        "baggage",
+        "content-length",
+    }
+
+
 def _merge_headers(token: str, base_headers: Optional[dict] = None) -> dict:
     if base_headers:
-        headers = {k: v for k, v in base_headers.items() if v is not None}
+        headers = {}
+        for k, v in base_headers.items():
+            if v is None:
+                continue
+            if P1_STRIP_VOLATILE_HEADERS and _is_volatile_header(k):
+                continue
+            headers[k] = v
         if not _has_header(headers, "Host"):
             headers["Host"] = API_HOST.replace("https://", "")
         if not _has_header(headers, "Accept"):
@@ -64,10 +98,6 @@ def _merge_headers(token: str, base_headers: Optional[dict] = None) -> dict:
             headers["User-Agent"] = "Chauffeur/18575 CFNetwork/3860.300.31 Darwin/25.2.0"
         if not _has_header(headers, "Connection"):
             headers["Connection"] = "keep-alive"
-        if not _has_header(headers, "X-Request-ID"):
-            headers["X-Request-ID"] = str(uuid.uuid4())
-        if not _has_header(headers, "X-Correlation-ID"):
-            headers["X-Correlation-ID"] = str(uuid.uuid4())
     else:
         headers = {
             "Host": API_HOST.replace("https://", ""),
@@ -81,6 +111,17 @@ def _merge_headers(token: str, base_headers: Optional[dict] = None) -> dict:
             "User-Agent": "Chauffeur/18575 CFNetwork/3860.300.31 Darwin/25.2.0",
             "Connection": "keep-alive",
         }
+    if P1_FORCE_FRESH_REQUEST_IDS:
+        _header_drop(headers, "X-Request-ID")
+        _header_drop(headers, "X-Correlation-ID")
+        headers["X-Request-ID"] = str(uuid.uuid4())
+        headers["X-Correlation-ID"] = str(uuid.uuid4())
+    else:
+        if not _has_header(headers, "X-Request-ID"):
+            headers["X-Request-ID"] = str(uuid.uuid4())
+        if not _has_header(headers, "X-Correlation-ID"):
+            headers["X-Correlation-ID"] = str(uuid.uuid4())
+
     headers["Authorization"] = token
     return headers
 

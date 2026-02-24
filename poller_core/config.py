@@ -30,6 +30,8 @@ P1_RESERVE_TIMEOUT_S = int(os.getenv("P1_RESERVE_TIMEOUT_S", "8"))
 P2_POLL_TIMEOUT_S = int(os.getenv("P2_POLL_TIMEOUT_S", "8"))
 P2_RESERVE_TIMEOUT_S = int(os.getenv("P2_RESERVE_TIMEOUT_S", "8"))
 P1_REFRESH_SKEW_S = int(os.getenv("P1_REFRESH_SKEW_S", "90"))
+P1_STRIP_VOLATILE_HEADERS = os.getenv("P1_STRIP_VOLATILE_HEADERS", "1") == "1"
+P1_FORCE_FRESH_REQUEST_IDS = os.getenv("P1_FORCE_FRESH_REQUEST_IDS", "1") == "1"
 
 # Toggle mock data for development (default: real polling)
 USE_MOCK_P1 = False    
