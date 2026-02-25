@@ -166,3 +166,51 @@ def get_bot_admin_active(bot_id: str) -> bool:
     row = c.fetchone()
     conn.close()
     return bool(row[0]) if row and row[0] is not None else False
+
+
+def delete_bot_instance(bot_id: str, allow_admin: bool = False) -> tuple[bool, str]:
+    bid = (bot_id or "").strip()
+    if not bid:
+        return False, "bot_not_found"
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT role FROM bot_instances WHERE bot_id = ? LIMIT 1", (bid,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False, "bot_not_found"
+
+    role = (row[0] or "user").strip().lower()
+    if role == "admin" and not allow_admin:
+        conn.close()
+        return False, "cannot_delete_admin"
+
+    try:
+        c.execute("BEGIN")
+        # user-linked data
+        c.execute("DELETE FROM booked_slots WHERE bot_id = ?", (bid,))
+        c.execute("DELETE FROM blocked_days WHERE bot_id = ?", (bid,))
+        c.execute("DELETE FROM offer_logs WHERE bot_id = ?", (bid,))
+        c.execute("DELETE FROM pinned_warnings WHERE bot_id = ?", (bid,))
+        c.execute("DELETE FROM user_custom_filters WHERE bot_id = ?", (bid,))
+        c.execute("DELETE FROM endtime_formulas WHERE bot_id = ?", (bid,))
+        # optional/legacy tables
+        try:
+            c.execute("DELETE FROM offer_messages WHERE bot_id = ?", (bid,))
+        except Exception:
+            pass
+        try:
+            c.execute("DELETE FROM user_endtime_formulas WHERE bot_id = ?", (bid,))
+        except Exception:
+            pass
+        c.execute("DELETE FROM users WHERE bot_id = ?", (bid,))
+        c.execute("DELETE FROM bot_instances WHERE bot_id = ?", (bid,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        return False, "delete_failed"
+
+    conn.close()
+    return True, "ok"

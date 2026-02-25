@@ -7,6 +7,7 @@ from .config import ADMIN_BOT_TOKEN, ADMIN_BOT_ID, ADMIN_BOT_NAME, BOT_REFRESH_I
 from .handlers import start, set_token, open_settings_cmd, handle_buttons, handle_text, _tap_all
 from .admin import (
     admin_add_bot,
+    admin_delete_bot,
     admin_list_bots,
     admin_list_users,
     admin_bot_info,
@@ -33,6 +34,7 @@ def _build_application(bot_row: dict):
     if app.bot_data["role"] == "admin":
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("addbot", admin_add_bot))
+        app.add_handler(CommandHandler("deletebot", admin_delete_bot))
         app.add_handler(CommandHandler("listbots", admin_list_bots))
         app.add_handler(CommandHandler("botinfo", admin_bot_info))
         app.add_handler(CommandHandler("bot", admin_bot_info))

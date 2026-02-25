@@ -59,3 +59,5 @@ MAX_RIDES_SHOWN = int(os.getenv("MAX_RIDES_SHOWN", "20"))
 
 # Athena token/etag helpers
 ATHENA_RELOGIN_SKEW_S = int(os.getenv("ATHENA_RELOGIN_SKEW_S", "3600"))
+OFFER_MEMORY_DEDUPE = os.getenv("OFFER_MEMORY_DEDUPE", "0") == "1"
+ATHENA_USE_OFFERS_ETAG = os.getenv("ATHENA_USE_OFFERS_ETAG", "0") == "1"

@@ -14,6 +14,7 @@ from .storage import get_active
 from db import (
     get_bot_instance,
     add_bot_instance,
+    delete_bot_instance,
     list_bot_instances,
     get_all_users,
     get_user_row,
@@ -99,6 +100,71 @@ async def admin_add_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Bot added: <code>{bot_id_disp}</code> ({bot_name_disp}) tz={tz_disp_safe}",
         parse_mode="HTML",
     )
+
+
+def _resolve_delete_target(raw: str) -> tuple[Optional[str], str]:
+    q = (raw or "").strip()
+    if not q:
+        return None, "Usage: /deletebot <bot_id|name>"
+    bots = list_bot_instances()
+    if not bots:
+        return None, "No bots registered."
+
+    ql = q.lower()
+    exact_id = [b for b in bots if str(b.get("bot_id") or "").lower() == ql]
+    if len(exact_id) == 1:
+        return str(exact_id[0].get("bot_id")), ""
+
+    exact_name = [b for b in bots if str(b.get("bot_name") or "").lower() == ql]
+    if len(exact_name) == 1:
+        return str(exact_name[0].get("bot_id")), ""
+    if len(exact_name) > 1:
+        ids = ", ".join([str(b.get("bot_id")) for b in exact_name[:10]])
+        return None, f"Ambiguous name. Matching bot_ids: {ids}"
+
+    partial = [
+        b
+        for b in bots
+        if ql in str(b.get("bot_id") or "").lower() or ql in str(b.get("bot_name") or "").lower()
+    ]
+    if len(partial) == 1:
+        return str(partial[0].get("bot_id")), ""
+    if len(partial) > 1:
+        ids = ", ".join([str(b.get("bot_id")) for b in partial[:10]])
+        return None, f"Ambiguous target. Matching bot_ids: {ids}"
+    return None, "Bot not found."
+
+
+async def admin_delete_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _admin_owner_ok(update, context):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /deletebot <bot_id|name>")
+        return
+
+    target = " ".join(context.args).strip()
+    bot_id, err = _resolve_delete_target(target)
+    if not bot_id:
+        await update.message.reply_text(err or "Bot not found.")
+        return
+
+    ok, reason = delete_bot_instance(bot_id)
+    if not ok:
+        if reason == "cannot_delete_admin":
+            await update.message.reply_text("⛔ Cannot delete the admin bot.")
+            return
+        if reason == "bot_not_found":
+            await update.message.reply_text("Bot not found.")
+            return
+        await update.message.reply_text("❌ Failed to delete bot.")
+        return
+
+    if context.user_data.get("admin_target_bot_id") == bot_id:
+        context.user_data.pop("admin_target_bot_id", None)
+        context.user_data.pop("admin_target_user_id", None)
+
+    await update.message.reply_text(f"✅ Bot deleted: <code>{html.escape(bot_id)}</code>", parse_mode="HTML")
 
 
 async def admin_list_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):

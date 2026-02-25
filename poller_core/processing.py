@@ -18,6 +18,7 @@ from .config import (
     P1_RESERVE_TIMEOUT_S,
     P2_RESERVE_TIMEOUT_S,
     FAST_ACCEPT_MODE,
+    OFFER_MEMORY_DEDUPE,
 )
 from .utils import (
     _esc,
@@ -363,8 +364,11 @@ def _process_offers_for_user(
         oid = offer.get("id")
         platform = offer.get("_platform", "p1")
 
-        # Skip already processed (in-mem)
-        if oid in accepted_per_user[bot_id][telegram_id] or oid in rejected_per_user[bot_id][telegram_id][platform]:
+        # Optional memory dedupe; disabled in race mode to avoid missing reused offer ids.
+        if OFFER_MEMORY_DEDUPE and (
+            oid in accepted_per_user[bot_id][telegram_id]
+            or oid in rejected_per_user[bot_id][telegram_id][platform]
+        ):
             print(f"[{datetime.now()}] ⏭️ Skipping offer {oid} for user {telegram_id} – already processed (memory).")
             continue
 
@@ -643,7 +647,8 @@ def _process_offers_for_user(
             log_offer_decision(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
             if FAST_ACCEPT_MODE:
                 # In race mode, skip heavy Telegram work for rejected offers.
-                rejected_per_user[bot_id][telegram_id][platform].add(oid)
+                if OFFER_MEMORY_DEDUPE:
+                    rejected_per_user[bot_id][telegram_id][platform].add(oid)
                 continue
             full_text = _build_user_message(
                 offer,
@@ -669,7 +674,8 @@ def _process_offers_for_user(
                 platform,
                 reply_markup=kb,
             )
-            rejected_per_user[bot_id][telegram_id][platform].add(oid)
+            if OFFER_MEMORY_DEDUPE:
+                rejected_per_user[bot_id][telegram_id][platform].add(oid)
             continue
 
         # Accept (either all filters OK or overridden by custom filter)
@@ -826,12 +832,13 @@ def _process_offers_for_user(
             platform,
             reply_markup=kb,
         )
-        if final_status == "accepted":
-            accepted_per_user[bot_id][telegram_id].add(oid)
-        else:
-            # Keep a short-lived per-platform backoff, but do not globally lock
-            # the offer id as "accepted" after a failed reserve.
-            rejected_per_user[bot_id][telegram_id][platform].add(oid)
+        if OFFER_MEMORY_DEDUPE:
+            if final_status == "accepted":
+                accepted_per_user[bot_id][telegram_id].add(oid)
+            else:
+                # Keep a short-lived per-platform backoff, but do not globally lock
+                # the offer id as "accepted" after a failed reserve.
+                rejected_per_user[bot_id][telegram_id][platform].add(oid)
 
         try:
             new_end_dt = parser.isoparse(offer_to_log["rides"][0].get("endsAt")) if offer_to_log["rides"][0].get("endsAt") else None

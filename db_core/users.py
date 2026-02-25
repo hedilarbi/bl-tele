@@ -94,7 +94,7 @@ def update_token(
 
     if auth_meta is not None:
         try:
-            auth_json = json.dumps(auth_meta, ensure_ascii=True)
+            auth_json = json.dumps(auth_meta, ensure_ascii=True) if auth_meta else None
         except Exception:
             auth_json = None
         updates.append("mobile_auth_json = ?")

@@ -21,6 +21,8 @@ from .config import (
     RIDES_REFRESH_INTERVAL_S,
     LOG_OFFERS_PAYLOAD,
     MAX_LOGGED_OFFERS,
+    OFFER_MEMORY_DEDUPE,
+    ATHENA_USE_OFFERS_ETAG,
 )
 from .state import (
     maybe_reset_inmem_caches,
@@ -543,7 +545,7 @@ def poll_user(user):
         tok = portal_token
         if not tok:
             return [], tok
-        etag = get_offers_etag(bot_id, telegram_id)
+        etag = get_offers_etag(bot_id, telegram_id) if ATHENA_USE_OFFERS_ETAG else None
         status_code, payload, new_etag = _athena_get_offers(tok, etag=etag)
 
         if ATHENA_PRINT_DEBUG:
@@ -561,7 +563,7 @@ def poll_user(user):
 
         offers: List[dict] = []
         if status_code == 200 and isinstance(payload, dict):
-            if new_etag:
+            if ATHENA_USE_OFFERS_ETAG and new_etag:
                 set_offers_etag(bot_id, telegram_id, new_etag)
             included = payload.get("included") or []
             for raw in (payload.get("data") or []):
@@ -661,7 +663,8 @@ def run():
     inflight: Dict[Tuple[str, int], tuple] = {}
 
     while True:
-        maybe_reset_inmem_caches()
+        if OFFER_MEMORY_DEDUPE:
+            maybe_reset_inmem_caches()
         _poll_log("🔄 Starting polling cycle")
         users = get_all_users_with_bot_admin_active()
         now_ts = time.time()

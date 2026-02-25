@@ -28,6 +28,7 @@ from db_core.users import (
 )
 from db_core.bots import (
     add_bot_instance,
+    delete_bot_instance,
     list_bot_instances,
     get_bot_instance,
     get_bot_token,

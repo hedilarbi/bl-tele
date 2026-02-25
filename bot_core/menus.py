@@ -126,7 +126,7 @@ def build_mobile_sessions_menu(bot_id: str, user_id: int):
         "📱 *Mobile Sessions*\n\n"
         f"Status: {dot} `{token_status}`\n"
         f"Token:\n`{token_disp}`\n\n"
-        "Use *Add/Update token* to paste your current mobile session token."
+        "Use *Add/Update token* to paste a full HTTP dump (Authorization + headers)."
     )
     keyboard = [
         [InlineKeyboardButton("➕ Add/Update token", callback_data="add_mobile_session")],

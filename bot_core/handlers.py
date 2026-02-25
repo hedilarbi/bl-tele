@@ -39,8 +39,6 @@ from .state import user_waiting_input, adding_slot_step, work_schedule_state, _c
 from .storage import get_active, set_active, get_filters
 from .utils import (
     parse_mobile_session_dump,
-    parse_mobile_auth_meta,
-    parse_mobile_auth_material,
     validate_mobile_session,
     validate_datetime,
     validate_day,
@@ -63,9 +61,6 @@ from db import (
     set_notification,
     get_offer_message,
     get_bot_instance,
-    get_mobile_auth,
-    get_mobile_headers,
-    get_user_row,
 )
 
 
@@ -100,37 +95,8 @@ def unpin_warning_if_any(bot_id: Optional[str], telegram_id: int, kind: str, bot
     clear_pinned_warning(bot_id, telegram_id, kind)
 
 
-def _merge_auth_meta(existing: Optional[dict], patch: Optional[dict]) -> dict:
-    out = dict(existing or {})
-    p = dict(patch or {})
-    if p.get("refresh_token"):
-        out["refresh_token"] = str(p["refresh_token"]).strip()
-    if p.get("client_id"):
-        out["client_id"] = str(p["client_id"]).strip()
-    p_oh = p.get("oauth_headers")
-    if isinstance(p_oh, dict):
-        merged_oh = dict(out.get("oauth_headers") or {})
-        for k, v in p_oh.items():
-            if k and v is not None:
-                merged_oh[k] = v
-        if merged_oh:
-            out["oauth_headers"] = merged_oh
-    return out
-
-
 def _is_bearer_like(token: Optional[str]) -> bool:
     return bool(token and isinstance(token, str) and token.lower().startswith("bearer "))
-
-
-def _missing_refresh_parts(auth_meta: dict) -> list[str]:
-    missing = []
-    if not (auth_meta or {}).get("refresh_token"):
-        missing.append("refresh_token")
-    if not (auth_meta or {}).get("client_id"):
-        missing.append("client_id")
-    if not isinstance((auth_meta or {}).get("oauth_headers"), dict) or not (auth_meta or {}).get("oauth_headers"):
-        missing.append("oauth_headers")
-    return missing
 
 
 def _validation_note_hint(note: str) -> str:
@@ -157,80 +123,37 @@ def _save_mobile_input_for_user(
     raw: str,
     bot_token: Optional[str] = None,
 ) -> str:
-    row = get_user_row(bot_id, user_id) or {}
-    existing_token = (row.get("token") or "").strip()
-    existing_status = (row.get("token_status") or "unknown").strip() or "unknown"
-    existing_headers = get_mobile_headers(bot_id, user_id)
-    existing_auth = get_mobile_auth(bot_id, user_id) or {}
-
     token_from_dump, headers_from_dump = parse_mobile_session_dump(raw)
-    auth_meta_from_dump = parse_mobile_auth_meta(raw, headers_from_dump if headers_from_dump else None)
-    material = parse_mobile_auth_material(raw)
-
-    token_candidate = ""
-    if _is_bearer_like(token_from_dump):
-        token_candidate = token_from_dump.strip()
-    elif _is_bearer_like(material.get("token")):
-        token_candidate = material.get("token", "").strip()
-
-    auth_patch = {}
-    if material.get("refresh_token"):
-        auth_patch["refresh_token"] = material["refresh_token"]
-    if material.get("client_id"):
-        auth_patch["client_id"] = material["client_id"]
-    auth_patch = _merge_auth_meta(auth_patch, auth_meta_from_dump)
-    merged_auth = _merge_auth_meta(existing_auth, auth_patch)
-
-    # Only replace mobile_headers when this input also includes a bearer token
-    # (oauth-only dumps should not overwrite P1 request headers).
-    final_headers = existing_headers
-    if token_candidate and headers_from_dump:
-        final_headers = headers_from_dump
-
-    final_token = token_candidate or existing_token
-
-    changed = (
-        bool(token_candidate)
-        or bool(headers_from_dump and token_candidate)
-        or (json.dumps(merged_auth, sort_keys=True, ensure_ascii=True) != json.dumps(existing_auth or {}, sort_keys=True, ensure_ascii=True))
-    )
-    if not changed:
-        return "❌ Nothing usable found. Send full dump, OAuth JSON, or refresh_token/client_id."
+    token_candidate = token_from_dump.strip() if _is_bearer_like(token_from_dump) else ""
+    if not token_candidate or not headers_from_dump:
+        return "❌ Invalid input. Send a full HTTP dump including Authorization + headers."
 
     update_token(
         bot_id,
         user_id,
-        final_token,
-        headers=final_headers,
-        auth_meta=merged_auth if merged_auth else None,
+        token_candidate,
+        headers=headers_from_dump,
+        auth_meta={},  # clear legacy oauth refresh traces
     )
 
-    if token_candidate:
-        ok, note = validate_mobile_session(final_token, final_headers if final_headers else None)
-        if ok:
-            next_status = "valid"
-        elif note.startswith("unauthorized:401"):
-            next_status = "expired"
-        else:
-            next_status = "unknown"
-        set_token_status(
-            bot_id,
-            user_id,
-            next_status,
-        )
-        if ok:
-            unpin_warning_if_any(bot_id, user_id, "no_token", bot_token)
-            unpin_warning_if_any(bot_id, user_id, "expired", bot_token)
-            return "✅ Mobile token saved and validated."
-        hint = _validation_note_hint(note)
-        return f"⚠️ Token saved, validation not OK yet ({note}). {hint}"
-
-    # Auth material only: keep previous status until poller refreshes successfully.
-    set_token_status(bot_id, user_id, existing_status)
-    missing = _missing_refresh_parts(merged_auth)
-    if missing:
-        return f"✅ Partial refresh material saved. Missing: {', '.join(missing)}."
-    return "✅ OAuth refresh material saved. Poller will auto-renew access token."
+    ok, note = validate_mobile_session(token_candidate, headers_from_dump)
+    if ok:
+        next_status = "valid"
+    elif note.startswith("unauthorized:401"):
+        next_status = "expired"
+    else:
+        next_status = "unknown"
+    set_token_status(
+        bot_id,
+        user_id,
+        next_status,
+    )
+    if ok:
+        unpin_warning_if_any(bot_id, user_id, "no_token", bot_token)
+        unpin_warning_if_any(bot_id, user_id, "expired", bot_token)
+        return "✅ Mobile token + headers saved and validated."
+    hint = _validation_note_hint(note)
+    return f"⚠️ Token saved, validation not OK yet ({note}). {hint}"
 
 
 async def open_settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -259,6 +182,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🛠️ <b>Admin Bot</b>\n\n"
             "Commands:\n"
             "• /addbot <code>&lt;token&gt; [name] [timezone]</code>\n"
+            "• /deletebot <code>&lt;bot_id|name&gt;</code>\n"
             "• /listbots\n"
             "• /botinfo <code>&lt;bot_id&gt;</code>\n"
             "• /listusers\n",
@@ -303,7 +227,7 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw:
         await update.message.reply_text(
             "Usage: /token <full HTTP dump>\n"
-            "Accepted: full HTTP dump, OAuth JSON, or refresh_token/client_id pieces."
+            "Accepted: full HTTP dump only (with Authorization + headers)."
         )
         return
     bot_token = context.bot.token if context and context.bot else None
@@ -386,11 +310,11 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "add_mobile_session":
         user_waiting_input[state_key] = "set_token"
         await query.edit_message_text(
-            "🔑 *Send mobile auth input*\n\n"
-            "Accepted:\n"
-            "• full HTTP dump (/rides, /offers, /oauth/token)\n"
-            "• OAuth JSON\n"
-            "• pieces: `refresh_token=...`, `client_id=...`, then headers block",
+            "🔑 *Send full HTTP dump*\n\n"
+            "Accepted only:\n"
+            "• full HTTP request dump with `Authorization: Bearer ...`\n"
+            "• includes all request headers\n\n"
+            "Not accepted: OAuth JSON, refresh_token, client_id.",
             parse_mode="Markdown",
         )
         return
