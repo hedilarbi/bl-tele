@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 
 import requests
 
-from .config import MOBILE_AUTH_BASE, MOBILE_CLIENT_ID, P1_POLL_TIMEOUT_S, P1_REFRESH_SKEW_S
+from .config import MOBILE_AUTH_BASE, MOBILE_CLIENT_ID, P1_POLL_TIMEOUT_S, P1_REFRESH_SKEW_S, HTTP_POOL_SIZE
 from db import get_mobile_auth, update_token, set_token_status
 
 _thread_local = threading.local()
@@ -20,6 +20,14 @@ def _get_session() -> requests.Session:
     sess = getattr(_thread_local, "session", None)
     if sess is None:
         sess = requests.Session()
+        sess.trust_env = False
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=HTTP_POOL_SIZE,
+            pool_maxsize=HTTP_POOL_SIZE,
+            max_retries=0,
+        )
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
         _thread_local.session = sess
     return sess
 

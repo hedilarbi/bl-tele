@@ -16,6 +16,7 @@ PORTAL_PAGE_SIZE = 50
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_S", "0.5"))
 MAX_WORKERS = max(1, int(os.getenv("MAX_WORKERS", "10")))
 RIDES_REFRESH_INTERVAL_S = int(os.getenv("RIDES_REFRESH_INTERVAL_S", "86400"))
+HTTP_POOL_SIZE = max(4, int(os.getenv("HTTP_POOL_SIZE", "32")))
 
 # Filter cache (seconds)
 FILTERS_CACHE_TTL_S = int(os.getenv("FILTERS_CACHE_TTL_S", "15"))
@@ -37,9 +38,12 @@ P1_FORCE_FRESH_REQUEST_IDS = os.getenv("P1_FORCE_FRESH_REQUEST_IDS", "1") == "1"
 USE_MOCK_P1 = False    
 USE_MOCK_P2 = False     
 ENABLE_P1 = True
+ENABLE_P2 = os.getenv("ENABLE_P2", "1") == "1"
 ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when available)
 # When enabled, accepted offers will be actually reserved via API calls (P1/P2).
 AUTO_RESERVE_ENABLED = True
+P1_PRIORITY_SKIP_P2_WAIT = os.getenv("P1_PRIORITY_SKIP_P2_WAIT", "1") == "1"
+TRACE_USER_POLL = os.getenv("TRACE_USER_POLL", "0") == "1"
 
 # Diagnostics
 DEBUG_PRINT_OFFERS = os.getenv("DEBUG_PRINT_OFFERS", "0") == "1"

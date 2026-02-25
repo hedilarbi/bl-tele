@@ -172,6 +172,8 @@ def _reserve_failure_human_reason(status_code: Optional[int], body: Any) -> str:
         return "Offer deja prise par un autre chauffeur."
     if status_code == 409:
         return "Conflit 409: offre deja prise."
+    if status_code == 410:
+        return "Offre expiree/supprimee (410): elle n'est plus reservable."
     if status_code == 422:
         return "Offre devenue invalide (422)."
     if status_code in (401, 403):

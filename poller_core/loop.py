@@ -12,6 +12,7 @@ from .config import (
     USE_MOCK_P1,
     USE_MOCK_P2,
     ENABLE_P1,
+    ENABLE_P2,
     ATHENA_PRINT_DEBUG,
     POLL_INTERVAL,
     BURST_POLL_INTERVAL_S,
@@ -23,6 +24,8 @@ from .config import (
     MAX_LOGGED_OFFERS,
     OFFER_MEMORY_DEDUPE,
     ATHENA_USE_OFFERS_ETAG,
+    P1_PRIORITY_SKIP_P2_WAIT,
+    TRACE_USER_POLL,
 )
 from .state import (
     maybe_reset_inmem_caches,
@@ -158,7 +161,8 @@ def poll_user(user):
     bot_id, telegram_id, token, filters_json, active, bot_admin_active = user
 
     tz_name = get_user_timezone(bot_id, telegram_id) or "UTC"
-    _poll_log(f"🔍 Polling {bot_id}/{telegram_id} (active={active}, admin_active={bot_admin_active})")
+    if TRACE_USER_POLL:
+        _poll_log(f"🔍 Polling {bot_id}/{telegram_id} (active={active}, admin_active={bot_admin_active})")
     mobile_headers = get_mobile_headers(bot_id, telegram_id)
 
     if not bot_admin_active:
@@ -206,8 +210,6 @@ def poll_user(user):
     email, password = _read_portal_creds(bot_id, telegram_id)
     has_portal_creds = bool(email and password)
     portal_token = None
-    if email and password:
-        portal_token = _ensure_portal_token(bot_id, telegram_id, email, password)
 
     poll_real_orders = ALWAYS_POLL_REAL_ORDERS and not (USE_MOCK_P1 and USE_MOCK_P2)
 
@@ -231,6 +233,9 @@ def poll_user(user):
     _refresh_p1_token(force=False, trigger="poll_cycle_start")
 
     def _fetch_p2_rides():
+        nonlocal portal_token
+        if not portal_token and has_portal_creds:
+            portal_token = _ensure_portal_token(bot_id, telegram_id, email, password)
         if not portal_token:
             return [], False
         status_code, payload, _ = _athena_get_rides(portal_token)
@@ -542,7 +547,13 @@ def poll_user(user):
                 offers_p2.append(mapped)
 
     def _fetch_p2_offers_real():
+        nonlocal portal_token
+        if not ENABLE_P2:
+            return [], portal_token
         tok = portal_token
+        if not tok and has_portal_creds:
+            tok = _ensure_portal_token(bot_id, telegram_id, email, password)
+            portal_token = tok
         if not tok:
             return [], tok
         etag = get_offers_etag(bot_id, telegram_id) if ATHENA_USE_OFFERS_ETAG else None
@@ -576,20 +587,25 @@ def poll_user(user):
         return offers, tok
 
     if not USE_MOCK_P1 or not USE_MOCK_P2:
-        if ENABLE_P1 and not USE_MOCK_P1 and not USE_MOCK_P2:
+        if ENABLE_P1 and ENABLE_P2 and not USE_MOCK_P1 and not USE_MOCK_P2:
             tasks = {
                 "p1": _io_executor.submit(_fetch_p1_offers_real),
                 "p2": _io_executor.submit(_fetch_p2_offers_real),
             }
-            for name, fut in tasks.items():
-                if name == "p1":
-                    offers_p1 = fut.result()
-                else:
-                    offers_p2, portal_token = fut.result()
+            offers_p1 = tasks["p1"].result()
+            if P1_PRIORITY_SKIP_P2_WAIT and offers_p1:
+                if ATHENA_PRINT_DEBUG:
+                    _poll_log(
+                        f"⚡ P1 priority: skipping P2 wait for {bot_id}/{telegram_id} "
+                        f"(offers_p1={len(offers_p1)})"
+                    )
+                tasks["p2"].cancel()
+            else:
+                offers_p2, portal_token = tasks["p2"].result()
         else:
             if ENABLE_P1 and not USE_MOCK_P1:
                 offers_p1 = _fetch_p1_offers_real()
-            if not USE_MOCK_P2:
+            if ENABLE_P2 and not USE_MOCK_P2:
                 offers_p2, portal_token = _fetch_p2_offers_real()
 
     # ---------- Combine and process ----------

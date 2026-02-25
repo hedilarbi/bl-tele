@@ -12,6 +12,7 @@ from .config import (
     LOG_RAW_API_RESPONSES,
     P1_STRIP_VOLATILE_HEADERS,
     P1_FORCE_FRESH_REQUEST_IDS,
+    HTTP_POOL_SIZE,
 )
 
 
@@ -33,6 +34,14 @@ def _get_session() -> requests.Session:
     sess = getattr(_thread_local, "session", None)
     if sess is None:
         sess = requests.Session()
+        sess.trust_env = False
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=HTTP_POOL_SIZE,
+            pool_maxsize=HTTP_POOL_SIZE,
+            max_retries=0,
+        )
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
         _thread_local.session = sess
     return sess
 
