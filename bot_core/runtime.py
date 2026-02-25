@@ -61,6 +61,22 @@ async def _start_application(app):
     await app.updater.start_polling()
 
 
+async def _stop_application(app):
+    try:
+        if app.updater:
+            await app.updater.stop()
+    except Exception:
+        pass
+    try:
+        await app.stop()
+    except Exception:
+        pass
+    try:
+        await app.shutdown()
+    except Exception:
+        pass
+
+
 async def _run_manager():
     init_db()
     _ensure_admin_bot()
@@ -84,7 +100,16 @@ async def _run_manager():
 
     while True:
         await asyncio.sleep(BOT_REFRESH_INTERVAL_S)
-        for row in list_bot_instances():
+        rows = list_bot_instances()
+        row_by_id = {row["bot_id"]: row for row in rows}
+
+        for bot_id in list(apps.keys()):
+            if bot_id not in row_by_id:
+                app = apps.pop(bot_id)
+                await _stop_application(app)
+                print(f"🛑 Bot stopped: {bot_id} (removed from DB)")
+
+        for row in rows:
             if row["bot_id"] not in apps:
                 await _start_bot_row(row)
 
