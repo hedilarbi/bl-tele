@@ -129,6 +129,7 @@ def maybe_send_message(
     text: str,
     platform: str,
     reply_markup: Optional[dict] = None,
+    force_notify: bool = False,
 ):
     """
     kind: 'accepted' | 'not_accepted' | 'rejected'
@@ -136,9 +137,10 @@ def maybe_send_message(
     Sends Telegram message only if user's notification preference for 'kind' is enabled.
     (You can later extend prefs to be per-platform if needed.)
     """
-    prefs = get_notifications(bot_id, telegram_id)
-    if not prefs.get(kind, True):
-        return None
+    if not force_notify:
+        prefs = get_notifications(bot_id, telegram_id)
+        if not prefs.get(kind, True):
+            return None
     # simple platform-aware header injection (optional)
     icon = _platform_icon(platform)
     text = f"{icon} {text}"
