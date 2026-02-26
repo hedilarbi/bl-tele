@@ -18,6 +18,7 @@ from .config import (
     P1_RESERVE_TIMEOUT_S,
     P2_RESERVE_TIMEOUT_S,
     FAST_ACCEPT_MODE,
+    FAST_ACCEPT_NOTIFY_REJECTED,
     OFFER_MEMORY_DEDUPE,
 )
 from .utils import (
@@ -356,6 +357,11 @@ def _process_offers_for_user(
     p2_token: Optional[str] = None,
 ):
     user_cfilters = _get_enabled_filter_slugs(bot_id, telegram_id)
+    pending_notifications: List[Tuple[str, str, str, Optional[dict]]] = []
+
+    def _queue_notification(kind: str, text: str, platform_name: str, reply_markup: Optional[dict] = None):
+        pending_notifications.append((kind, text, platform_name, reply_markup))
+
     if user_cfilters:
         slugs = ", ".join(sorted(user_cfilters.keys()))
         print(f"[{datetime.now()}] 🧩 Custom filters for {bot_id}/{telegram_id}: {slugs}")
@@ -648,7 +654,12 @@ def _process_offers_for_user(
             print(f"[{datetime.now()}] ⛔ Rejected {oid} – {base_reason or 'filtres non respectés'}")
             log_offer_decision(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
             if FAST_ACCEPT_MODE:
-                # In race mode, skip heavy Telegram work for rejected offers.
+                # In race mode, skip heavy work; optionally keep a lightweight reject notification.
+                if FAST_ACCEPT_NOTIFY_REJECTED:
+                    header_line = _build_offer_header_line(offer, "rejected", platform, forced_accept=False)
+                    reject_lines = _build_reject_summary_lines(filter_results)
+                    notify_text = f"{header_line}\n{reject_lines}" if reject_lines else header_line
+                    _queue_notification("rejected", notify_text, platform, reply_markup=None)
                 if OFFER_MEMORY_DEDUPE:
                     rejected_per_user[bot_id][telegram_id][platform].add(oid)
                 continue
@@ -668,14 +679,7 @@ def _process_offers_for_user(
             details_key = uuid.uuid4().hex[:16]
             save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
             kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
-            _send_notification_async(
-                bot_id,
-                telegram_id,
-                "rejected",
-                notify_text,
-                platform,
-                reply_markup=kb,
-            )
+            _queue_notification("rejected", notify_text, platform, reply_markup=kb)
             if OFFER_MEMORY_DEDUPE:
                 rejected_per_user[bot_id][telegram_id][platform].add(oid)
             continue
@@ -826,14 +830,7 @@ def _process_offers_for_user(
         details_key = uuid.uuid4().hex[:16]
         save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
         kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
-        _send_notification_async(
-            bot_id,
-            telegram_id,
-            final_status,
-            notify_line,
-            platform,
-            reply_markup=kb,
-        )
+        _queue_notification(final_status, notify_line, platform, reply_markup=kb)
         if OFFER_MEMORY_DEDUPE:
             if final_status == "accepted":
                 accepted_per_user[bot_id][telegram_id].add(oid)
@@ -847,3 +844,13 @@ def _process_offers_for_user(
         except Exception:
             new_end_dt = None
         accepted_intervals.append((pickup, new_end_dt))
+
+    for kind, text, platform_name, reply_markup in pending_notifications:
+        _send_notification_async(
+            bot_id,
+            telegram_id,
+            kind,
+            text,
+            platform_name,
+            reply_markup=reply_markup,
+        )
