@@ -40,7 +40,14 @@ from .filters import (
     _find_conflict,
 )
 from .notify import maybe_send_message, _platform_icon
-from .state import accepted_per_user, rejected_per_user, invalidate_rides_cache, set_rides_cache
+from .state import (
+    accepted_per_user,
+    rejected_per_user,
+    invalidate_rides_cache,
+    set_rides_cache,
+    is_recent_not_valid,
+    mark_not_valid_cached,
+)
 from .p1_client import reserve_offer_p1, get_rides_p1
 from .p1_auth import maybe_refresh_p1_session
 from .p2_client import reserve_offer_p2, _athena_get_rides, _filter_rides_by_bl_uuid
@@ -357,6 +364,7 @@ def _process_offers_for_user(
     p1_token: Optional[str] = None,
     p1_headers: Optional[dict] = None,
     p2_token: Optional[str] = None,
+    cache_version: int = 0,
 ):
     user_cfilters = _get_enabled_filter_slugs(bot_id, telegram_id)
     pending_notifications: List[Tuple[str, str, str, Optional[dict], bool]] = []
@@ -379,6 +387,9 @@ def _process_offers_for_user(
     for offer in offers:
         oid = offer.get("id")
         platform = offer.get("_platform", "p1")
+        if oid and is_recent_not_valid(bot_id, telegram_id, platform, str(oid), cache_version=cache_version):
+            print(f"[{datetime.now()}] ⏭️ Skipping recent not-valid offer {oid} for user {telegram_id} (cached 1m).")
+            continue
 
         # Optional memory dedupe; disabled in race mode to avoid missing reused offer ids.
         if OFFER_MEMORY_DEDUPE and (
@@ -660,17 +671,38 @@ def _process_offers_for_user(
 
         if is_rejected:
             print(f"[{datetime.now()}] ⛔ Rejected {oid} – {base_reason or 'filtres non respectés'}")
+            if oid:
+                mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
             try:
                 log_offer_decision(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
             except Exception as e:
                 _builtins.print(f"[{datetime.now()}] ⚠️ log_offer_decision failed (rejected {oid}): {type(e).__name__}: {e}")
             if FAST_ACCEPT_MODE:
-                # In race mode, skip heavy work; optionally keep a lightweight reject notification.
+                # In race mode, still keep "Show details" so users can inspect rejected offers.
                 if FAST_ACCEPT_NOTIFY_REJECTED:
                     header_line = _build_offer_header_line(offer, "rejected", platform, forced_accept=False)
                     reject_lines = _build_reject_summary_lines(filter_results)
                     notify_text = f"{header_line}\n{reject_lines}" if reject_lines else header_line
-                    _queue_notification("rejected", notify_text, platform, reply_markup=None, force_notify=True)
+                    full_text = _build_user_message(
+                        offer,
+                        "rejected",
+                        None,
+                        tz_name,
+                        summary_text,
+                        filter_results=filter_results,
+                        platform=platform,
+                        forced_accept=False,
+                    )
+                    details_key = uuid.uuid4().hex[:16]
+                    try:
+                        save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
+                    except Exception as e:
+                        _builtins.print(f"[{datetime.now()}] ⚠️ save_offer_message failed (fast rejected {oid}): {type(e).__name__}: {e}")
+                        details_key = None
+                    kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
+                    if details_key is None:
+                        kb = None
+                    _queue_notification("rejected", notify_text, platform, reply_markup=kb, force_notify=True)
                 if OFFER_MEMORY_DEDUPE:
                     rejected_per_user[bot_id][telegram_id][platform].add(oid)
                 continue

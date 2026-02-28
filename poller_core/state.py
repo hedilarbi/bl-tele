@@ -27,6 +27,8 @@ _rejected_last_reset = datetime.now(timezone.utc)
 
 _rides_cache: Dict[Tuple[str, int], Dict[str, object]] = {}
 _user_runtime_cache: Dict[Tuple[str, int], Dict[str, object]] = {}
+_recent_not_valid_cache: Dict[Tuple[str, int, str, str, int], float] = {}
+_NOT_VALID_TTL_S = 60.0
 
 
 def get_rides_cache(bot_id: str, telegram_id: int):
@@ -87,6 +89,49 @@ def set_user_runtime_cache(bot_id: str, telegram_id: int, cache_version: int, da
 
 def invalidate_user_runtime_cache(bot_id: str, telegram_id: int):
     _user_runtime_cache.pop((bot_id, telegram_id), None)
+
+
+def is_recent_not_valid(
+    bot_id: str,
+    telegram_id: int,
+    platform: str,
+    offer_id: str,
+    cache_version: int = 0,
+    now_ts: Optional[float] = None,
+) -> bool:
+    now = time.time() if now_ts is None else float(now_ts)
+    key = (str(bot_id), int(telegram_id), str(platform), str(offer_id), int(cache_version))
+    exp = _recent_not_valid_cache.get(key)
+    if exp is None:
+        return False
+    if now >= exp:
+        _recent_not_valid_cache.pop(key, None)
+        return False
+    return True
+
+
+def mark_not_valid_cached(
+    bot_id: str,
+    telegram_id: int,
+    platform: str,
+    offer_id: str,
+    cache_version: int = 0,
+    ttl_s: float = _NOT_VALID_TTL_S,
+    now_ts: Optional[float] = None,
+):
+    now = time.time() if now_ts is None else float(now_ts)
+    key = (str(bot_id), int(telegram_id), str(platform), str(offer_id), int(cache_version))
+    _recent_not_valid_cache[key] = now + float(ttl_s)
+    # Opportunistic cleanup to avoid unbounded growth
+    if len(_recent_not_valid_cache) > 20000:
+        cleanup_not_valid_cache(now_ts=now)
+
+
+def cleanup_not_valid_cache(now_ts: Optional[float] = None):
+    now = time.time() if now_ts is None else float(now_ts)
+    for k, exp in list(_recent_not_valid_cache.items()):
+        if now >= float(exp):
+            _recent_not_valid_cache.pop(k, None)
 
 
 def maybe_reset_inmem_caches():

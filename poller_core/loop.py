@@ -28,6 +28,7 @@ from .config import (
 )
 from .state import (
     maybe_reset_inmem_caches,
+    cleanup_not_valid_cache,
     get_rides_cache,
     set_rides_cache,
     get_offers_etag,
@@ -674,6 +675,7 @@ def poll_user(user):
         p1_token=token,
         p1_headers=mobile_headers,
         p2_token=portal_token,
+        cache_version=cache_version,
     )
 
     return f"Done with user {telegram_id}"
@@ -688,6 +690,7 @@ def run():
     inflight: Dict[Tuple[str, int], tuple] = {}
 
     while True:
+        cleanup_not_valid_cache()
         if OFFER_MEMORY_DEDUPE:
             maybe_reset_inmem_caches()
         _poll_log("🔄 Starting polling cycle")
