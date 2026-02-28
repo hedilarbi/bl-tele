@@ -81,7 +81,11 @@ def update_token(
 ):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    updates = ["token = ?", "token_status = 'unknown'"]
+    updates = [
+        "token = ?",
+        "token_status = 'unknown'",
+        "cache_version = COALESCE(cache_version, 0) + 1",
+    ]
     params = [token]
 
     if headers is not None:
@@ -182,7 +186,12 @@ def get_token_status(bot_id: str, telegram_id: int) -> str:
 def update_filters(bot_id: str, telegram_id: int, filters_json: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("UPDATE users SET filters = ? WHERE bot_id = ? AND telegram_id = ?", (filters_json, bot_id, telegram_id))
+    c.execute(
+        "UPDATE users "
+        "SET filters = ?, cache_version = COALESCE(cache_version, 0) + 1 "
+        "WHERE bot_id = ? AND telegram_id = ?",
+        (filters_json, bot_id, telegram_id),
+    )
     conn.commit()
     conn.close()
 
@@ -201,7 +210,14 @@ def get_all_users_with_bot_admin_active():
     c = conn.cursor()
     c.execute(
         """
-        SELECT u.bot_id, u.telegram_id, u.token, u.filters, u.active, COALESCE(b.admin_active, 0)
+        SELECT
+            u.bot_id,
+            u.telegram_id,
+            u.token,
+            u.filters,
+            u.active,
+            COALESCE(b.admin_active, 0),
+            COALESCE(u.cache_version, 0)
         FROM users u
         LEFT JOIN bot_instances b ON b.bot_id = u.bot_id
         WHERE COALESCE(b.role, 'user') != 'admin'
@@ -268,7 +284,9 @@ def set_active(bot_id: str, telegram_id: int, active: bool):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "UPDATE users SET active = ? WHERE bot_id = ? AND telegram_id = ?",
+        "UPDATE users "
+        "SET active = ?, cache_version = COALESCE(cache_version, 0) + 1 "
+        "WHERE bot_id = ? AND telegram_id = ?",
         (1 if active else 0, bot_id, telegram_id),
     )
     conn.commit()
@@ -287,7 +305,12 @@ def get_user_timezone(bot_id: str, telegram_id: int) -> str:
 def set_user_timezone(bot_id: str, telegram_id: int, tz: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("UPDATE users SET timezone = ? WHERE bot_id = ? AND telegram_id = ?", (tz, bot_id, telegram_id))
+    c.execute(
+        "UPDATE users "
+        "SET timezone = ?, cache_version = COALESCE(cache_version, 0) + 1 "
+        "WHERE bot_id = ? AND telegram_id = ?",
+        (tz, bot_id, telegram_id),
+    )
     conn.commit()
     conn.close()
 
@@ -339,7 +362,9 @@ def set_bl_account(bot_id: str, telegram_id: int, email: str, password: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "UPDATE users SET bl_email=?, bl_password=? WHERE bot_id=? AND telegram_id=?",
+        "UPDATE users "
+        "SET bl_email=?, bl_password=?, cache_version = COALESCE(cache_version, 0) + 1 "
+        "WHERE bot_id=? AND telegram_id=?",
         (email.strip(), password.strip(), bot_id, telegram_id),
     )
     conn.commit()
@@ -374,7 +399,12 @@ def get_bl_account_full(bot_id: str, telegram_id: int):
 def set_bl_uuid(bot_id: str, telegram_id: int, bl_uuid: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("UPDATE users SET bl_uuid = ? WHERE bot_id = ? AND telegram_id = ?", (bl_uuid, bot_id, telegram_id))
+    c.execute(
+        "UPDATE users "
+        "SET bl_uuid = ?, cache_version = COALESCE(cache_version, 0) + 1 "
+        "WHERE bot_id = ? AND telegram_id = ?",
+        (bl_uuid, bot_id, telegram_id),
+    )
     conn.commit()
     conn.close()
 

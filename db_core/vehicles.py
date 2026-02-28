@@ -38,7 +38,12 @@ def toggle_vehicle_class(bot_id: str, telegram_id: int, mode: str, vclass: str):
         return None
     current_val = current[0]
     new_val = 0 if current_val == 1 else 1
-    c.execute(f"UPDATE users SET {column} = ? WHERE bot_id = ? AND telegram_id = ?", (new_val, bot_id, telegram_id))
+    c.execute(
+        f"UPDATE users "
+        f"SET {column} = ?, cache_version = COALESCE(cache_version, 0) + 1 "
+        f"WHERE bot_id = ? AND telegram_id = ?",
+        (new_val, bot_id, telegram_id),
+    )
     conn.commit()
     conn.close()
     return new_val

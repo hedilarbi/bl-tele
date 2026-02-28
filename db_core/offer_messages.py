@@ -6,24 +6,9 @@ from .config import DB_FILE
 def save_offer_message(bot_id: str, telegram_id: int, message_key: str, header_text: str, full_text: str):
     if not message_key or not full_text:
         return
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS offer_messages (
-            bot_id      TEXT    NOT NULL,
-            telegram_id INTEGER NOT NULL,
-            offer_id    TEXT    NOT NULL,
-            full_text   TEXT    NOT NULL,
-            header_text TEXT,
-            PRIMARY KEY (bot_id, telegram_id, offer_id)
-        )
-    """
-    )
-    try:
-        c.execute("ALTER TABLE offer_messages ADD COLUMN header_text TEXT")
-    except Exception:
-        pass
+    c.execute("PRAGMA busy_timeout=5000")
     c.execute(
         """
         INSERT INTO offer_messages (bot_id, telegram_id, offer_id, full_text, header_text)

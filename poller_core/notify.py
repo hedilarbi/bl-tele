@@ -1,4 +1,5 @@
 import requests
+import time
 from typing import Optional
 from datetime import datetime
 
@@ -61,6 +62,68 @@ def _send_one(
     return r.json().get("result", {}).get("message_id")
 
 
+def _retry_after_s(resp) -> float:
+    if resp is None:
+        return 0.0
+    try:
+        h = resp.headers.get("Retry-After")
+        if h:
+            return float(h)
+    except Exception:
+        pass
+    try:
+        j = resp.json() if resp.content else {}
+        p = (j or {}).get("parameters") or {}
+        ra = p.get("retry_after")
+        if ra is not None:
+            return float(ra)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _is_html_parse_error(resp) -> bool:
+    if resp is None or int(getattr(resp, "status_code", 0) or 0) != 400:
+        return False
+    try:
+        low = (resp.text or "").lower()
+    except Exception:
+        low = ""
+    keys = (
+        "can't parse entities",
+        "cant parse entities",
+        "unsupported start tag",
+        "can't find end tag",
+        "parse entities",
+    )
+    return any(k in low for k in keys)
+
+
+def _send_one_with_retry(
+    bot_token: str,
+    chat_id: int,
+    text: str,
+    reply_markup: Optional[dict],
+    parse_mode: Optional[str],
+    retries: int = 3,
+) -> Optional[int]:
+    backoff_s = 0.4
+    for attempt in range(max(1, int(retries))):
+        try:
+            return _send_one(bot_token, chat_id, text, reply_markup, parse_mode)
+        except requests.HTTPError as e:
+            resp = getattr(e, "response", None)
+            status = int(getattr(resp, "status_code", 0) or 0)
+            retryable = status == 429 or (500 <= status < 600)
+            if retryable and attempt < (retries - 1):
+                wait_s = _retry_after_s(resp) or backoff_s
+                wait_s = min(max(wait_s, 0.2), 5.0)
+                time.sleep(wait_s)
+                backoff_s = min(backoff_s * 2.0, 5.0)
+                continue
+            raise
+
+
 def tg_send_message(
     bot_token: Optional[str],
     chat_id: int,
@@ -74,22 +137,27 @@ def tg_send_message(
     try:
         chunks = list(_split_chunks(text, 4096))
         for i, ch in enumerate(chunks):
-            mid = _send_one(bot_token, chat_id, ch, reply_markup if i == 0 else None, "HTML")
+            mid = _send_one_with_retry(bot_token, chat_id, ch, reply_markup if i == 0 else None, "HTML")
             if first_id is None:
                 first_id = mid
         return first_id
     except requests.HTTPError as e:
-        print(f"[{datetime.now()}] ⚠️ Falling back to plain text due to HTML parse error: {e}")
-        plain = _strip_html_tags(text)
-        first_id = None
-        for i, ch in enumerate(_split_chunks(plain, 4096)):
-            try:
-                mid = _send_one(bot_token, chat_id, ch, reply_markup if i == 0 else None, None)
-                if first_id is None:
-                    first_id = mid
-            except Exception as e2:
-                print(f"[{datetime.now()}] ❌ Telegram fallback send failed: {e2}")
-                return first_id
+        resp = getattr(e, "response", None)
+        status = int(getattr(resp, "status_code", 0) or 0)
+        if _is_html_parse_error(resp):
+            print(f"[{datetime.now()}] ⚠️ Falling back to plain text due to HTML parse error: {e}")
+            plain = _strip_html_tags(text)
+            first_id = None
+            for i, ch in enumerate(_split_chunks(plain, 4096)):
+                try:
+                    mid = _send_one_with_retry(bot_token, chat_id, ch, reply_markup if i == 0 else None, None)
+                    if first_id is None:
+                        first_id = mid
+                except Exception as e2:
+                    print(f"[{datetime.now()}] ❌ Telegram fallback send failed: {e2}")
+                    return first_id
+            return first_id
+        print(f"[{datetime.now()}] ❌ Telegram sendMessage HTTP error {status}: {e}")
         return first_id
     except Exception as e:
         print(f"[{datetime.now()}] ❌ Telegram sendMessage error for {chat_id}: {e}")

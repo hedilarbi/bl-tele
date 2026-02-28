@@ -660,7 +660,10 @@ def _process_offers_for_user(
 
         if is_rejected:
             print(f"[{datetime.now()}] ⛔ Rejected {oid} – {base_reason or 'filtres non respectés'}")
-            log_offer_decision(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
+            try:
+                log_offer_decision(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
+            except Exception as e:
+                _builtins.print(f"[{datetime.now()}] ⚠️ log_offer_decision failed (rejected {oid}): {type(e).__name__}: {e}")
             if FAST_ACCEPT_MODE:
                 # In race mode, skip heavy work; optionally keep a lightweight reject notification.
                 if FAST_ACCEPT_NOTIFY_REJECTED:
@@ -685,8 +688,14 @@ def _process_offers_for_user(
             reject_lines = _build_reject_summary_lines(filter_results)
             notify_text = f"{header_line}\n{reject_lines}" if reject_lines else header_line
             details_key = uuid.uuid4().hex[:16]
-            save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
+            try:
+                save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
+            except Exception as e:
+                _builtins.print(f"[{datetime.now()}] ⚠️ save_offer_message failed (rejected {oid}): {type(e).__name__}: {e}")
+                details_key = None
             kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
+            if details_key is None:
+                kb = None
             _queue_notification("rejected", notify_text, platform, reply_markup=kb, force_notify=True)
             if OFFER_MEMORY_DEDUPE:
                 rejected_per_user[bot_id][telegram_id][platform].add(oid)
@@ -814,7 +823,10 @@ def _process_offers_for_user(
             final_status = "not_accepted"
         final_reason = reserve_reason_user if final_status == "not_accepted" else None
         final_reason_for_log = reserve_reason if final_status == "not_accepted" else reason_for_log
-        log_offer_decision(bot_id, telegram_id, offer_to_log, final_status, final_reason_for_log)
+        try:
+            log_offer_decision(bot_id, telegram_id, offer_to_log, final_status, final_reason_for_log)
+        except Exception as e:
+            _builtins.print(f"[{datetime.now()}] ⚠️ log_offer_decision failed ({final_status} {oid}): {type(e).__name__}: {e}")
 
         full_text = _build_user_message(
             offer_to_log,
@@ -836,8 +848,14 @@ def _process_offers_for_user(
         if final_status == "not_accepted" and final_reason:
             notify_line = f"{header_line}\n⚠️ {_esc(final_reason)}"
         details_key = uuid.uuid4().hex[:16]
-        save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
+        try:
+            save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
+        except Exception as e:
+            _builtins.print(f"[{datetime.now()}] ⚠️ save_offer_message failed ({final_status} {oid}): {type(e).__name__}: {e}")
+            details_key = None
         kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
+        if details_key is None:
+            kb = None
         _queue_notification(
             final_status,
             notify_line,

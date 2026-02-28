@@ -94,6 +94,23 @@ def _needs_refresh(token: Optional[str]) -> bool:
     return now >= (exp - P1_REFRESH_SKEW_S)
 
 
+def is_p1_token_expired(token: Optional[str], skew_s: int = 0) -> bool:
+    tok = _normalize_bearer(token)
+    if not tok:
+        return False
+    exp = _jwt_exp_unverified(tok)
+    if exp is None:
+        return False
+    now = int(time.time())
+    try:
+        skew = int(skew_s or 0)
+    except Exception:
+        skew = 0
+    if skew < 0:
+        skew = 0
+    return now >= (exp - skew)
+
+
 def _build_oauth_headers(mobile_headers: Optional[dict], oauth_headers: Optional[dict]) -> dict:
     allowed = {
         "accept",

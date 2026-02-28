@@ -26,6 +26,7 @@ _accepted_last_reset = datetime.now(timezone.utc)
 _rejected_last_reset = datetime.now(timezone.utc)
 
 _rides_cache: Dict[Tuple[str, int], Dict[str, object]] = {}
+_user_runtime_cache: Dict[Tuple[str, int], Dict[str, object]] = {}
 
 
 def get_rides_cache(bot_id: str, telegram_id: int):
@@ -65,6 +66,27 @@ def set_rides_cache(bot_id: str, telegram_id: int, intervals: List[Tuple[datetim
 
 def invalidate_rides_cache(bot_id: str, telegram_id: int):
     _rides_cache.pop((bot_id, telegram_id), None)
+
+
+def get_user_runtime_cache(bot_id: str, telegram_id: int, cache_version: int):
+    entry = _user_runtime_cache.get((bot_id, telegram_id))
+    if not entry:
+        return None
+    if int(entry.get("cache_version", -1)) != int(cache_version):
+        return None
+    return entry.get("data")
+
+
+def set_user_runtime_cache(bot_id: str, telegram_id: int, cache_version: int, data: dict):
+    _user_runtime_cache[(bot_id, telegram_id)] = {
+        "cache_version": int(cache_version),
+        "data": data or {},
+        "ts": time.time(),
+    }
+
+
+def invalidate_user_runtime_cache(bot_id: str, telegram_id: int):
+    _user_runtime_cache.pop((bot_id, telegram_id), None)
 
 
 def maybe_reset_inmem_caches():

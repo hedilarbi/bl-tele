@@ -33,6 +33,18 @@ def _ensure_tg_user_columns(cur):
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+    try:
+        c.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    try:
+        c.execute("PRAGMA busy_timeout=5000")
+    except Exception:
+        pass
 
     # bot instances
     c.execute(
@@ -100,11 +112,16 @@ def init_db():
     for alter_sql in [
         "ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'UTC'",
         "ALTER TABLE users ADD COLUMN token_status TEXT DEFAULT 'unknown'",
+        "ALTER TABLE users ADD COLUMN cache_version INTEGER DEFAULT 0",
     ]:
         try:
             c.execute(alter_sql)
         except Exception:
             pass
+    try:
+        c.execute("UPDATE users SET cache_version = COALESCE(cache_version, 0)")
+    except Exception:
+        pass
     for alter_sql in [
         "ALTER TABLE users ADD COLUMN notify_accepted INTEGER DEFAULT 1",
         "ALTER TABLE users ADD COLUMN notify_not_accepted INTEGER DEFAULT 1",
@@ -301,6 +318,171 @@ def init_db():
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_endtime_formulas_user "
         "ON endtime_formulas(bot_id, telegram_id, priority, id)"
+    )
+
+    # Touch users.cache_version when poll-relevant linked tables change.
+    trigger_sql = [
+        # booked_slots
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_booked_slots_ai_touch_user_cache
+        AFTER INSERT ON booked_slots
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = NEW.bot_id AND telegram_id = NEW.telegram_id;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_booked_slots_au_touch_user_cache
+        AFTER UPDATE ON booked_slots
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = NEW.bot_id AND telegram_id = NEW.telegram_id;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_booked_slots_ad_touch_user_cache
+        AFTER DELETE ON booked_slots
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = OLD.bot_id AND telegram_id = OLD.telegram_id;
+        END
+        """,
+        # blocked_days
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_blocked_days_ai_touch_user_cache
+        AFTER INSERT ON blocked_days
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = NEW.bot_id AND telegram_id = NEW.telegram_id;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_blocked_days_au_touch_user_cache
+        AFTER UPDATE ON blocked_days
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = NEW.bot_id AND telegram_id = NEW.telegram_id;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_blocked_days_ad_touch_user_cache
+        AFTER DELETE ON blocked_days
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = OLD.bot_id AND telegram_id = OLD.telegram_id;
+        END
+        """,
+        # endtime_formulas
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_endtime_formulas_ai_touch_user_cache
+        AFTER INSERT ON endtime_formulas
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = NEW.bot_id AND telegram_id = NEW.telegram_id;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_endtime_formulas_au_touch_user_cache
+        AFTER UPDATE ON endtime_formulas
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = NEW.bot_id AND telegram_id = NEW.telegram_id;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_endtime_formulas_ad_touch_user_cache
+        AFTER DELETE ON endtime_formulas
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = OLD.bot_id AND telegram_id = OLD.telegram_id;
+        END
+        """,
+        # user_custom_filters assignment changes
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_user_custom_filters_ai_touch_user_cache
+        AFTER INSERT ON user_custom_filters
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = NEW.bot_id AND telegram_id = NEW.telegram_id;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_user_custom_filters_au_touch_user_cache
+        AFTER UPDATE ON user_custom_filters
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = NEW.bot_id AND telegram_id = NEW.telegram_id;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_user_custom_filters_ad_touch_user_cache
+        AFTER DELETE ON user_custom_filters
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE bot_id = OLD.bot_id AND telegram_id = OLD.telegram_id;
+        END
+        """,
+        # global custom_filters edits impact assigned users
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_custom_filters_au_touch_user_cache
+        AFTER UPDATE ON custom_filters
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE EXISTS (
+            SELECT 1
+            FROM user_custom_filters ucf
+            WHERE ucf.filter_id = NEW.id
+              AND ucf.bot_id = users.bot_id
+              AND ucf.telegram_id = users.telegram_id
+          );
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_custom_filters_ad_touch_user_cache
+        AFTER DELETE ON custom_filters
+        BEGIN
+          UPDATE users
+          SET cache_version = COALESCE(cache_version, 0) + 1
+          WHERE EXISTS (
+            SELECT 1
+            FROM user_custom_filters ucf
+            WHERE ucf.filter_id = OLD.id
+              AND ucf.bot_id = users.bot_id
+              AND ucf.telegram_id = users.telegram_id
+          );
+        END
+        """,
+    ]
+    for sql in trigger_sql:
+        try:
+            c.execute(sql)
+        except Exception:
+            pass
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS offer_messages (
+            bot_id      TEXT    NOT NULL,
+            telegram_id INTEGER NOT NULL,
+            offer_id    TEXT    NOT NULL,
+            full_text   TEXT    NOT NULL,
+            header_text TEXT,
+            PRIMARY KEY (bot_id, telegram_id, offer_id)
+        )
+    """
     )
 
     _ensure_tg_user_columns(c)

@@ -36,8 +36,9 @@ def log_offer_decision(bot_id: str, telegram_id: int, offer: dict, status: str, 
     if not flight_number:
         flight_number = rid.get("flight_number")
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
+    c.execute("PRAGMA busy_timeout=5000")
     c.execute(
         """
         INSERT INTO offer_logs (
@@ -90,7 +91,7 @@ def log_offer_decision(bot_id: str, telegram_id: int, offer: dict, status: str, 
 
 
 def get_processed_offer_ids(bot_id: str, telegram_id: int):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
     c.execute("SELECT offer_id FROM offer_logs WHERE bot_id = ? AND telegram_id = ?", (bot_id, telegram_id))
     rows = c.fetchall()
@@ -99,7 +100,7 @@ def get_processed_offer_ids(bot_id: str, telegram_id: int):
 
 
 def get_offer_logs(bot_id: str, telegram_id: int, limit: int = 10, offset: int = 0):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
     c.execute(
         """
@@ -143,7 +144,7 @@ def get_offer_logs(bot_id: str, telegram_id: int, limit: int = 10, offset: int =
 
 
 def get_offer_logs_counts(bot_id: str, telegram_id: int):
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM offer_logs WHERE bot_id = ? AND telegram_id = ?", (bot_id, telegram_id))
     total = c.fetchone()[0] or 0
@@ -176,7 +177,7 @@ def get_offer_stats(
     Aggregate stats for offers in an optional UTC time window.
     start_utc/end_utc should be 'YYYY-MM-DD HH:MM:SS' in UTC.
     """
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
     query = (
         "SELECT status, type, vehicle_class, price, currency "

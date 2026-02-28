@@ -42,7 +42,7 @@ ENABLE_P2 = os.getenv("ENABLE_P2", "1") == "1"
 ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when available)
 # When enabled, accepted offers will be actually reserved via API calls (P1/P2).
 AUTO_RESERVE_ENABLED = True
-P1_PRIORITY_SKIP_P2_WAIT = os.getenv("P1_PRIORITY_SKIP_P2_WAIT", "1") == "1"
+P1_PRIORITY_SKIP_P2_WAIT = os.getenv("P1_PRIORITY_SKIP_P2_WAIT", "0") == "1"
 TRACE_USER_POLL = os.getenv("TRACE_USER_POLL", "0") == "1"
 
 # Diagnostics

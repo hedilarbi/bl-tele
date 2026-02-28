@@ -17,7 +17,6 @@ from .config import (
     POLL_INTERVAL,
     BURST_POLL_INTERVAL_S,
     BURST_DURATION_S,
-    FILTERS_CACHE_TTL_S,
     MAX_WORKERS,
     RIDES_REFRESH_INTERVAL_S,
     LOG_OFFERS_PAYLOAD,
@@ -33,12 +32,12 @@ from .state import (
     set_rides_cache,
     get_offers_etag,
     set_offers_etag,
-    get_filters_cache,
-    set_filters_cache,
+    get_user_runtime_cache,
+    set_user_runtime_cache,
 )
 from .utils import _normalize_formulas
 from .p1_client import get_rides_p1, get_offers_p1
-from .p1_auth import maybe_refresh_p1_session
+from .p1_auth import maybe_refresh_p1_session, is_p1_token_expired
 from .p2_client import (
     _map_portal_offer,
     _athena_get_offers,
@@ -158,12 +157,11 @@ def _read_portal_creds(bot_id: str, telegram_id: int) -> Tuple[Optional[str], Op
 
 
 def poll_user(user):
-    bot_id, telegram_id, token, filters_json, active, bot_admin_active = user
-
-    tz_name = get_user_timezone(bot_id, telegram_id) or "UTC"
-    if TRACE_USER_POLL:
-        _poll_log(f"🔍 Polling {bot_id}/{telegram_id} (active={active}, admin_active={bot_admin_active})")
-    mobile_headers = get_mobile_headers(bot_id, telegram_id)
+    if len(user) >= 7:
+        bot_id, telegram_id, token, filters_json, active, bot_admin_active, cache_version = user[:7]
+    else:
+        bot_id, telegram_id, token, filters_json, active, bot_admin_active = user[:6]
+        cache_version = 0
 
     if not bot_admin_active:
         print(f"[{datetime.now()}] ⏩ Skipping inactive bot {bot_id} (admin inactive)")
@@ -172,42 +170,55 @@ def poll_user(user):
         print(f"[{datetime.now()}] ⏩ Skipping inactive user {telegram_id}")
         return
 
-    # Load filters + normalize admin formulas once
-    filters_key = None
-    cached = get_filters_cache(bot_id, telegram_id)
-    if filters_json:
-        try:
-            formulas_raw = get_endtime_formulas(bot_id, telegram_id)
-            formulas_key = json.dumps(formulas_raw, sort_keys=True, default=str)
-            filters_key = f"{filters_json}|{formulas_key}"
-        except Exception:
-            formulas_raw = get_endtime_formulas(bot_id, telegram_id)
-            formulas_key = ""
-            filters_key = filters_json
+    runtime_cached = get_user_runtime_cache(bot_id, telegram_id, cache_version)
+    if runtime_cached:
+        tz_name = runtime_cached.get("tz_name") or "UTC"
+        mobile_headers = runtime_cached.get("mobile_headers")
+        filters = runtime_cached.get("filters") or {}
+        class_state = runtime_cached.get("class_state") or {}
+        booked_slots = runtime_cached.get("booked_slots") or []
+        blocked_days = set(runtime_cached.get("blocked_days") or set())
+        bl_uuid = runtime_cached.get("bl_uuid")
+        email = runtime_cached.get("email")
+        password = runtime_cached.get("password")
     else:
+        tz_name = get_user_timezone(bot_id, telegram_id) or "UTC"
+        mobile_headers = get_mobile_headers(bot_id, telegram_id)
         formulas_raw = get_endtime_formulas(bot_id, telegram_id)
-        filters_key = "{}"
-
-    if (
-        cached
-        and cached.get("key") == filters_key
-        and (time.time() - float(cached.get("ts") or 0)) < FILTERS_CACHE_TTL_S
-    ):
-        filters = cached.get("filters") or {}
-    else:
         filters = json.loads(filters_json) if filters_json else {}
         filters["__endtime_formulas__"] = _normalize_formulas(formulas_raw)
-        set_filters_cache(bot_id, telegram_id, filters_key, filters)
+        class_state = get_vehicle_classes_state(bot_id, telegram_id)
+        booked_slots = get_booked_slots(bot_id, telegram_id)
+        blocked_days = {d["day"] for d in get_blocked_days(bot_id, telegram_id)}
+        bl_uuid = get_bl_uuid(bot_id, telegram_id)
+        email, password = _read_portal_creds(bot_id, telegram_id)
+        set_user_runtime_cache(
+            bot_id,
+            telegram_id,
+            cache_version,
+            {
+                "tz_name": tz_name,
+                "mobile_headers": mobile_headers,
+                "filters": filters,
+                "class_state": class_state,
+                "booked_slots": booked_slots,
+                "blocked_days": list(blocked_days),
+                "bl_uuid": bl_uuid,
+                "email": email,
+                "password": password,
+            },
+        )
 
-    class_state = get_vehicle_classes_state(bot_id, telegram_id)
-    booked_slots = get_booked_slots(bot_id, telegram_id)
-    blocked_days = {d["day"] for d in get_blocked_days(bot_id, telegram_id)}
+    if TRACE_USER_POLL:
+        _poll_log(
+            f"🔍 Polling {bot_id}/{telegram_id} "
+            f"(active={active}, admin_active={bot_admin_active}, cache_v={cache_version}, "
+            f"runtime_cache={'hit' if runtime_cached else 'miss'})"
+        )
 
     # ---------- Build busy intervals from Rides (Athena preferred) ----------
     accepted_intervals: List[Tuple[datetime, Optional[datetime]]] = []
 
-    bl_uuid = get_bl_uuid(bot_id, telegram_id)
-    email, password = _read_portal_creds(bot_id, telegram_id)
     has_portal_creds = bool(email and password)
     portal_token = None
 
@@ -229,6 +240,16 @@ def poll_user(user):
             print(f"[{datetime.now()}] 🔁 P1 token refreshed for user {telegram_id} (trigger={trigger})")
             return True
         return False
+
+    def _set_expired_and_pin():
+        set_token_status(bot_id, telegram_id, "expired")
+        existing = get_pinned_warnings(bot_id, telegram_id)
+        if not existing["expired_msg_id"]:
+            if existing["no_token_msg_id"]:
+                bot_token = _resolve_bot_token(bot_id, telegram_id)
+                tg_unpin_message(bot_token, telegram_id, existing["no_token_msg_id"])
+                clear_pinned_warning(bot_id, telegram_id, "no_token")
+            pin_warning_if_needed(bot_id, telegram_id, "expired")
 
     _refresh_p1_token(force=False, trigger="poll_cycle_start")
 
@@ -285,15 +306,9 @@ def poll_user(user):
             )
             return intervals_p1, True
         if status_code in (401, 403):
-            if status_code == 401:
-                set_token_status(bot_id, telegram_id, "expired")
-                existing = get_pinned_warnings(bot_id, telegram_id)
-                if not existing["expired_msg_id"]:
-                    if existing["no_token_msg_id"]:
-                        bot_token = _resolve_bot_token(bot_id, telegram_id)
-                        tg_unpin_message(bot_token, telegram_id, existing["no_token_msg_id"])
-                        clear_pinned_warning(bot_id, telegram_id, "no_token")
-                    pin_warning_if_needed(bot_id, telegram_id, "expired")
+            is_expired = status_code == 401 or (status_code == 403 and is_p1_token_expired(token, skew_s=0))
+            if is_expired:
+                _set_expired_and_pin()
             else:
                 set_token_status(bot_id, telegram_id, "unknown")
                 unpin_warning_if_any(bot_id, telegram_id, "expired")
@@ -378,15 +393,9 @@ def poll_user(user):
             if status_code in (401, 403) and _refresh_p1_token(force=True, trigger="p1_offers_unauthorized"):
                 status_code, results = get_offers_p1(token, headers=mobile_headers)
             if status_code in (401, 403):
-                if status_code == 401:
-                    set_token_status(bot_id, telegram_id, "expired")
-                    existing = get_pinned_warnings(bot_id, telegram_id)
-                    if not existing["expired_msg_id"]:
-                        if existing["no_token_msg_id"]:
-                            bot_token = _resolve_bot_token(bot_id, telegram_id)
-                            tg_unpin_message(bot_token, telegram_id, existing["no_token_msg_id"])
-                            clear_pinned_warning(bot_id, telegram_id, "no_token")
-                        pin_warning_if_needed(bot_id, telegram_id, "expired")
+                is_expired = status_code == 401 or (status_code == 403 and is_p1_token_expired(token, skew_s=0))
+                if is_expired:
+                    _set_expired_and_pin()
                 else:
                     set_token_status(bot_id, telegram_id, "unknown")
                     unpin_warning_if_any(bot_id, telegram_id, "expired")
