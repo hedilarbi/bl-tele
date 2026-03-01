@@ -60,6 +60,7 @@ from .notify import (
     tg_unpin_message,
 )
 from db import (
+    init_db,
     get_all_users_with_bot_admin_active,
     get_booked_slots,
     get_vehicle_classes_state,
@@ -686,6 +687,7 @@ def _user_key(user_row) -> Tuple[str, int]:
 
 
 def run():
+    init_db()
     _poll_log("🚀 Poller started")
     inflight: Dict[Tuple[str, int], tuple] = {}
 

@@ -208,24 +208,48 @@ def get_all_users():
 def get_all_users_with_bot_admin_active():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute(
+    try:
+        c.execute(
+            """
+            SELECT
+                u.bot_id,
+                u.telegram_id,
+                u.token,
+                u.filters,
+                u.active,
+                COALESCE(b.admin_active, 0),
+                COALESCE(u.cache_version, 0)
+            FROM users u
+            LEFT JOIN bot_instances b ON b.bot_id = u.bot_id
+            WHERE COALESCE(b.role, 'user') != 'admin'
+              AND COALESCE(u.active, 0) = 1
+              AND COALESCE(b.admin_active, 0) = 1
         """
-        SELECT
-            u.bot_id,
-            u.telegram_id,
-            u.token,
-            u.filters,
-            u.active,
-            COALESCE(b.admin_active, 0),
-            COALESCE(u.cache_version, 0)
-        FROM users u
-        LEFT JOIN bot_instances b ON b.bot_id = u.bot_id
-        WHERE COALESCE(b.role, 'user') != 'admin'
-          AND COALESCE(u.active, 0) = 1
-          AND COALESCE(b.admin_active, 0) = 1
-    """
-    )
-    users = c.fetchall()
+        )
+        users = c.fetchall()
+    except sqlite3.OperationalError as e:
+        # Backward-compatible fallback for old DBs not yet migrated with users.cache_version
+        if "cache_version" not in str(e).lower():
+            conn.close()
+            raise
+        c.execute(
+            """
+            SELECT
+                u.bot_id,
+                u.telegram_id,
+                u.token,
+                u.filters,
+                u.active,
+                COALESCE(b.admin_active, 0),
+                0 AS cache_version
+            FROM users u
+            LEFT JOIN bot_instances b ON b.bot_id = u.bot_id
+            WHERE COALESCE(b.role, 'user') != 'admin'
+              AND COALESCE(u.active, 0) = 1
+              AND COALESCE(b.admin_active, 0) = 1
+        """
+        )
+        users = c.fetchall()
     conn.close()
     return users
 
