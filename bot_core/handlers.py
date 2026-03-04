@@ -303,11 +303,13 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Mobile sessions
-    if query.data in ("mobile_sessions", "open_mobile_sessions"):
+    if query.data == "mobile_sessions":
+        add_user(bot_id, user_id)
         info_text, menu = build_mobile_sessions_menu(bot_id, user_id)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
-    if query.data == "add_mobile_session":
+    if query.data in ("add_mobile_session", "open_mobile_sessions"):
+        add_user(bot_id, user_id)
         user_waiting_input[state_key] = "set_token"
         await query.edit_message_text(
             "🔑 *Send full HTTP dump*\n\n"
@@ -556,6 +558,15 @@ async def _tap_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if int(owner_id) != int(user.id):
+        # Keep token-recovery path reachable from pinned warnings in private chat,
+        # even if owner_telegram_id is stale/inconsistent in DB.
+        cb = update.callback_query
+        cb_data = (cb.data or "") if cb else ""
+        is_token_recovery_cb = cb_data in ("open_mobile_sessions", "add_mobile_session")
+        chat_id = getattr(update.effective_chat, "id", None)
+        if is_token_recovery_cb and chat_id is not None and int(chat_id) == int(user.id):
+            _capture_from_update(update, bot_id)
+            return
         msg = update.effective_message
         if msg:
             await msg.reply_text("⛔ This bot is already assigned to another user.")

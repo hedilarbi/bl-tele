@@ -231,7 +231,7 @@ def pin_warning_if_needed(bot_id: str, telegram_id: int, kind: str):
         text = "⚠️ <b>Bot Issue</b>: no mobile session\n\nPlease add your mobile session token."
     else:
         text = "⚠️ <b>Bot Issue</b>: mobile session expired\n\nPlease update your mobile session token."
-    markup = {"inline_keyboard": [[{"text": "➕ Add mobile session", "callback_data": "open_mobile_sessions"}]]}
+    markup = {"inline_keyboard": [[{"text": "➕ Add/Update mobile session", "callback_data": "add_mobile_session"}]]}
     message_id = tg_send_message(bot_token, telegram_id, text, reply_markup=markup)
     if message_id:
         tg_pin_message(bot_token, telegram_id, message_id)
