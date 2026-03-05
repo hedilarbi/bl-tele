@@ -30,29 +30,21 @@ from .state import (
     maybe_reset_inmem_caches,
     cleanup_not_valid_cache,
     get_rides_cache,
-    set_rides_cache,
     get_offers_etag,
     set_offers_etag,
     get_user_runtime_cache,
     set_user_runtime_cache,
 )
 from .utils import _normalize_formulas
-from .p1_client import get_rides_p1, get_offers_p1
+from .p1_client import get_offers_p1
 from .p1_auth import maybe_refresh_p1_session, is_p1_token_expired
 from .p2_client import (
     _map_portal_offer,
     _athena_get_offers,
-    _athena_get_rides,
     _ensure_portal_token,
-    _filter_rides_by_bl_uuid,
 )
-from .rides import (
-    _dump_rides,
-    _extract_intervals_from_rides,
-    _rides_snapshot_from_athena_payload,
-    _rides_snapshot_from_p1_list,
-)
-from .processing import debug_print_offers, _process_offers_for_user
+from .processing import debug_print_offers, _process_offers_for_user, _refresh_rides_cache_async
+from .filters import _get_enabled_filter_slugs
 from .notify import (
     pin_warning_if_needed,
     unpin_warning_if_any,
@@ -177,6 +169,10 @@ def poll_user(user):
         tz_name = runtime_cached.get("tz_name") or "UTC"
         mobile_headers = runtime_cached.get("mobile_headers")
         filters = runtime_cached.get("filters") or {}
+        if "user_cfilters" in runtime_cached:
+            user_cfilters = runtime_cached.get("user_cfilters") or {}
+        else:
+            user_cfilters = _get_enabled_filter_slugs(bot_id, telegram_id)
         class_state = runtime_cached.get("class_state") or {}
         booked_slots = runtime_cached.get("booked_slots") or []
         blocked_days = set(runtime_cached.get("blocked_days") or set())
@@ -189,6 +185,7 @@ def poll_user(user):
         formulas_raw = get_endtime_formulas(bot_id, telegram_id)
         filters = json.loads(filters_json) if filters_json else {}
         filters["__endtime_formulas__"] = _normalize_formulas(formulas_raw)
+        user_cfilters = _get_enabled_filter_slugs(bot_id, telegram_id)
         class_state = get_vehicle_classes_state(bot_id, telegram_id)
         booked_slots = get_booked_slots(bot_id, telegram_id)
         blocked_days = {d["day"] for d in get_blocked_days(bot_id, telegram_id)}
@@ -202,6 +199,7 @@ def poll_user(user):
                 "tz_name": tz_name,
                 "mobile_headers": mobile_headers,
                 "filters": filters,
+                "user_cfilters": user_cfilters,
                 "class_state": class_state,
                 "booked_slots": booked_slots,
                 "blocked_days": list(blocked_days),
@@ -254,76 +252,6 @@ def poll_user(user):
             pin_warning_if_needed(bot_id, telegram_id, "expired")
 
     _refresh_p1_token(force=False, trigger="poll_cycle_start")
-
-    def _fetch_p2_rides():
-        nonlocal portal_token
-        if not portal_token and has_portal_creds:
-            portal_token = _ensure_portal_token(bot_id, telegram_id, email, password)
-        if not portal_token:
-            return [], False
-        status_code, payload, _ = _athena_get_rides(portal_token)
-
-        if status_code == 200 and isinstance(payload, dict):
-            data_all = (payload or {}).get("data") or []
-            data_kept = _filter_rides_by_bl_uuid(data_all, bl_uuid) if bl_uuid else data_all
-            filtered_payload = {"data": data_kept, "included": (payload or {}).get("included") or []}
-            snap = _rides_snapshot_from_athena_payload(filtered_payload, tz_name)
-            _dump_rides(bot_id, telegram_id, snap, "p2")
-            intervals_p2 = _extract_intervals_from_rides([
-                (r.get("attributes") or {}) | {"starts_at": (r.get("attributes") or {}).get("starts_at")}
-                for r in (data_kept or [])
-            ])
-            print(
-                f"[{datetime.now()}] 📚 Loaded {len(intervals_p2)} assigned interval(s) "
-                f"(kept {len(data_kept)}/{len(data_all)} rides) from Athena for user {telegram_id}"
-            )
-            return intervals_p2, True
-        if status_code == 304:
-            if ATHENA_PRINT_DEBUG:
-                print(f"[{datetime.now()}] 📦 Athena rides 304 Not Modified for user {telegram_id}")
-            return [], True
-        if status_code in (401, 403):
-            print(f"[{datetime.now()}] ⚠️ Athena rides unauthorized for user {telegram_id}.")
-            return [], False
-        if status_code is None:
-            print(f"[{datetime.now()}] ⚠️ Athena rides network error for user {telegram_id}")
-            return [], False
-        print(f"[{datetime.now()}] ⚠️ Athena rides returned status {status_code} for user {telegram_id}")
-        return [], False
-
-    def _fetch_p1_rides():
-        if not token or not str(token).strip():
-            return [], False
-        status_code, ride_results = get_rides_p1(token, headers=mobile_headers)
-        if status_code in (401, 403) and _refresh_p1_token(force=True, trigger="p1_rides_unauthorized"):
-            status_code, ride_results = get_rides_p1(token, headers=mobile_headers)
-        if status_code == 200 and isinstance(ride_results, list):
-            kept = _filter_rides_by_bl_uuid(ride_results, bl_uuid) if bl_uuid else ride_results
-            snap = _rides_snapshot_from_p1_list(kept, tz_name)
-            _dump_rides(bot_id, telegram_id, snap, "p1")
-            intervals_p1 = _extract_intervals_from_rides(kept)
-            print(
-                f"[{datetime.now()}] 📚 Loaded {len(intervals_p1)} assigned interval(s) "
-                f"(kept {len(kept)}/{len(ride_results)} rides) from P1 /rides for user {telegram_id}"
-            )
-            return intervals_p1, True
-        if status_code in (401, 403):
-            is_expired = status_code == 401 or (status_code == 403 and is_p1_token_expired(token, skew_s=0))
-            if is_expired:
-                _set_expired_and_pin()
-            else:
-                set_token_status(bot_id, telegram_id, "unknown")
-                unpin_warning_if_any(bot_id, telegram_id, "expired")
-                print(f"[{datetime.now()}] ⚠️ P1 /rides forbidden (403) for user {telegram_id} (not marked expired).")
-        elif status_code is None:
-            err_detail = ride_results.get("error") if isinstance(ride_results, dict) else None
-            if err_detail:
-                print(f"[{datetime.now()}] ⚠️ P1 /rides network error for user {telegram_id} | {err_detail}")
-            else:
-                print(f"[{datetime.now()}] ⚠️ P1 /rides network error for user {telegram_id}")
-        else:
-            print(f"[{datetime.now()}] ⚠️ P1 /rides returned status {status_code} for user {telegram_id}")
-        return [], False
 
     # ---------- PLATFORM 1 OFFERS ----------
     offers_p1: List[dict] = []
@@ -630,36 +558,33 @@ def poll_user(user):
             offer["_poll_ts"] = now_ts
 
     if poll_real_orders:
-        now_ts = time.time()
         cached_intervals, cached_ts = get_rides_cache(bot_id, telegram_id)
-        refresh = True
-        if cached_intervals is not None and cached_ts is not None:
-            if (now_ts - cached_ts) < RIDES_REFRESH_INTERVAL_S:
-                accepted_intervals = cached_intervals or []
-                refresh = False
-
-        if refresh:
-            if not portal_token and not (token and str(token).strip()):
-                if cached_intervals is not None:
-                    accepted_intervals = cached_intervals or []
-                # nothing to refresh without tokens
-            else:
-                p1_intervals: List[Tuple[datetime, Optional[datetime]]] = []
-                p2_intervals: List[Tuple[datetime, Optional[datetime]]] = []
-                tasks = {}
-                if portal_token:
-                    tasks["p2"] = _io_executor.submit(_fetch_p2_rides)
-                # Only use P1 /rides when no portal credentials are set
-                if (not has_portal_creds) and token and str(token).strip():
-                    tasks["p1"] = _io_executor.submit(_fetch_p1_rides)
-                for name, fut in tasks.items():
-                    intervals, _ok = fut.result()
-                    if name == "p1":
-                        p1_intervals = intervals
-                    else:
-                        p2_intervals = intervals
-                accepted_intervals = p1_intervals + p2_intervals
-                set_rides_cache(bot_id, telegram_id, accepted_intervals, ts=now_ts)
+        accepted_intervals = cached_intervals or []
+        now_ts = time.time()
+        needs_refresh = (
+            cached_intervals is None
+            or cached_ts is None
+            or ((now_ts - cached_ts) >= RIDES_REFRESH_INTERVAL_S)
+        )
+        p2_refresh_token = portal_token if portal_token else None
+        p1_refresh_token = token if ((not has_portal_creds) and token and str(token).strip()) else None
+        if needs_refresh and (p2_refresh_token or p1_refresh_token):
+            _refresh_rides_cache_async(
+                bot_id,
+                telegram_id,
+                tz_name,
+                p1_refresh_token,
+                mobile_headers,
+                p2_refresh_token,
+                bl_uuid=bl_uuid,
+                portal_email=email,
+                portal_password=password,
+            )
+            if ATHENA_PRINT_DEBUG:
+                _poll_log(
+                    f"🧵 Rides refresh scheduled async for {bot_id}/{telegram_id} "
+                    f"(cached={'yes' if cached_intervals is not None else 'no'})"
+                )
 
     debug_print_offers(telegram_id, all_offers)
 
@@ -677,6 +602,10 @@ def poll_user(user):
         p1_headers=mobile_headers,
         p2_token=portal_token,
         cache_version=cache_version,
+        bl_uuid=bl_uuid,
+        user_cfilters=user_cfilters,
+        portal_email=email,
+        portal_password=password,
     )
 
     return f"Done with user {telegram_id}"

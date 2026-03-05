@@ -9,7 +9,6 @@ from datetime import datetime, timezone, timedelta
 from datetime import time as dt_time
 from dateutil import parser
 from dateutil.tz import gettz
-from copy import deepcopy
 
 from .config import (
     DEBUG_PRINT_OFFERS,
@@ -20,6 +19,7 @@ from .config import (
     FAST_ACCEPT_MODE,
     FAST_ACCEPT_NOTIFY_REJECTED,
     OFFER_MEMORY_DEDUPE,
+    ATHENA_PRINT_DEBUG,
 )
 from .utils import (
     _esc,
@@ -50,9 +50,9 @@ from .state import (
 )
 from .p1_client import reserve_offer_p1, get_rides_p1
 from .p1_auth import maybe_refresh_p1_session
-from .p2_client import reserve_offer_p2, _athena_get_rides, _filter_rides_by_bl_uuid
+from .p2_client import reserve_offer_p2, _athena_get_rides, _filter_rides_by_bl_uuid, _ensure_portal_token
 from .rides import _extract_intervals_from_rides
-from db import log_offer_decision, save_offer_message, get_bl_uuid, set_token_status
+from db import log_offer_decision, save_offer_message, set_token_status
 
 
 def _quiet_print(*args, **kwargs):
@@ -69,12 +69,17 @@ def _refresh_rides_cache_now(
     p1_token: Optional[str],
     p1_headers: Optional[dict],
     p2_token: Optional[str],
+    bl_uuid: Optional[str] = None,
+    portal_email: Optional[str] = None,
+    portal_password: Optional[str] = None,
 ):
     intervals: List[Tuple[datetime, Optional[datetime]]] = []
-    bl_uuid = get_bl_uuid(bot_id, telegram_id)
+    p2_tok = p2_token
+    if not p2_tok and portal_email and portal_password:
+        p2_tok = _ensure_portal_token(bot_id, telegram_id, portal_email, portal_password)
 
-    if p2_token:
-        status_code, payload, _ = _athena_get_rides(p2_token)
+    if p2_tok:
+        status_code, payload, _ = _athena_get_rides(p2_tok)
         if status_code == 200 and isinstance(payload, dict):
             data_all = (payload or {}).get("data") or []
             data_kept = _filter_rides_by_bl_uuid(data_all, bl_uuid) if bl_uuid else data_all
@@ -108,14 +113,74 @@ def _refresh_rides_cache_async(
     p1_token: Optional[str],
     p1_headers: Optional[dict],
     p2_token: Optional[str],
+    bl_uuid: Optional[str] = None,
+    portal_email: Optional[str] = None,
+    portal_password: Optional[str] = None,
 ):
     def _job():
         try:
-            _refresh_rides_cache_now(bot_id, telegram_id, tz_name, p1_token, p1_headers, p2_token)
+            _refresh_rides_cache_now(
+                bot_id,
+                telegram_id,
+                tz_name,
+                p1_token,
+                p1_headers,
+                p2_token,
+                bl_uuid=bl_uuid,
+                portal_email=portal_email,
+                portal_password=portal_password,
+            )
         except Exception:
             invalidate_rides_cache(bot_id, telegram_id)
 
     _bg_executor.submit(_job)
+
+
+_db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def _log_offer_decision_async(
+    bot_id: str,
+    telegram_id: int,
+    offer: dict,
+    status: str,
+    reason: Optional[str] = None,
+):
+    def _job():
+        try:
+            log_offer_decision(bot_id, telegram_id, offer, status, reason)
+        except Exception as e:
+            if ATHENA_PRINT_DEBUG:
+                _builtins.print(
+                    f"[{datetime.now()}] ⚠️ log_offer_decision failed "
+                    f"({status} {offer.get('id') if isinstance(offer, dict) else '—'}): "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    _db_executor.submit(_job)
+
+
+def _save_offer_message_async(
+    bot_id: str,
+    telegram_id: int,
+    message_key: Optional[str],
+    header_text: str,
+    full_text: str,
+):
+    if not message_key:
+        return
+
+    def _job():
+        try:
+            save_offer_message(bot_id, telegram_id, message_key, header_text, full_text)
+        except Exception as e:
+            if ATHENA_PRINT_DEBUG:
+                _builtins.print(
+                    f"[{datetime.now()}] ⚠️ save_offer_message failed "
+                    f"({message_key}): {type(e).__name__}: {e}"
+                )
+
+    _db_executor.submit(_job)
 
 
 def _reserve_with_timeout(fn, timeout_s: int, *args, **kwargs):
@@ -365,8 +430,13 @@ def _process_offers_for_user(
     p1_headers: Optional[dict] = None,
     p2_token: Optional[str] = None,
     cache_version: int = 0,
+    bl_uuid: Optional[str] = None,
+    user_cfilters: Optional[dict] = None,
+    portal_email: Optional[str] = None,
+    portal_password: Optional[str] = None,
 ):
-    user_cfilters = _get_enabled_filter_slugs(bot_id, telegram_id)
+    if user_cfilters is None:
+        user_cfilters = _get_enabled_filter_slugs(bot_id, telegram_id)
     pending_notifications: List[Tuple[str, str, str, Optional[dict], bool]] = []
 
     def _queue_notification(
@@ -659,7 +729,6 @@ def _process_offers_for_user(
 
         # --- Final decision based on accumulated filters ---
         failed_filters = [fr for fr in filter_results if not fr["ok"]]
-        summary_text = _format_filter_summary(filter_results)
         base_reason = "; ".join([fr["detail"] or fr["name"] for fr in failed_filters]) if failed_filters else None
 
         forced_accept_reason = None
@@ -673,10 +742,7 @@ def _process_offers_for_user(
             print(f"[{datetime.now()}] ⛔ Rejected {oid} – {base_reason or 'filtres non respectés'}")
             if oid:
                 mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
-            try:
-                log_offer_decision(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
-            except Exception as e:
-                _builtins.print(f"[{datetime.now()}] ⚠️ log_offer_decision failed (rejected {oid}): {type(e).__name__}: {e}")
+            _log_offer_decision_async(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
             if FAST_ACCEPT_MODE:
                 # In race mode, still keep "Show details" so users can inspect rejected offers.
                 if FAST_ACCEPT_NOTIFY_REJECTED:
@@ -688,20 +754,13 @@ def _process_offers_for_user(
                         "rejected",
                         None,
                         tz_name,
-                        summary_text,
                         filter_results=filter_results,
                         platform=platform,
                         forced_accept=False,
                     )
                     details_key = uuid.uuid4().hex[:16]
-                    try:
-                        save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
-                    except Exception as e:
-                        _builtins.print(f"[{datetime.now()}] ⚠️ save_offer_message failed (fast rejected {oid}): {type(e).__name__}: {e}")
-                        details_key = None
+                    _save_offer_message_async(bot_id, telegram_id, details_key, header_line, full_text)
                     kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
-                    if details_key is None:
-                        kb = None
                     _queue_notification("rejected", notify_text, platform, reply_markup=kb, force_notify=True)
                 if OFFER_MEMORY_DEDUPE:
                     rejected_per_user[bot_id][telegram_id][platform].add(oid)
@@ -711,7 +770,6 @@ def _process_offers_for_user(
                 "rejected",
                 None,
                 tz_name,
-                summary_text,
                 filter_results=filter_results,
                 platform=platform,
                 forced_accept=False,
@@ -720,14 +778,8 @@ def _process_offers_for_user(
             reject_lines = _build_reject_summary_lines(filter_results)
             notify_text = f"{header_line}\n{reject_lines}" if reject_lines else header_line
             details_key = uuid.uuid4().hex[:16]
-            try:
-                save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
-            except Exception as e:
-                _builtins.print(f"[{datetime.now()}] ⚠️ save_offer_message failed (rejected {oid}): {type(e).__name__}: {e}")
-                details_key = None
+            _save_offer_message_async(bot_id, telegram_id, details_key, header_line, full_text)
             kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
-            if details_key is None:
-                kb = None
             _queue_notification("rejected", notify_text, platform, reply_markup=kb, force_notify=True)
             if OFFER_MEMORY_DEDUPE:
                 rejected_per_user[bot_id][telegram_id][platform].add(oid)
@@ -735,22 +787,16 @@ def _process_offers_for_user(
 
         # Accept (either all filters OK or overridden by custom filter)
         print(f"[{datetime.now()}] ✅ Accepted {oid} [{platform}]")
-        offer_to_log = deepcopy(offer)
+        offer_to_log = offer
 
         # Optionally auto-reserve the offer upstream
+        reserve_attempted = False
+        reserve_ok = True
+        reserve_reason = None
+        reserve_reason_user = None
         if AUTO_RESERVE_ENABLED:
-            reserve_attempted = False
-            reserve_ok = True
-            reserve_reason = None
-            reserve_reason_user = None
             latency_ms = _poll_latency_ms(offer_to_log)
             latency_note = f" | latency={latency_ms}ms" if latency_ms is not None else ""
-            _builtins.print(
-                f"[{datetime.now()}] 🧾 Reserve check {oid} platform={platform} "
-                f"p1_token={'yes' if p1_token else 'no'} "
-                f"p2_token={'yes' if p2_token else 'no'} "
-                f"price={offer_to_log.get('price')}"
-            )
             try:
                 if platform == "p1":
                     if p1_token:
@@ -775,9 +821,10 @@ def _process_offers_for_user(
                             if refreshed and new_tok:
                                 p1_token = new_tok
                                 p1_headers = new_headers
-                                _builtins.print(
-                                    f"[{datetime.now()}] 🔁 P1 token refreshed during reserve retry for user {telegram_id}"
-                                )
+                                if ATHENA_PRINT_DEBUG:
+                                    _builtins.print(
+                                        f"[{datetime.now()}] 🔁 P1 token refreshed during reserve retry for user {telegram_id}"
+                                    )
                                 rs, rb = _reserve_with_timeout(
                                     reserve_offer_p1,
                                     P1_RESERVE_TIMEOUT_S,
@@ -787,17 +834,20 @@ def _process_offers_for_user(
                                     headers=p1_headers,
                                 )
                             else:
-                                _builtins.print(
-                                    f"[{datetime.now()}] ⚠️ P1 refresh unavailable during reserve for user {telegram_id}: {note}"
-                                )
-                        _builtins.print(f"[{datetime.now()}] 🎯 P1 reserve {oid} -> {rs} | {rb}{latency_note}")
+                                if ATHENA_PRINT_DEBUG:
+                                    _builtins.print(
+                                        f"[{datetime.now()}] ⚠️ P1 refresh unavailable during reserve for user {telegram_id}: {note}"
+                                    )
+                        if ATHENA_PRINT_DEBUG:
+                            _builtins.print(f"[{datetime.now()}] 🎯 P1 reserve {oid} -> {rs} | {rb}{latency_note}")
                         reserve_ok = 200 <= (rs or 0) < 300
                         if not reserve_ok:
                             if rs == 401:
                                 set_token_status(bot_id, telegram_id, "expired")
-                            _builtins.print(
-                                f"[{datetime.now()}] ❌ P1 reserve failed {oid} (status={rs}) body={rb}{latency_note}"
-                            )
+                            if ATHENA_PRINT_DEBUG:
+                                _builtins.print(
+                                    f"[{datetime.now()}] ❌ P1 reserve failed {oid} (status={rs}) body={rb}{latency_note}"
+                                )
                             reserve_reason = f"reserve_failed:{rs}"
                             reserve_reason_user = _reserve_failure_human_reason(rs, rb)
                         else:
@@ -808,9 +858,10 @@ def _process_offers_for_user(
                                 p1_token,
                                 p1_headers,
                                 p2_token,
+                                bl_uuid=bl_uuid,
+                                portal_email=portal_email,
+                                portal_password=portal_password,
                             )
-                    else:
-                        _builtins.print(f"[{datetime.now()}] ⚠️ P1 reserve skipped (no token) for user {telegram_id}")
                 else:  # p2
                     if p2_token:
                         bid_price = offer_to_log.get("price")
@@ -824,12 +875,16 @@ def _process_offers_for_user(
                                 p2_token,
                                 oid,
                                 float(bid_price),
-                                bl_user_id=get_bl_uuid(bot_id, telegram_id),
+                                bl_user_id=bl_uuid,
                             )
-                            _builtins.print(f"[{datetime.now()}] 🎯 P2 reserve {oid} -> {rs} | {rb}{latency_note}")
+                            if ATHENA_PRINT_DEBUG:
+                                _builtins.print(f"[{datetime.now()}] 🎯 P2 reserve {oid} -> {rs} | {rb}{latency_note}")
                         reserve_ok = 200 <= (rs or 0) < 300
                         if not reserve_ok:
-                            _builtins.print(f"[{datetime.now()}] ❌ P2 reserve failed {oid} (status={rs}) body={rb}{latency_note}")
+                            if ATHENA_PRINT_DEBUG:
+                                _builtins.print(
+                                    f"[{datetime.now()}] ❌ P2 reserve failed {oid} (status={rs}) body={rb}{latency_note}"
+                                )
                             reserve_reason = f"reserve_failed:{rs}"
                             reserve_reason_user = _reserve_failure_human_reason(rs, rb)
                         else:
@@ -840,9 +895,10 @@ def _process_offers_for_user(
                                 p1_token,
                                 p1_headers,
                                 p2_token,
+                                bl_uuid=bl_uuid,
+                                portal_email=portal_email,
+                                portal_password=portal_password,
                             )
-                    else:
-                        _builtins.print(f"[{datetime.now()}] ⚠️ P2 reserve skipped (no portal token) for user {telegram_id}")
             except Exception as e:
                 _builtins.print(f"[{datetime.now()}] ❌ Auto-reserve error for {oid}: {type(e).__name__}: {e}{latency_note}")
                 reserve_attempted = True
@@ -855,17 +911,13 @@ def _process_offers_for_user(
             final_status = "not_accepted"
         final_reason = reserve_reason_user if final_status == "not_accepted" else None
         final_reason_for_log = reserve_reason if final_status == "not_accepted" else reason_for_log
-        try:
-            log_offer_decision(bot_id, telegram_id, offer_to_log, final_status, final_reason_for_log)
-        except Exception as e:
-            _builtins.print(f"[{datetime.now()}] ⚠️ log_offer_decision failed ({final_status} {oid}): {type(e).__name__}: {e}")
+        _log_offer_decision_async(bot_id, telegram_id, offer_to_log, final_status, final_reason_for_log)
 
         full_text = _build_user_message(
             offer_to_log,
             final_status,
             final_reason,
             tz_name,
-            summary_text,
             filter_results=filter_results,
             platform=platform,
             forced_accept=bool(accept_override and failed_filters),
@@ -880,14 +932,8 @@ def _process_offers_for_user(
         if final_status == "not_accepted" and final_reason:
             notify_line = f"{header_line}\n⚠️ {_esc(final_reason)}"
         details_key = uuid.uuid4().hex[:16]
-        try:
-            save_offer_message(bot_id, telegram_id, details_key, header_line, full_text)
-        except Exception as e:
-            _builtins.print(f"[{datetime.now()}] ⚠️ save_offer_message failed ({final_status} {oid}): {type(e).__name__}: {e}")
-            details_key = None
+        _save_offer_message_async(bot_id, telegram_id, details_key, header_line, full_text)
         kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
-        if details_key is None:
-            kb = None
         _queue_notification(
             final_status,
             notify_line,
