@@ -42,7 +42,6 @@ ENABLE_P2 = os.getenv("ENABLE_P2", "1") == "1"
 ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when available)
 # When enabled, accepted offers will be actually reserved via API calls (P1/P2).
 AUTO_RESERVE_ENABLED = True
-P1_PRIORITY_SKIP_P2_WAIT = os.getenv("P1_PRIORITY_SKIP_P2_WAIT", "0") == "1"
 TRACE_USER_POLL = os.getenv("TRACE_USER_POLL", "0") == "1"
 
 # Diagnostics
@@ -66,3 +65,4 @@ MAX_RIDES_SHOWN = int(os.getenv("MAX_RIDES_SHOWN", "20"))
 ATHENA_RELOGIN_SKEW_S = int(os.getenv("ATHENA_RELOGIN_SKEW_S", "3600"))
 OFFER_MEMORY_DEDUPE = os.getenv("OFFER_MEMORY_DEDUPE", "0") == "1"
 ATHENA_USE_OFFERS_ETAG = os.getenv("ATHENA_USE_OFFERS_ETAG", "0") == "1"
+METRICS_LOG_EVERY_CYCLES = max(1, int(os.getenv("METRICS_LOG_EVERY_CYCLES", "20")))

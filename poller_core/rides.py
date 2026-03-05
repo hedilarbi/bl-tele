@@ -1,6 +1,5 @@
 from typing import List, Tuple, Optional
 from datetime import datetime, timedelta
-from dateutil import parser
 
 from .config import DUMP_RIDES_IN_LOGS, DUMP_RIDES_IN_TELEGRAM, MAX_RIDES_SHOWN
 from .utils import (
@@ -11,6 +10,7 @@ from .utils import (
     _duration_minutes_from_rid,
     _extract_addr,
 )
+from .timeparse import parse_iso_dt_or_none
 from .notify import maybe_send_message
 from .p2_client import _safe_attr, _find_included, _extract_loc_from_included
 
@@ -34,19 +34,15 @@ def _extract_intervals_from_rides(rides: list) -> List[Tuple[datetime, Optional[
         )
         if not start_s:
             continue
-        try:
-            start_dt = parser.isoparse(start_s)
-        except Exception:
+        start_dt = parse_iso_dt_or_none(start_s)
+        if start_dt is None:
             continue
 
         # end time or duration
         end_dt = None
         end_s = rid.get("endsAt") or rid.get("ends_at") or rid.get("end_time")
         if end_s:
-            try:
-                end_dt = parser.isoparse(end_s)
-            except Exception:
-                end_dt = None
+            end_dt = parse_iso_dt_or_none(end_s)
         if not end_dt:
             dur_min = _duration_minutes_from_rid(rid)
             if dur_min is not None:

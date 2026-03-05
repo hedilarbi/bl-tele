@@ -2,10 +2,10 @@ import json
 import re
 from typing import Optional, Iterable, List, Tuple
 from datetime import datetime, timedelta
-from dateutil import parser
 from dateutil.tz import gettz
 
 from .config import DEBUG_ENDS
+from .timeparse import parse_iso_dt
 
 
 def _to_str(x):
@@ -125,7 +125,7 @@ def _fmt_dt_local(s: str, tz_name: Optional[str]) -> str:
     if not s:
         return "—"
     try:
-        dt = parser.isoparse(s)
+        dt = parse_iso_dt(s)
         tzinfo = gettz(tz_name) if tz_name else None
         if tzinfo:
             return dt.astimezone(tzinfo).strftime("%Y-%m-%d %H:%M %Z")
@@ -324,7 +324,7 @@ def _parse_user_slot_local(dt_str: str, tz_name: str) -> Optional[datetime]:
         except Exception:
             pass
     try:
-        dt = parser.parse(dt_str)
+        dt = parse_iso_dt(dt_str)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=tzinfo)
         else:
@@ -338,7 +338,7 @@ def _fmt_local_iso(iso_or_none: Optional[str], tz_name: str) -> str:
     if not iso_or_none:
         return "—"
     try:
-        dt = parser.isoparse(iso_or_none)
+        dt = parse_iso_dt(iso_or_none)
         return _fmt_dt_local_from_dt(dt, tz_name)
     except Exception:
         return iso_or_none

@@ -23,8 +23,8 @@ from .config import (
     MAX_LOGGED_OFFERS,
     OFFER_MEMORY_DEDUPE,
     ATHENA_USE_OFFERS_ETAG,
-    P1_PRIORITY_SKIP_P2_WAIT,
     TRACE_USER_POLL,
+    METRICS_LOG_EVERY_CYCLES,
 )
 from .state import (
     maybe_reset_inmem_caches,
@@ -45,6 +45,7 @@ from .p2_client import (
 )
 from .processing import debug_print_offers, _process_offers_for_user, _refresh_rides_cache_async
 from .filters import _get_enabled_filter_slugs
+from .metrics import format_line, observe_ms
 from .notify import (
     pin_warning_if_needed,
     unpin_warning_if_any,
@@ -319,9 +320,13 @@ def poll_user(user):
         if not token or not str(token).strip():
             _refresh_p1_token(force=False, trigger="p1_offers_no_token")
         if token and str(token).strip():
+            t0 = time.perf_counter()
             status_code, results = get_offers_p1(token, headers=mobile_headers)
+            observe_ms("p1_fetch_ms", (time.perf_counter() - t0) * 1000.0)
             if status_code in (401, 403) and _refresh_p1_token(force=True, trigger="p1_offers_unauthorized"):
+                t1 = time.perf_counter()
                 status_code, results = get_offers_p1(token, headers=mobile_headers)
+                observe_ms("p1_fetch_ms", (time.perf_counter() - t1) * 1000.0)
             if status_code in (401, 403):
                 is_expired = status_code == 401 or (status_code == 403 and is_p1_token_expired(token, skew_s=0))
                 if is_expired:
@@ -496,7 +501,9 @@ def poll_user(user):
         if not tok:
             return [], tok
         etag = get_offers_etag(bot_id, telegram_id) if ATHENA_USE_OFFERS_ETAG else None
+        t0 = time.perf_counter()
         status_code, payload, new_etag = _athena_get_offers(tok, etag=etag)
+        observe_ms("p2_fetch_ms", (time.perf_counter() - t0) * 1000.0)
 
         if ATHENA_PRINT_DEBUG:
             print(f"[{datetime.now()}] 🛰️ Athena offers status={status_code} for user {telegram_id}")
@@ -505,7 +512,9 @@ def poll_user(user):
             print(f"[{datetime.now()}] ⚠️ Athena token unauthorized for user {telegram_id}. Re-logging...")
             tok = _ensure_portal_token(bot_id, telegram_id, email, password)
             if tok:
+                t1 = time.perf_counter()
                 status_code, payload, new_etag = _athena_get_offers(tok)
+                observe_ms("p2_fetch_ms", (time.perf_counter() - t1) * 1000.0)
                 if ATHENA_PRINT_DEBUG:
                     print(
                         f"[{datetime.now()}] 🛰️ Athena offers (after re-login) status={status_code} for user {telegram_id}"
@@ -532,7 +541,9 @@ def poll_user(user):
                 "p2": _io_executor.submit(_fetch_p2_offers_real),
             }
             offers_p1 = tasks["p1"].result()
-            if P1_PRIORITY_SKIP_P2_WAIT and offers_p1:
+            # Competition mode: never delay reservation path waiting for P2
+            # if P1 already has offers.
+            if offers_p1:
                 if ATHENA_PRINT_DEBUG:
                     _poll_log(
                         f"⚡ P1 priority: skipping P2 wait for {bot_id}/{telegram_id} "
@@ -619,8 +630,10 @@ def run():
     init_db()
     _poll_log("🚀 Poller started")
     inflight: Dict[Tuple[str, int], tuple] = {}
+    cycle_idx = 0
 
     while True:
+        cycle_idx += 1
         cleanup_not_valid_cache()
         if OFFER_MEMORY_DEDUPE:
             maybe_reset_inmem_caches()
@@ -657,4 +670,18 @@ def run():
         )
         if not users:
             _poll_log("⚠️ No eligible users (requires users.active=1 and bot_instances.admin_active=1).")
+        if cycle_idx % METRICS_LOG_EVERY_CYCLES == 0:
+            _poll_log(
+                "📈 "
+                + " | ".join(
+                    [
+                        format_line("offer_filter_ms"),
+                        format_line("p1_fetch_ms"),
+                        format_line("p2_fetch_ms"),
+                        format_line("reserve_rtt_ms"),
+                        format_line("reserve_batch_ms"),
+                        format_line("offer_end2end_ms"),
+                    ]
+                )
+            )
         time.sleep(_sleep_interval())

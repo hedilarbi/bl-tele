@@ -2,11 +2,11 @@ import json
 import re
 from typing import Optional, Tuple, List
 from datetime import datetime
-from dateutil import parser
 from dateutil.tz import gettz
 
 from .config import CF_DEBUG
 from .utils import _parse_hhmm, _to_str, _esc
+from .timeparse import parse_iso_dt_or_none
 from db import list_user_custom_filters
 
 
@@ -129,7 +129,9 @@ def _filter_reject_under_90_between_20_22(
     tH, tM = tm
 
     try:
-        pu_dt = parser.isoparse(rid["pickupTime"])
+        pu_dt = parse_iso_dt_or_none(rid["pickupTime"])
+        if pu_dt is None:
+            return None, None
         pu_local = pu_dt.astimezone(gettz(tz_name))
         within = (fH, fM) <= (pu_local.hour, pu_local.minute) <= (tH, tM)
     except Exception:
@@ -200,10 +202,7 @@ def _find_conflict(
 ) -> Optional[Tuple[datetime, datetime]]:
     new_end = None
     if new_end_iso:
-        try:
-            new_end = parser.isoparse(new_end_iso)
-        except Exception:
-            new_end = None
+        new_end = parse_iso_dt_or_none(new_end_iso)
     for a_start, a_end in accepted_intervals:
         if not a_end:
             continue
