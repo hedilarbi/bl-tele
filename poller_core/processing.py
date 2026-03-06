@@ -45,10 +45,14 @@ from .state import (
     is_recent_not_valid,
     mark_not_valid_cached,
 )
-from .p1_client import get_rides_p1
-from .p2_client import _athena_get_rides, _filter_rides_by_bl_uuid, _ensure_portal_token
+from .p1_client import get_rides_p1, reserve_offer_p1
+from .p2_client import (
+    _athena_get_rides,
+    _filter_rides_by_bl_uuid,
+    _ensure_portal_token,
+    reserve_offer_p2,
+)
 from .rides import _extract_intervals_from_rides
-from .reserve_async import reserve_batch
 from .timeparse import parse_iso_dt_or_none
 from .metrics import observe_ms
 from db import log_offer_decision, save_offer_message, set_token_status
@@ -136,6 +140,40 @@ def _refresh_rides_cache_async(
 
 
 _db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_reserve_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+
+
+def _reserve_offer_sync(task: dict) -> dict:
+    platform = str(task.get("platform") or "")
+    offer_id = task.get("offer_id")
+    task_key = task.get("task_key")
+    t0 = time.perf_counter()
+    try:
+        if platform == "p1":
+            status_code, body = reserve_offer_p1(
+                task.get("token"),
+                str(offer_id),
+                price=task.get("price"),
+                headers=task.get("headers"),
+            )
+        elif platform == "p2":
+            status_code, body = reserve_offer_p2(
+                task.get("token"),
+                str(offer_id),
+                float(task.get("price")),
+                bl_user_id=task.get("bl_user_id"),
+            )
+        else:
+            status_code, body = None, {"error": "unknown_platform"}
+    except Exception as e:
+        status_code, body = None, {"error": f"{type(e).__name__}: {e}"}
+    return {
+        "task_key": task_key,
+        "offer_id": offer_id,
+        "status_code": status_code,
+        "body": body,
+        "latency_ms": (time.perf_counter() - t0) * 1000.0,
+    }
 
 
 def _log_offer_decision_async(
@@ -451,6 +489,8 @@ def _process_offers_for_user(
         user_cfilters = _get_enabled_filter_slugs(bot_id, telegram_id)
     pending_notifications: List[Tuple[str, str, str, Optional[dict], bool]] = []
     reserve_candidates: List[dict] = []
+    pending_intervals: List[Tuple[datetime, Optional[datetime]]] = []
+    reserve_batch_started_at: Optional[float] = None
 
     def _queue_notification(
         kind: str,
@@ -728,7 +768,8 @@ def _process_offers_for_user(
             record_result("Créneaux bloqués", conflict_reason is None, conflict_reason)
 
         # 5.5) Conflict with already accepted offers (busy intervals)
-        conflict_with = _find_conflict(pickup, ends_at_iso, accepted_intervals)
+        effective_busy_intervals = accepted_intervals + pending_intervals
+        conflict_with = _find_conflict(pickup, ends_at_iso, effective_busy_intervals)
         if conflict_with:
             a_start, a_end = conflict_with
             conflict_text = (
@@ -736,7 +777,7 @@ def _process_offers_for_user(
                 f"({_fmt_dt_local_from_dt(a_start, tz_name)} – {_fmt_dt_local_from_dt(a_end, tz_name)})"
             )
             record_result("Conflit trajets acceptés", False, conflict_text)
-        elif accepted_intervals:
+        elif effective_busy_intervals:
             record_result("Conflit trajets acceptés", True, "aucun conflit")
 
         # --- Final decision based on accumulated filters ---
@@ -804,9 +845,43 @@ def _process_offers_for_user(
             observe_ms("offer_end2end_ms", _poll_latency_ms(offer))
             continue
 
-        # Accepted candidate (real reserve done in parallel batch below)
+        # Accepted candidate:
+        # submit reserve immediately so network race starts before full offer scan ends.
         predicted_end = parse_iso_dt_or_none((offer.get("rides") or [{}])[0].get("endsAt"))
-        accepted_intervals.append((pickup, predicted_end))
+        reserve_future = None
+        if AUTO_RESERVE_ENABLED:
+            if platform == "p1" and p1_token:
+                reserve_future = _reserve_executor.submit(
+                    _reserve_offer_sync,
+                    {
+                        "task_key": len(reserve_candidates),
+                        "platform": "p1",
+                        "offer_id": oid,
+                        "token": p1_token,
+                        "price": offer.get("price"),
+                        "headers": p1_headers,
+                    },
+                )
+            elif platform == "p2":
+                p2_price = offer.get("price")
+                if p2_token and p2_price is not None:
+                    reserve_future = _reserve_executor.submit(
+                        _reserve_offer_sync,
+                        {
+                            "task_key": len(reserve_candidates),
+                            "platform": "p2",
+                            "offer_id": oid,
+                            "token": p2_token,
+                            "price": float(p2_price),
+                            "bl_user_id": bl_uuid,
+                        },
+                    )
+            if reserve_future is not None and reserve_batch_started_at is None:
+                reserve_batch_started_at = time.perf_counter()
+
+        # Keep a pending interval guard to avoid accepting overlapping rides
+        # in the same cycle before reserve responses come back.
+        pending_intervals.append((pickup, predicted_end))
         reserve_candidates.append(
             {
                 "offer": offer,
@@ -815,52 +890,32 @@ def _process_offers_for_user(
                 "reason_for_log": reason_for_log,
                 "filter_results": filter_results,
                 "forced_accept": bool(accept_override and failed_filters),
+                "pickup": pickup,
+                "predicted_end": predicted_end,
+                "reserve_future": reserve_future,
             }
         )
 
-    # Parallel reserve batch for accepted candidates
     reserve_results: Dict[int, dict] = {}
     if AUTO_RESERVE_ENABLED and reserve_candidates:
-        tasks: List[dict] = []
         for idx, cand in enumerate(reserve_candidates):
-            offer = cand["offer"]
-            plat = cand["platform"]
-            oid = cand["oid"]
-            if plat == "p1":
-                if p1_token:
-                    tasks.append(
-                        {
-                            "task_key": idx,
-                            "platform": "p1",
-                            "offer_id": oid,
-                            "token": p1_token,
-                            "price": offer.get("price"),
-                            "headers": p1_headers,
-                        }
-                    )
-            else:
-                price = offer.get("price")
-                if p2_token and price is not None:
-                    tasks.append(
-                        {
-                            "task_key": idx,
-                            "platform": "p2",
-                            "offer_id": oid,
-                            "token": p2_token,
-                            "price": float(price),
-                            "bl_user_id": bl_uuid,
-                        }
-                    )
-        if tasks:
-            t_batch = time.perf_counter()
-            results = reserve_batch(tasks)
-            observe_ms("reserve_batch_ms", (time.perf_counter() - t_batch) * 1000.0)
-            for rr in results:
-                key = rr.get("task_key")
-                if key is None:
-                    continue
-                reserve_results[int(key)] = rr
-                observe_ms("reserve_rtt_ms", rr.get("latency_ms"))
+            fut = cand.get("reserve_future")
+            if fut is None:
+                continue
+            try:
+                rr = fut.result()
+            except Exception as e:
+                rr = {
+                    "task_key": idx,
+                    "offer_id": cand.get("oid"),
+                    "status_code": None,
+                    "body": {"error": f"{type(e).__name__}: {e}"},
+                    "latency_ms": None,
+                }
+            reserve_results[idx] = rr
+            observe_ms("reserve_rtt_ms", rr.get("latency_ms"))
+        if reserve_batch_started_at is not None:
+            observe_ms("reserve_batch_ms", (time.perf_counter() - reserve_batch_started_at) * 1000.0)
 
     refresh_rides_after_success = False
     for idx, cand in enumerate(reserve_candidates):
@@ -870,6 +925,8 @@ def _process_offers_for_user(
         reason_for_log = cand["reason_for_log"]
         filter_results = cand["filter_results"]
         forced_accept = cand["forced_accept"]
+        pickup_dt = cand.get("pickup")
+        predicted_end = cand.get("predicted_end")
 
         reserve_attempted = idx in reserve_results
         reserve_ok = True
@@ -902,6 +959,8 @@ def _process_offers_for_user(
         final_status = "accepted"
         if AUTO_RESERVE_ENABLED and reserve_attempted and not reserve_ok:
             final_status = "not_accepted"
+        if final_status == "accepted" and pickup_dt is not None:
+            accepted_intervals.append((pickup_dt, predicted_end))
         final_reason = reserve_reason_user if final_status == "not_accepted" else None
         final_reason_for_log = reserve_reason if final_status == "not_accepted" else reason_for_log
         _log_offer_decision_async(bot_id, telegram_id, offer_to_log, final_status, final_reason_for_log)

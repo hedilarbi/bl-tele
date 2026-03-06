@@ -82,7 +82,6 @@ print = _quiet_print
 _burst_until = 0.0
 _burst_lock = threading.Lock()
 _user_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-_io_executor = ThreadPoolExecutor(max_workers=max(4, MAX_WORKERS * 2))
 
 
 def _bump_burst():
@@ -536,22 +535,17 @@ def poll_user(user):
 
     if not USE_MOCK_P1 or not USE_MOCK_P2:
         if ENABLE_P1 and ENABLE_P2 and not USE_MOCK_P1 and not USE_MOCK_P2:
-            tasks = {
-                "p1": _io_executor.submit(_fetch_p1_offers_real),
-                "p2": _io_executor.submit(_fetch_p2_offers_real),
-            }
-            offers_p1 = tasks["p1"].result()
-            # Competition mode: never delay reservation path waiting for P2
-            # if P1 already has offers.
-            if offers_p1:
-                if ATHENA_PRINT_DEBUG:
-                    _poll_log(
-                        f"⚡ P1 priority: skipping P2 wait for {bot_id}/{telegram_id} "
-                        f"(offers_p1={len(offers_p1)})"
-                    )
-                tasks["p2"].cancel()
-            else:
-                offers_p2, portal_token = tasks["p2"].result()
+            # P1 fast lane:
+            # query P1 first; only query P2 when P1 is empty.
+            # This avoids launching/canceling a P2 request that still consumes resources.
+            offers_p1 = _fetch_p1_offers_real()
+            if not offers_p1:
+                offers_p2, portal_token = _fetch_p2_offers_real()
+            elif ATHENA_PRINT_DEBUG:
+                _poll_log(
+                    f"⚡ P1 fast lane for {bot_id}/{telegram_id} "
+                    f"(offers_p1={len(offers_p1)}), P2 deferred to next cycle"
+                )
         else:
             if ENABLE_P1 and not USE_MOCK_P1:
                 offers_p1 = _fetch_p1_offers_real()
@@ -560,9 +554,6 @@ def poll_user(user):
 
     # ---------- Combine and process ----------
     all_offers = (offers_p1 or []) + (offers_p2 or [])
-    if not all_offers:
-        print(f"[{datetime.now()}] ℹ️ No offers for user {telegram_id} this cycle")
-        return f"Done with user {telegram_id}"
     now_ts = time.time()
     for offer in all_offers:
         if isinstance(offer, dict) and offer.get("_poll_ts") is None:
@@ -596,6 +587,10 @@ def poll_user(user):
                     f"🧵 Rides refresh scheduled async for {bot_id}/{telegram_id} "
                     f"(cached={'yes' if cached_intervals is not None else 'no'})"
                 )
+
+    if not all_offers:
+        print(f"[{datetime.now()}] ℹ️ No offers for user {telegram_id} this cycle")
+        return f"Done with user {telegram_id}"
 
     debug_print_offers(telegram_id, all_offers)
 

@@ -13,9 +13,9 @@ PORTAL_CLIENT_ID = os.getenv("BL_PORTAL_CLIENT_ID", "7qL5jGGai6MqBCatVeoihQx5dKE
 MOBILE_CLIENT_ID = os.getenv("BL_MOBILE_CLIENT_ID", "")
 PORTAL_PAGE_SIZE = 50
 
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_S", "0.5"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_S", "0.3"))
 MAX_WORKERS = max(1, int(os.getenv("MAX_WORKERS", "10")))
-RIDES_REFRESH_INTERVAL_S = int(os.getenv("RIDES_REFRESH_INTERVAL_S", "86400"))
+RIDES_REFRESH_INTERVAL_S = int(os.getenv("RIDES_REFRESH_INTERVAL_S", "3600"))
 HTTP_POOL_SIZE = max(4, int(os.getenv("HTTP_POOL_SIZE", "32")))
 
 # Filter cache (seconds)
@@ -23,7 +23,7 @@ FILTERS_CACHE_TTL_S = int(os.getenv("FILTERS_CACHE_TTL_S", "15"))
 
 # Burst polling (seconds)
 BURST_POLL_INTERVAL_S = float(os.getenv("BURST_POLL_INTERVAL_S", "0.3"))
-BURST_DURATION_S = float(os.getenv("BURST_DURATION_S", "6"))
+BURST_DURATION_S = float(os.getenv("BURST_DURATION_S", "0"))
 
 # HTTP timeouts (seconds)
 P1_POLL_TIMEOUT_S = int(os.getenv("P1_POLL_TIMEOUT_S", "8"))
