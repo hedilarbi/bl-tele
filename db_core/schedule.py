@@ -29,6 +29,10 @@ def add_blocked_day(bot_id: str, telegram_id: int, day_str: str):
     """,
         (bot_id, telegram_id, day_str),
     )
+    c.execute(
+        "UPDATE users SET cache_version = COALESCE(cache_version, 0) + 1 WHERE bot_id = ? AND telegram_id = ?",
+        (bot_id, telegram_id),
+    )
     conn.commit()
     conn.close()
 
@@ -36,6 +40,11 @@ def add_blocked_day(bot_id: str, telegram_id: int, day_str: str):
 def delete_blocked_day(bot_id: str, day_id: int):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    c.execute(
+        "UPDATE users SET cache_version = COALESCE(cache_version, 0) + 1 "
+        "WHERE bot_id = ? AND telegram_id = (SELECT telegram_id FROM blocked_days WHERE id = ? AND bot_id = ?)",
+        (bot_id, day_id, bot_id),
+    )
     c.execute("DELETE FROM blocked_days WHERE id = ? AND bot_id = ?", (day_id, bot_id))
     conn.commit()
     conn.close()

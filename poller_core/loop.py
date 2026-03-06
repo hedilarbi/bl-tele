@@ -18,7 +18,6 @@ from .config import (
     BURST_POLL_INTERVAL_S,
     BURST_DURATION_S,
     MAX_WORKERS,
-    RIDES_REFRESH_INTERVAL_S,
     LOG_OFFERS_PAYLOAD,
     MAX_LOGGED_OFFERS,
     OFFER_MEMORY_DEDUPE,
@@ -29,21 +28,28 @@ from .config import (
 from .state import (
     maybe_reset_inmem_caches,
     cleanup_not_valid_cache,
-    get_rides_cache,
+    get_rides_intervals,
+    maybe_cleanup_rides,
+    invalidate_rides_cache,
     get_offers_etag,
     set_offers_etag,
     get_user_runtime_cache,
     set_user_runtime_cache,
+    mark_token_invalid,
+    is_token_invalid,
+    get_portal_token_mem,
+    set_portal_token_mem,
+    clear_portal_token_mem,
 )
 from .utils import _normalize_formulas
 from .p1_client import get_offers_p1
-from .p1_auth import maybe_refresh_p1_session, is_p1_token_expired
+from .p1_auth import is_p1_token_expired
 from .p2_client import (
     _map_portal_offer,
     _athena_get_offers,
     _ensure_portal_token,
 )
-from .processing import debug_print_offers, _process_offers_for_user, _refresh_rides_cache_async
+from .processing import debug_print_offers, _process_offers_for_user, _init_rides_cache_async
 from .filters import _get_enabled_filter_slugs
 from .metrics import format_line, observe_ms
 from .notify import (
@@ -82,6 +88,23 @@ print = _quiet_print
 _burst_until = 0.0
 _burst_lock = threading.Lock()
 _user_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+# Dedicated executor for parallel P1+P2 fetch inside poll_user.
+# Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
+_fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
+
+# Cache for the active-users DB query: refreshed every 3 seconds instead of every 200ms.
+_USERS_CACHE_TTL_S = 3.0
+_users_cache_data: Optional[list] = None
+_users_cache_ts: float = 0.0
+
+
+def _get_users_cached() -> list:
+    global _users_cache_data, _users_cache_ts
+    now = time.time()
+    if _users_cache_data is None or (now - _users_cache_ts) >= _USERS_CACHE_TTL_S:
+        _users_cache_data = get_all_users_with_bot_admin_active()
+        _users_cache_ts = now
+    return _users_cache_data or []
 
 
 def _bump_burst():
@@ -224,34 +247,24 @@ def poll_user(user):
 
     poll_real_orders = ALWAYS_POLL_REAL_ORDERS and not (USE_MOCK_P1 and USE_MOCK_P2)
 
-    def _refresh_p1_token(force: bool = False, trigger: str = "unspecified") -> bool:
-        nonlocal token, mobile_headers
-        new_token, new_headers, refreshed, note = maybe_refresh_p1_session(
-            bot_id=bot_id,
-            telegram_id=telegram_id,
-            token=token,
-            mobile_headers=mobile_headers,
-            force=force,
-            trigger=trigger,
-        )
-        if refreshed and new_token:
-            token = new_token
-            mobile_headers = new_headers
-            print(f"[{datetime.now()}] 🔁 P1 token refreshed for user {telegram_id} (trigger={trigger})")
-            return True
-        return False
+    # Skip immediately if this user's token was already marked invalid (unchanged since 401/403)
+    if is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version)):
+        return f"Skipped {telegram_id} (token invalid — waiting for update)"
 
-    def _set_expired_and_pin():
-        set_token_status(bot_id, telegram_id, "expired")
+    def _set_token_problem(kind: str):
+        """Mark token invalid in memory + send pinned warning. kind: 'no_token' | 'expired'"""
+        mark_token_invalid(bot_id, telegram_id, token, cache_version)
+        set_token_status(bot_id, telegram_id, "expired" if kind == "expired" else "unknown")
         existing = get_pinned_warnings(bot_id, telegram_id)
-        if not existing["expired_msg_id"]:
-            if existing["no_token_msg_id"]:
-                bot_token = _resolve_bot_token(bot_id, telegram_id)
-                tg_unpin_message(bot_token, telegram_id, existing["no_token_msg_id"])
-                clear_pinned_warning(bot_id, telegram_id, "no_token")
-            pin_warning_if_needed(bot_id, telegram_id, "expired")
-
-    _refresh_p1_token(force=False, trigger="poll_cycle_start")
+        target_id = existing.get("expired_msg_id") if kind == "expired" else existing.get("no_token_msg_id")
+        if not target_id:
+            other = "no_token" if kind == "expired" else "expired"
+            other_id = existing.get("no_token_msg_id") if kind == "expired" else existing.get("expired_msg_id")
+            if other_id:
+                bot_tok = _resolve_bot_token(bot_id, telegram_id)
+                tg_unpin_message(bot_tok, telegram_id, other_id)
+                clear_pinned_warning(bot_id, telegram_id, other)
+            pin_warning_if_needed(bot_id, telegram_id, kind)
 
     # ---------- PLATFORM 1 OFFERS ----------
     offers_p1: List[dict] = []
@@ -317,45 +330,31 @@ def poll_user(user):
 
     def _fetch_p1_offers_real():
         if not token or not str(token).strip():
-            _refresh_p1_token(force=False, trigger="p1_offers_no_token")
-        if token and str(token).strip():
-            t0 = time.perf_counter()
-            status_code, results = get_offers_p1(token, headers=mobile_headers)
-            observe_ms("p1_fetch_ms", (time.perf_counter() - t0) * 1000.0)
-            if status_code in (401, 403) and _refresh_p1_token(force=True, trigger="p1_offers_unauthorized"):
-                t1 = time.perf_counter()
-                status_code, results = get_offers_p1(token, headers=mobile_headers)
-                observe_ms("p1_fetch_ms", (time.perf_counter() - t1) * 1000.0)
-            if status_code in (401, 403):
-                is_expired = status_code == 401 or (status_code == 403 and is_p1_token_expired(token, skew_s=0))
-                if is_expired:
-                    _set_expired_and_pin()
-                else:
-                    set_token_status(bot_id, telegram_id, "unknown")
-                    unpin_warning_if_any(bot_id, telegram_id, "expired")
-                    print(f"[{datetime.now()}] ⚠️ P1 offers forbidden (403) for user {telegram_id} (not marked expired).")
-                print(f"[{datetime.now()}] ⚠️ P1 offers returned {status_code} for user {telegram_id}")
-                return []
-            if status_code == 200:
-                set_token_status(bot_id, telegram_id, "valid")
-                unpin_warning_if_any(bot_id, telegram_id, "expired")
-                unpin_warning_if_any(bot_id, telegram_id, "no_token")
-                offers = results or []
-                _log_offers_found("P1", telegram_id, offers)
-                return offers
-            if status_code is None:
-                err_detail = results.get("error") if isinstance(results, dict) else None
-                if err_detail:
-                    print(f"[{datetime.now()}] ⚠️ P1 offers error for user {telegram_id} | {err_detail}")
-                else:
-                    print(f"[{datetime.now()}] ⚠️ P1 offers returned None for user {telegram_id} | body={results}")
-            else:
-                print(f"[{datetime.now()}] ⚠️ P1 offers returned {status_code} for user {telegram_id} | body={results}")
+            _set_token_problem("no_token")
             return []
-
-        existing = get_pinned_warnings(bot_id, telegram_id)
-        if not existing["expired_msg_id"] and not existing["no_token_msg_id"]:
-            pin_warning_if_needed(bot_id, telegram_id, "no_token")
+        t0 = time.perf_counter()
+        status_code, results = get_offers_p1(token, headers=mobile_headers)
+        observe_ms("p1_fetch_ms", (time.perf_counter() - t0) * 1000.0)
+        if status_code in (401, 403):
+            kind = "expired" if (status_code == 401 or is_p1_token_expired(token, skew_s=0)) else "expired"
+            _set_token_problem(kind)
+            _poll_log(f"⚠️ P1 offers returned {status_code} for user {telegram_id} — token marked invalid")
+            return []
+        if status_code == 200:
+            set_token_status(bot_id, telegram_id, "valid")
+            unpin_warning_if_any(bot_id, telegram_id, "expired")
+            unpin_warning_if_any(bot_id, telegram_id, "no_token")
+            offers = results or []
+            _log_offers_found("P1", telegram_id, offers)
+            return offers
+        if status_code is None:
+            err_detail = results.get("error") if isinstance(results, dict) else None
+            if err_detail:
+                _poll_log(f"⚠️ P1 offers error for user {telegram_id} | {err_detail}")
+            else:
+                _poll_log(f"⚠️ P1 offers returned None for user {telegram_id} | body={results}")
+        else:
+            _poll_log(f"⚠️ P1 offers returned {status_code} for user {telegram_id} | body={results}")
         return []
 
     # ---------- PLATFORM 2 OFFERS (Portal/Athena) ----------
@@ -493,10 +492,13 @@ def poll_user(user):
         nonlocal portal_token
         if not ENABLE_P2:
             return [], portal_token
-        tok = portal_token
+        # Check in-memory cache first — avoids a DB read every 200ms cycle.
+        tok = portal_token or get_portal_token_mem(bot_id, telegram_id)
         if not tok and has_portal_creds:
             tok = _ensure_portal_token(bot_id, telegram_id, email, password)
-            portal_token = tok
+            if tok:
+                set_portal_token_mem(bot_id, telegram_id, tok)
+        portal_token = tok
         if not tok:
             return [], tok
         etag = get_offers_etag(bot_id, telegram_id) if ATHENA_USE_OFFERS_ETAG else None
@@ -508,16 +510,16 @@ def poll_user(user):
             print(f"[{datetime.now()}] 🛰️ Athena offers status={status_code} for user {telegram_id}")
 
         if status_code in (401, 403):
-            print(f"[{datetime.now()}] ⚠️ Athena token unauthorized for user {telegram_id}. Re-logging...")
+            _poll_log(f"⚠️ Athena token unauthorized for user {telegram_id}. Re-logging...")
+            clear_portal_token_mem(bot_id, telegram_id)
             tok = _ensure_portal_token(bot_id, telegram_id, email, password)
             if tok:
+                set_portal_token_mem(bot_id, telegram_id, tok)
                 t1 = time.perf_counter()
                 status_code, payload, new_etag = _athena_get_offers(tok)
                 observe_ms("p2_fetch_ms", (time.perf_counter() - t1) * 1000.0)
                 if ATHENA_PRINT_DEBUG:
-                    print(
-                        f"[{datetime.now()}] 🛰️ Athena offers (after re-login) status={status_code} for user {telegram_id}"
-                    )
+                    _poll_log(f"🛰️ Athena offers (after re-login) status={status_code} for user {telegram_id}")
 
         offers: List[dict] = []
         if status_code == 200 and isinstance(payload, dict):
@@ -530,22 +532,25 @@ def poll_user(user):
                     offers.append(mapped)
             _log_offers_found("P2", telegram_id, offers)
         elif status_code == 304 and ATHENA_PRINT_DEBUG:
-            print(f"[{datetime.now()}] 📦 Athena offers 304 Not Modified for user {telegram_id}")
+            _poll_log(f"📦 Athena offers 304 Not Modified for user {telegram_id}")
         return offers, tok
 
     if not USE_MOCK_P1 or not USE_MOCK_P2:
         if ENABLE_P1 and ENABLE_P2 and not USE_MOCK_P1 and not USE_MOCK_P2:
-            # P1 fast lane:
-            # query P1 first; only query P2 when P1 is empty.
-            # This avoids launching/canceling a P2 request that still consumes resources.
-            offers_p1 = _fetch_p1_offers_real()
-            if not offers_p1:
-                offers_p2, portal_token = _fetch_p2_offers_real()
-            elif ATHENA_PRINT_DEBUG:
-                _poll_log(
-                    f"⚡ P1 fast lane for {bot_id}/{telegram_id} "
-                    f"(offers_p1={len(offers_p1)}), P2 deferred to next cycle"
-                )
+            # Parallel P1+P2: both requests fired simultaneously.
+            # Eliminates the sequential RTT wasted waiting for P1 before starting P2.
+            _f1 = _fetch_executor.submit(_fetch_p1_offers_real)
+            _f2 = _fetch_executor.submit(_fetch_p2_offers_real)
+            try:
+                offers_p1 = _f1.result()
+            except Exception:
+                offers_p1 = []
+            try:
+                _p2_res = _f2.result()
+                if isinstance(_p2_res, tuple):
+                    offers_p2, portal_token = _p2_res
+            except Exception:
+                offers_p2 = []
         else:
             if ENABLE_P1 and not USE_MOCK_P1:
                 offers_p1 = _fetch_p1_offers_real()
@@ -553,40 +558,44 @@ def poll_user(user):
                 offers_p2, portal_token = _fetch_p2_offers_real()
 
     # ---------- Combine and process ----------
-    all_offers = (offers_p1 or []) + (offers_p2 or [])
+    # Deduplicate by offer id: P1 wins if the same id appears on both platforms.
     now_ts = time.time()
-    for offer in all_offers:
-        if isinstance(offer, dict) and offer.get("_poll_ts") is None:
+    _seen_ids: set = set()
+    all_offers: List[dict] = []
+    for offer in (offers_p1 or []) + (offers_p2 or []):
+        if not isinstance(offer, dict):
+            continue
+        oid = offer.get("id")
+        if oid and oid in _seen_ids:
+            continue
+        if oid:
+            _seen_ids.add(oid)
+        if offer.get("_poll_ts") is None:
             offer["_poll_ts"] = now_ts
+        all_offers.append(offer)
 
     if poll_real_orders:
-        cached_intervals, cached_ts = get_rides_cache(bot_id, telegram_id)
-        accepted_intervals = cached_intervals or []
-        now_ts = time.time()
-        needs_refresh = (
-            cached_intervals is None
-            or cached_ts is None
-            or ((now_ts - cached_ts) >= RIDES_REFRESH_INTERVAL_S)
-        )
-        p2_refresh_token = portal_token if portal_token else None
-        p1_refresh_token = token if ((not has_portal_creds) and token and str(token).strip()) else None
-        if needs_refresh and (p2_refresh_token or p1_refresh_token):
-            _refresh_rides_cache_async(
-                bot_id,
-                telegram_id,
-                tz_name,
-                p1_refresh_token,
-                mobile_headers,
-                p2_refresh_token,
-                bl_uuid=bl_uuid,
-                portal_email=email,
-                portal_password=password,
-            )
-            if ATHENA_PRINT_DEBUG:
-                _poll_log(
-                    f"🧵 Rides refresh scheduled async for {bot_id}/{telegram_id} "
-                    f"(cached={'yes' if cached_intervals is not None else 'no'})"
+        maybe_cleanup_rides(bot_id, telegram_id)
+        cached_intervals = get_rides_intervals(bot_id, telegram_id)
+        if cached_intervals is None:
+            # First time: lazy-init rides cache in background (one-shot fetch)
+            p2_init_token = portal_token if portal_token else None
+            p1_init_token = token if (not has_portal_creds and token and str(token).strip()) else None
+            if p2_init_token or p1_init_token:
+                _init_rides_cache_async(
+                    bot_id,
+                    telegram_id,
+                    tz_name,
+                    p1_init_token,
+                    mobile_headers,
+                    p2_init_token,
+                    bl_uuid=bl_uuid,
+                    portal_email=email,
+                    portal_password=password,
                 )
+                if ATHENA_PRINT_DEBUG:
+                    _poll_log(f"🧵 Rides init scheduled async for {bot_id}/{telegram_id}")
+        accepted_intervals = cached_intervals or []
 
     if not all_offers:
         print(f"[{datetime.now()}] ℹ️ No offers for user {telegram_id} this cycle")
@@ -627,13 +636,16 @@ def run():
     inflight: Dict[Tuple[str, int], tuple] = {}
     cycle_idx = 0
 
+    _LOG_CYCLE_EVERY = 25         # print scheduler stats every ~5s at 200ms interval
+    _CLEANUP_CYCLE_EVERY = 100    # cleanup not_valid cache every ~20s
+
     while True:
         cycle_idx += 1
-        cleanup_not_valid_cache()
+        if cycle_idx % _CLEANUP_CYCLE_EVERY == 0:
+            cleanup_not_valid_cache()
         if OFFER_MEMORY_DEDUPE:
             maybe_reset_inmem_caches()
-        _poll_log("🔄 Starting polling cycle")
-        users = get_all_users_with_bot_admin_active()
+        users = _get_users_cached()
         now_ts = time.time()
 
         completed = 0
@@ -659,12 +671,13 @@ def run():
             inflight[key] = (_user_executor.submit(poll_user, user), now_ts)
             launched += 1
 
-        _poll_log(
-            f"👥 Poll scheduler: eligible={len(users)} in_flight={len(inflight)} "
-            f"launched={launched} completed={completed}"
-        )
-        if not users:
-            _poll_log("⚠️ No eligible users (requires users.active=1 and bot_instances.admin_active=1).")
+        if cycle_idx % _LOG_CYCLE_EVERY == 0:
+            _poll_log(
+                f"👥 Poll scheduler: eligible={len(users)} in_flight={len(inflight)} "
+                f"launched={launched} completed={completed}"
+            )
+            if not users:
+                _poll_log("⚠️ No eligible users (requires users.active=1 and bot_instances.admin_active=1).")
         if cycle_idx % METRICS_LOG_EVERY_CYCLES == 0:
             _poll_log(
                 "📈 "

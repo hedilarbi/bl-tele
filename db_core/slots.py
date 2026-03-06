@@ -13,6 +13,10 @@ def add_booked_slot(bot_id: str, telegram_id: int, from_time: str, to_time: str,
     """,
         (bot_id, telegram_id, from_time, to_time, name),
     )
+    c.execute(
+        "UPDATE users SET cache_version = COALESCE(cache_version, 0) + 1 WHERE bot_id = ? AND telegram_id = ?",
+        (bot_id, telegram_id),
+    )
     conn.commit()
     conn.close()
 
@@ -36,6 +40,11 @@ def get_booked_slots(bot_id: str, telegram_id: int):
 def delete_booked_slot(bot_id: str, slot_id: int):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    c.execute(
+        "UPDATE users SET cache_version = COALESCE(cache_version, 0) + 1 "
+        "WHERE bot_id = ? AND telegram_id = (SELECT telegram_id FROM booked_slots WHERE id = ? AND bot_id = ?)",
+        (bot_id, slot_id, bot_id),
+    )
     c.execute("DELETE FROM booked_slots WHERE id = ? AND bot_id = ?", (slot_id, bot_id))
     conn.commit()
     conn.close()

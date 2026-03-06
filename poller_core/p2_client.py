@@ -433,7 +433,7 @@ def _filter_rides_by_bl_uuid(raw_items: list, bl_uuid: str) -> list:
     - Mobile: item['chauffeur']['id']
     """
     if not bl_uuid:
-        return raw_items or []
+        return []
 
     filtered = []
     for it in (raw_items or []):

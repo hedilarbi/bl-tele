@@ -29,6 +29,7 @@ from .utils import (
     _compute_ends_at,
     _fmt_local_iso,
     _extract_addr,
+    _parse_user_slot_local,
 )
 from .filters import (
     _get_enabled_filter_slugs,
@@ -42,6 +43,8 @@ from .state import (
     rejected_per_user,
     invalidate_rides_cache,
     set_rides_cache,
+    set_rides_fetched,
+    add_ride_to_cache,
     is_recent_not_valid,
     mark_not_valid_cached,
 )
@@ -123,6 +126,82 @@ def _refresh_rides_cache_async(
     def _job():
         try:
             _refresh_rides_cache_now(
+                bot_id,
+                telegram_id,
+                tz_name,
+                p1_token,
+                p1_headers,
+                p2_token,
+                bl_uuid=bl_uuid,
+                portal_email=portal_email,
+                portal_password=portal_password,
+            )
+        except Exception:
+            invalidate_rides_cache(bot_id, telegram_id)
+
+    _bg_executor.submit(_job)
+
+
+def _init_rides_cache_now(
+    bot_id: str,
+    telegram_id: int,
+    tz_name: str,
+    p1_token: Optional[str],
+    p1_headers: Optional[dict],
+    p2_token: Optional[str],
+    bl_uuid: Optional[str] = None,
+    portal_email: Optional[str] = None,
+    portal_password: Optional[str] = None,
+):
+    """Fetch rides once and store keyed by ride_id. Called on first poll only."""
+    rides_dict: Dict[str, Any] = {}
+    p2_tok = p2_token
+    if not p2_tok and portal_email and portal_password:
+        p2_tok = _ensure_portal_token(bot_id, telegram_id, portal_email, portal_password)
+
+    if p2_tok:
+        status_code, payload, _ = _athena_get_rides(p2_tok)
+        if status_code == 200 and isinstance(payload, dict):
+            data_all = (payload or {}).get("data") or []
+            data_kept = _filter_rides_by_bl_uuid(data_all, bl_uuid) if bl_uuid else []
+            for r in data_kept:
+                rid = str(r.get("id") or "")
+                if not rid:
+                    continue
+                attrs = r.get("attributes") or {}
+                intervals = _extract_intervals_from_rides(
+                    [attrs | {"starts_at": attrs.get("starts_at")}]
+                )
+                if intervals:
+                    rides_dict[f"p2_{rid}"] = intervals[0]
+
+    if p1_token:
+        status_code, ride_results = get_rides_p1(p1_token, headers=p1_headers)
+        if status_code == 200 and isinstance(ride_results, list):
+            kept = _filter_rides_by_bl_uuid(ride_results, bl_uuid) if bl_uuid else []
+            for i, r in enumerate(kept):
+                rid = str(r.get("id") or f"_p1_{i}")
+                intervals = _extract_intervals_from_rides([r])
+                if intervals:
+                    rides_dict[f"p1_{rid}"] = intervals[0]
+
+    set_rides_fetched(bot_id, telegram_id, rides_dict)
+
+
+def _init_rides_cache_async(
+    bot_id: str,
+    telegram_id: int,
+    tz_name: str,
+    p1_token: Optional[str],
+    p1_headers: Optional[dict],
+    p2_token: Optional[str],
+    bl_uuid: Optional[str] = None,
+    portal_email: Optional[str] = None,
+    portal_password: Optional[str] = None,
+):
+    def _job():
+        try:
+            _init_rides_cache_now(
                 bot_id,
                 telegram_id,
                 tz_name,
@@ -552,13 +631,27 @@ def _process_offers_for_user(
                 f"| endsAt={_fmt_local_iso(end, tz_name)} | formula={fstr}"
             )
 
-        # --- 0) Working hours & blocked days (user timezone) ---
+        # --- 0a) Vehicle class — cheapest filter, checked FIRST to short-circuit early ---
         filter_results: List[dict] = []
         accept_override = False
 
         def record_result(name: str, ok: bool, detail: Optional[str] = None):
             filter_results.append({"name": name, "ok": bool(ok), "detail": detail})
 
+        otype_dict = class_state.get(otype, {})
+        matched_vc = next((cls for cls in otype_dict.keys() if cls.lower() == raw_vc.lower()), None)
+        enabled = otype_dict.get(matched_vc, 0) if matched_vc else 0
+        record_result("Classe véhicule", bool(enabled), f"{otype} '{raw_vc}' désactivé" if not enabled else None)
+        if not enabled:
+            # Vehicle class disabled: skip all remaining filters immediately.
+            if oid:
+                mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
+            _log_offer_decision_async(bot_id, telegram_id, offer, "rejected", f"{otype} '{raw_vc}' désactivé")
+            observe_ms("offer_filter_ms", (time.perf_counter() - filter_t0) * 1000.0)
+            observe_ms("offer_end2end_ms", _poll_latency_ms(offer))
+            continue
+
+        # --- 0b) Working hours & blocked days (user timezone) ---
         pickup_local = pickup.astimezone(gettz(tz_name))
         pickup_t = pickup_local.time()
 
@@ -725,12 +818,6 @@ def _process_offers_for_user(
             else:
                 record_result("Vols bloqués", True, "aucun numéro de vol")
 
-        # 4) Class filter
-        otype_dict = class_state.get(otype, {})
-        matched_vc = next((cls for cls in otype_dict.keys() if cls.lower() == raw_vc.lower()), None)
-        enabled = otype_dict.get(matched_vc, 0) if matched_vc else 0
-        record_result("Classe véhicule", bool(enabled), f"{otype} '{raw_vc}' désactivé" if not enabled else None)
-
         # 5) Booked-slots (user tz) – overlap using start & end
         ends_at_iso = rid.get("endsAt")
         offer_end_local = None
@@ -739,7 +826,6 @@ def _process_offers_for_user(
             if parsed_end is not None:
                 offer_end_local = parsed_end.astimezone(gettz(tz_name))
 
-        from .utils import _parse_user_slot_local
         conflict_reason = None
         for slot in booked_slots:
             start_local = _parse_user_slot_local(slot.get("from"), tz_name)
@@ -917,7 +1003,6 @@ def _process_offers_for_user(
         if reserve_batch_started_at is not None:
             observe_ms("reserve_batch_ms", (time.perf_counter() - reserve_batch_started_at) * 1000.0)
 
-    refresh_rides_after_success = False
     for idx, cand in enumerate(reserve_candidates):
         offer_to_log = cand["offer"]
         oid = cand["oid"]
@@ -949,7 +1034,8 @@ def _process_offers_for_user(
                         f"(status={rs}) body={rb}"
                     )
             else:
-                refresh_rides_after_success = True
+                if pickup_dt is not None:
+                    add_ride_to_cache(bot_id, telegram_id, oid, pickup_dt, predicted_end)
                 if ATHENA_PRINT_DEBUG:
                     _builtins.print(
                         f"[{datetime.now()}] 🎯 {platform.upper()} reserve {oid} -> {rs} "
@@ -1002,19 +1088,6 @@ def _process_offers_for_user(
             else:
                 rejected_per_user[bot_id][telegram_id][platform].add(oid)
         observe_ms("offer_end2end_ms", _poll_latency_ms(offer_to_log))
-
-    if refresh_rides_after_success:
-        _refresh_rides_cache_async(
-            bot_id,
-            telegram_id,
-            tz_name,
-            p1_token,
-            p1_headers,
-            p2_token,
-            bl_uuid=bl_uuid,
-            portal_email=portal_email,
-            portal_password=portal_password,
-        )
 
     for kind, text, platform_name, reply_markup, force_notify in pending_notifications:
         _send_notification_async(
