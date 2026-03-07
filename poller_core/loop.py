@@ -22,8 +22,6 @@ from .config import (
     MAX_LOGGED_OFFERS,
     OFFER_MEMORY_DEDUPE,
     ATHENA_USE_OFFERS_ETAG,
-    TRACE_USER_POLL,
-    METRICS_LOG_EVERY_CYCLES,
 )
 from .state import (
     maybe_reset_inmem_caches,
@@ -43,15 +41,15 @@ from .state import (
 )
 from .utils import _normalize_formulas
 from .p1_client import get_offers_p1
-from .p1_auth import is_p1_token_expired
 from .p2_client import (
     _map_portal_offer,
     _athena_get_offers,
     _ensure_portal_token,
 )
 from .processing import debug_print_offers, _process_offers_for_user, _init_rides_cache_async
+from .p1_client import warmup_p1_reserve_connection
 from .filters import _get_enabled_filter_slugs
-from .metrics import format_line, observe_ms
+from .metrics import observe_ms
 from .notify import (
     pin_warning_if_needed,
     unpin_warning_if_any,
@@ -134,26 +132,6 @@ def _log_offers_found(platform: str, telegram_id: int, offers: List[dict]):
     if not offers:
         return
     _bump_burst()
-    if LOG_OFFERS_PAYLOAD:
-        try:
-            payload = json.dumps(offers, ensure_ascii=True, default=str)
-        except Exception:
-            payload = str(offers)
-        _builtins.print(
-            f"[{datetime.now()}] ✅ {platform} offers found for user {telegram_id}: {len(offers)} | {payload}"
-        )
-        return
-
-    sample = []
-    for off in (offers or [])[: max(0, MAX_LOGGED_OFFERS)]:
-        oid = off.get("id")
-        price = off.get("price")
-        curr = off.get("currency") or ""
-        sample.append(f"{oid}:{price}{curr}")
-    suffix = f" | sample={sample}" if sample else ""
-    _builtins.print(
-        f"[{datetime.now()}] ✅ {platform} offers found for user {telegram_id}: {len(offers)}{suffix}"
-    )
 
 
 def _read_portal_creds(bot_id: str, telegram_id: int) -> Tuple[Optional[str], Optional[str]]:
@@ -230,13 +208,6 @@ def poll_user(user):
                 "email": email,
                 "password": password,
             },
-        )
-
-    if TRACE_USER_POLL:
-        _poll_log(
-            f"🔍 Polling {bot_id}/{telegram_id} "
-            f"(active={active}, admin_active={bot_admin_active}, cache_v={cache_version}, "
-            f"runtime_cache={'hit' if runtime_cached else 'miss'})"
         )
 
     # ---------- Build busy intervals from Rides (Athena preferred) ----------
@@ -329,6 +300,7 @@ def poll_user(user):
         ]
 
     def _fetch_p1_offers_real():
+        nonlocal token, mobile_headers
         if not token or not str(token).strip():
             _set_token_problem("no_token")
             return []
@@ -336,9 +308,8 @@ def poll_user(user):
         status_code, results = get_offers_p1(token, headers=mobile_headers)
         observe_ms("p1_fetch_ms", (time.perf_counter() - t0) * 1000.0)
         if status_code in (401, 403):
-            kind = "expired" if (status_code == 401 or is_p1_token_expired(token, skew_s=0)) else "expired"
-            _set_token_problem(kind)
-            _poll_log(f"⚠️ P1 offers returned {status_code} for user {telegram_id} — token marked invalid")
+            _set_token_problem("expired")
+            _poll_log(f"⚠️ P1 offers {status_code} for user {telegram_id} — token marked invalid")
             return []
         if status_code == 200:
             set_token_status(bot_id, telegram_id, "valid")
@@ -506,9 +477,6 @@ def poll_user(user):
         status_code, payload, new_etag = _athena_get_offers(tok, etag=etag)
         observe_ms("p2_fetch_ms", (time.perf_counter() - t0) * 1000.0)
 
-        if ATHENA_PRINT_DEBUG:
-            print(f"[{datetime.now()}] 🛰️ Athena offers status={status_code} for user {telegram_id}")
-
         if status_code in (401, 403):
             _poll_log(f"⚠️ Athena token unauthorized for user {telegram_id}. Re-logging...")
             clear_portal_token_mem(bot_id, telegram_id)
@@ -518,8 +486,6 @@ def poll_user(user):
                 t1 = time.perf_counter()
                 status_code, payload, new_etag = _athena_get_offers(tok)
                 observe_ms("p2_fetch_ms", (time.perf_counter() - t1) * 1000.0)
-                if ATHENA_PRINT_DEBUG:
-                    _poll_log(f"🛰️ Athena offers (after re-login) status={status_code} for user {telegram_id}")
 
         offers: List[dict] = []
         if status_code == 200 and isinstance(payload, dict):
@@ -531,8 +497,6 @@ def poll_user(user):
                 if mapped:
                     offers.append(mapped)
             _log_offers_found("P2", telegram_id, offers)
-        elif status_code == 304 and ATHENA_PRINT_DEBUG:
-            _poll_log(f"📦 Athena offers 304 Not Modified for user {telegram_id}")
         return offers, tok
 
     if not USE_MOCK_P1 or not USE_MOCK_P2:
@@ -593,12 +557,9 @@ def poll_user(user):
                     portal_email=email,
                     portal_password=password,
                 )
-                if ATHENA_PRINT_DEBUG:
-                    _poll_log(f"🧵 Rides init scheduled async for {bot_id}/{telegram_id}")
         accepted_intervals = cached_intervals or []
 
     if not all_offers:
-        print(f"[{datetime.now()}] ℹ️ No offers for user {telegram_id} this cycle")
         return f"Done with user {telegram_id}"
 
     debug_print_offers(telegram_id, all_offers)
@@ -630,19 +591,45 @@ def _user_key(user_row) -> Tuple[str, int]:
     return (str(user_row[0]), int(user_row[1]))
 
 
+def _warmup_reserve_connections_async():
+    """Fire-and-forget: warm up P1+P2 reserve connections using first available user token."""
+    def _job():
+        try:
+            users = _get_users_cached()
+            for u in users:
+                tok = u[2] if len(u) > 2 else None
+                hdrs = None
+                try:
+                    from db import get_mobile_headers as _gmh
+                    hdrs = _gmh(u[0], u[1])
+                except Exception:
+                    pass
+                if tok and str(tok).strip():
+                    warmup_p1_reserve_connection(tok, hdrs)
+                    return
+        except Exception:
+            pass
+    _fetch_executor.submit(_job)
+
+
 def run():
     init_db()
     _poll_log("🚀 Poller started")
     inflight: Dict[Tuple[str, int], tuple] = {}
     cycle_idx = 0
 
-    _LOG_CYCLE_EVERY = 25         # print scheduler stats every ~5s at 200ms interval
     _CLEANUP_CYCLE_EVERY = 100    # cleanup not_valid cache every ~20s
+    _WARMUP_CYCLE_EVERY = 225     # re-warm reserve connections every ~45s
+
+    # Pre-warm reserve connections immediately at startup
+    _warmup_reserve_connections_async()
 
     while True:
         cycle_idx += 1
         if cycle_idx % _CLEANUP_CYCLE_EVERY == 0:
             cleanup_not_valid_cache()
+        if cycle_idx % _WARMUP_CYCLE_EVERY == 0:
+            _warmup_reserve_connections_async()
         if OFFER_MEMORY_DEDUPE:
             maybe_reset_inmem_caches()
         users = _get_users_cached()
@@ -671,25 +658,4 @@ def run():
             inflight[key] = (_user_executor.submit(poll_user, user), now_ts)
             launched += 1
 
-        if cycle_idx % _LOG_CYCLE_EVERY == 0:
-            _poll_log(
-                f"👥 Poll scheduler: eligible={len(users)} in_flight={len(inflight)} "
-                f"launched={launched} completed={completed}"
-            )
-            if not users:
-                _poll_log("⚠️ No eligible users (requires users.active=1 and bot_instances.admin_active=1).")
-        if cycle_idx % METRICS_LOG_EVERY_CYCLES == 0:
-            _poll_log(
-                "📈 "
-                + " | ".join(
-                    [
-                        format_line("offer_filter_ms"),
-                        format_line("p1_fetch_ms"),
-                        format_line("p2_fetch_ms"),
-                        format_line("reserve_rtt_ms"),
-                        format_line("reserve_batch_ms"),
-                        format_line("offer_end2end_ms"),
-                    ]
-                )
-            )
         time.sleep(_sleep_interval())

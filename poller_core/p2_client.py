@@ -61,6 +61,29 @@ def _session_request(method: str, url: str, **kwargs):
     return sess.request(method=method, url=url, **kwargs)
 
 
+# ── Shared reserve session (P2) ──────────────────────────────────────────────
+_p2_reserve_session_lock = threading.Lock()
+_p2_reserve_session: Optional[requests.Session] = None
+
+
+def _get_p2_reserve_session() -> requests.Session:
+    global _p2_reserve_session
+    if _p2_reserve_session is None:
+        with _p2_reserve_session_lock:
+            if _p2_reserve_session is None:
+                sess = requests.Session()
+                sess.trust_env = False
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=HTTP_POOL_SIZE,
+                    pool_maxsize=HTTP_POOL_SIZE,
+                    max_retries=0,
+                )
+                sess.mount("https://", adapter)
+                sess.mount("http://", adapter)
+                _p2_reserve_session = sess
+    return _p2_reserve_session
+
+
 def _safe_attr(d, *keys, default=None):
     cur = d
     for k in keys:
@@ -239,7 +262,12 @@ def reserve_offer_p2(
     payload = {"action": "accept", "id": str(offer_id), "price": float(price)}
 
     try:
-        r = _session_request("POST", url, headers=headers, json=payload, timeout=P2_RESERVE_TIMEOUT_S)
+        sess = _get_p2_reserve_session()
+        try:
+            sess.cookies.clear()
+        except Exception:
+            pass
+        r = sess.request("POST", url, headers=headers, json=payload, timeout=P2_RESERVE_TIMEOUT_S)
         try:
             body = r.json()
         except Exception:

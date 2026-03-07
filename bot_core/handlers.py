@@ -128,13 +128,7 @@ def _save_mobile_input_for_user(
     if not token_candidate or not headers_from_dump:
         return "❌ Invalid input. Send a full HTTP dump including Authorization + headers."
 
-    update_token(
-        bot_id,
-        user_id,
-        token_candidate,
-        headers=headers_from_dump,
-        auth_meta={},  # clear legacy oauth refresh traces
-    )
+    update_token(bot_id, user_id, token_candidate, headers=headers_from_dump, auth_meta={})
 
     ok, note = validate_mobile_session(token_candidate, headers_from_dump)
     if ok:
@@ -143,17 +137,13 @@ def _save_mobile_input_for_user(
         next_status = "expired"
     else:
         next_status = "unknown"
-    set_token_status(
-        bot_id,
-        user_id,
-        next_status,
-    )
+    set_token_status(bot_id, user_id, next_status)
     if ok:
         unpin_warning_if_any(bot_id, user_id, "no_token", bot_token)
         unpin_warning_if_any(bot_id, user_id, "expired", bot_token)
         return "✅ Mobile token + headers saved and validated."
     hint = _validation_note_hint(note)
-    return f"⚠️ Token saved, validation not OK yet ({note}). {hint}"
+    return f"⚠️ Token saved, validation failed ({note}). {hint}"
 
 
 async def open_settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -315,8 +305,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔑 *Send full HTTP dump*\n\n"
             "Accepted only:\n"
             "• full HTTP request dump with `Authorization: Bearer ...`\n"
-            "• includes all request headers\n\n"
-            "Not accepted: OAuth JSON, refresh_token, client_id.",
+            "• includes all request headers",
             parse_mode="Markdown",
         )
         return

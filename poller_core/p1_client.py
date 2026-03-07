@@ -56,6 +56,49 @@ def _session_request(method: str, url: str, **kwargs):
     return sess.request(method=method, url=url, **kwargs)
 
 
+# ── Shared reserve session ────────────────────────────────────────────────────
+# NOT thread-local: shared across all _reserve_executor workers so the
+# connection pool stays warm even when individual threads are idle.
+# Reserves are rare (only on valid offers) so thread-local sessions go cold
+# between uses, paying a full TCP+TLS handshake (~600ms) each time.
+_reserve_session_lock = threading.Lock()
+_reserve_session: Optional[requests.Session] = None
+
+
+def _get_reserve_session() -> requests.Session:
+    global _reserve_session
+    if _reserve_session is None:
+        with _reserve_session_lock:
+            if _reserve_session is None:
+                sess = requests.Session()
+                sess.trust_env = False
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=HTTP_POOL_SIZE,
+                    pool_maxsize=HTTP_POOL_SIZE,
+                    max_retries=0,
+                )
+                sess.mount("https://", adapter)
+                sess.mount("http://", adapter)
+                _reserve_session = sess
+    return _reserve_session
+
+
+def warmup_p1_reserve_connection(token: str, headers: Optional[dict] = None):
+    """Pre-warm the shared reserve session with a GET /offers.
+    Call at startup and every ~45s to keep the TCP/TLS connection alive."""
+    try:
+        hdrs = _merge_headers(token, headers)
+        _reserve_session_lock  # just reference to ensure module loaded
+        sess = _get_reserve_session()
+        try:
+            sess.cookies.clear()
+        except Exception:
+            pass
+        sess.request("GET", f"{API_HOST}/offers", headers=hdrs, timeout=max(3, int(P1_POLL_TIMEOUT_S)))
+    except Exception:
+        pass
+
+
 def _has_header(headers: dict, name: str) -> bool:
     lname = name.lower()
     return any(k.lower() == lname for k in headers.keys())
@@ -213,7 +256,12 @@ def reserve_offer_p1(token: str, offer_id: str, price: Optional[float] = None, h
         except Exception:
             payload["price"] = price
     try:
-        r = _session_request(
+        sess = _get_reserve_session()
+        try:
+            sess.cookies.clear()
+        except Exception:
+            pass
+        r = sess.request(
             "POST",
             f"{API_HOST}/offers",
             headers=headers,

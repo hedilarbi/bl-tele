@@ -16,7 +16,6 @@ from .config import (
     FAST_ACCEPT_MODE,
     FAST_ACCEPT_NOTIFY_REJECTED,
     OFFER_MEMORY_DEDUPE,
-    ATHENA_PRINT_DEBUG,
 )
 from .utils import (
     _esc,
@@ -265,13 +264,8 @@ def _log_offer_decision_async(
     def _job():
         try:
             log_offer_decision(bot_id, telegram_id, offer, status, reason)
-        except Exception as e:
-            if ATHENA_PRINT_DEBUG:
-                _builtins.print(
-                    f"[{datetime.now()}] ⚠️ log_offer_decision failed "
-                    f"({status} {offer.get('id') if isinstance(offer, dict) else '—'}): "
-                    f"{type(e).__name__}: {e}"
-                )
+        except Exception:
+            pass
 
     _db_executor.submit(_job)
 
@@ -309,12 +303,8 @@ def _save_offer_details_render_async(
                 forced_accept=forced_accept,
             )
             save_offer_message(bot_id, telegram_id, message_key, header_line, full_text)
-        except Exception as e:
-            if ATHENA_PRINT_DEBUG:
-                _builtins.print(
-                    f"[{datetime.now()}] ⚠️ save_offer_details_render failed "
-                    f"({message_key}): {type(e).__name__}: {e}"
-                )
+        except Exception:
+            pass
 
     _db_executor.submit(_job)
 
@@ -937,6 +927,11 @@ def _process_offers_for_user(
         reserve_future = None
         if AUTO_RESERVE_ENABLED:
             if platform == "p1" and p1_token:
+                _builtins.print(
+                    f"[{datetime.now()}] ⚡ Reserve P1 user={telegram_id} offer={oid} "
+                    f"price={offer.get('price')} {offer.get('currency','')} "
+                    f"class={offer.get('vehicleClass','')} type={otype}"
+                )
                 reserve_future = _reserve_executor.submit(
                     _reserve_offer_sync,
                     {
@@ -951,6 +946,11 @@ def _process_offers_for_user(
             elif platform == "p2":
                 p2_price = offer.get("price")
                 if p2_token and p2_price is not None:
+                    _builtins.print(
+                        f"[{datetime.now()}] ⚡ Reserve P2 user={telegram_id} offer={oid} "
+                        f"price={p2_price} {offer.get('currency','')} "
+                        f"class={offer.get('vehicleClass','')} type={otype}"
+                    )
                     reserve_future = _reserve_executor.submit(
                         _reserve_offer_sync,
                         {
@@ -1028,19 +1028,17 @@ def _process_offers_for_user(
                     set_token_status(bot_id, telegram_id, "expired")
                 reserve_reason = f"reserve_failed:{rs}"
                 reserve_reason_user = _reserve_failure_human_reason(rs, rb)
-                if ATHENA_PRINT_DEBUG:
-                    _builtins.print(
-                        f"[{datetime.now()}] ❌ {platform.upper()} reserve failed {oid} "
-                        f"(status={rs}) body={rb}"
-                    )
+                _builtins.print(
+                    f"[{datetime.now()}] ❌ {platform.upper()} reserve {oid} -> {rs} "
+                    f"latency={int(rr.get('latency_ms') or 0)}ms body={rb}"
+                )
             else:
                 if pickup_dt is not None:
                     add_ride_to_cache(bot_id, telegram_id, oid, pickup_dt, predicted_end)
-                if ATHENA_PRINT_DEBUG:
-                    _builtins.print(
-                        f"[{datetime.now()}] 🎯 {platform.upper()} reserve {oid} -> {rs} "
-                        f"| latency={int(rr.get('latency_ms') or 0)}ms"
-                    )
+                _builtins.print(
+                    f"[{datetime.now()}] ✅ {platform.upper()} reserve {oid} -> {rs} "
+                    f"latency={int(rr.get('latency_ms') or 0)}ms"
+                )
 
         final_status = "accepted"
         if AUTO_RESERVE_ENABLED and reserve_attempted and not reserve_ok:
