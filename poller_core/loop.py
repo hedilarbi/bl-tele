@@ -38,6 +38,8 @@ from .state import (
     get_portal_token_mem,
     set_portal_token_mem,
     clear_portal_token_mem,
+    is_token_ok_mem,
+    set_token_ok_mem,
 )
 from .utils import _normalize_formulas
 from .p1_client import get_offers_p1
@@ -312,9 +314,11 @@ def poll_user(user):
             _poll_log(f"⚠️ P1 offers {status_code} for user {telegram_id} — token marked invalid")
             return []
         if status_code == 200:
-            set_token_status(bot_id, telegram_id, "valid")
-            unpin_warning_if_any(bot_id, telegram_id, "expired")
-            unpin_warning_if_any(bot_id, telegram_id, "no_token")
+            if not is_token_ok_mem(bot_id, telegram_id, cache_version):
+                set_token_status(bot_id, telegram_id, "valid")
+                unpin_warning_if_any(bot_id, telegram_id, "expired")
+                unpin_warning_if_any(bot_id, telegram_id, "no_token")
+                set_token_ok_mem(bot_id, telegram_id, cache_version)
             offers = results or []
             _log_offers_found("P1", telegram_id, offers)
             return offers
@@ -618,8 +622,8 @@ def run():
     inflight: Dict[Tuple[str, int], tuple] = {}
     cycle_idx = 0
 
-    _CLEANUP_CYCLE_EVERY = 100    # cleanup not_valid cache every ~20s
-    _WARMUP_CYCLE_EVERY = 225     # re-warm reserve connections every ~45s
+    _CLEANUP_CYCLE_EVERY = 200    # cleanup not_valid cache every ~20s at 100ms poll
+    _WARMUP_CYCLE_EVERY = 300    # re-warm reserve connections every ~30s at 100ms poll
 
     # Pre-warm reserve connections immediately at startup
     _warmup_reserve_connections_async()

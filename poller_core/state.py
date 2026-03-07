@@ -275,3 +275,27 @@ def set_portal_token_mem(bot_id: str, telegram_id: int, token: str, skew_s: floa
 
 def clear_portal_token_mem(bot_id: str, telegram_id: int):
     _portal_token_mem.pop((str(bot_id), int(telegram_id)), None)
+
+
+# ── Token-ok in-memory flag ────────────────────────────────────────────────────
+# After the first successful P1 poll, skip set_token_status("valid") + unpin_warning DB ops
+# on every subsequent cycle. Reset automatically when cache_version changes (token updated).
+
+_token_ok_mem: Dict[Tuple[str, int, int], bool] = {}
+
+
+def is_token_ok_mem(bot_id: str, telegram_id: int, cache_version: int) -> bool:
+    """Return True if we already confirmed this token is valid + warnings cleared."""
+    return _token_ok_mem.get((str(bot_id), int(telegram_id), int(cache_version)), False)
+
+
+def set_token_ok_mem(bot_id: str, telegram_id: int, cache_version: int):
+    """Mark token as confirmed valid + warnings cleared. Evict stale versions."""
+    key = (str(bot_id), int(telegram_id), int(cache_version))
+    _token_ok_mem[key] = True
+    stale = [
+        k for k in list(_token_ok_mem)
+        if k[0] == str(bot_id) and k[1] == int(telegram_id) and k[2] != int(cache_version)
+    ]
+    for k in stale:
+        _token_ok_mem.pop(k, None)
