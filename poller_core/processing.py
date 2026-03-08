@@ -79,24 +79,6 @@ def _refresh_rides_cache_now(
     portal_password: Optional[str] = None,
 ):
     intervals: List[Tuple[datetime, Optional[datetime]]] = []
-    p2_tok = p2_token
-    if not p2_tok and portal_email and portal_password:
-        p2_tok = _ensure_portal_token(bot_id, telegram_id, portal_email, portal_password)
-
-    if p2_tok:
-        status_code, payload, _ = _athena_get_rides(p2_tok)
-        if status_code == 200 and isinstance(payload, dict):
-            data_all = (payload or {}).get("data") or []
-            data_kept = _filter_rides_by_bl_uuid(data_all, bl_uuid) if bl_uuid else data_all
-            intervals.extend(
-                _extract_intervals_from_rides(
-                    [
-                        (r.get("attributes") or {})
-                        | {"starts_at": (r.get("attributes") or {}).get("starts_at")}
-                        for r in (data_kept or [])
-                    ]
-                )
-            )
 
     if p1_token:
         status_code, ride_results = get_rides_p1(p1_token, headers=p1_headers)
@@ -154,25 +136,6 @@ def _init_rides_cache_now(
 ):
     """Fetch rides once and store keyed by ride_id. Called on first poll only."""
     rides_dict: Dict[str, Any] = {}
-    p2_tok = p2_token
-    if not p2_tok and portal_email and portal_password:
-        p2_tok = _ensure_portal_token(bot_id, telegram_id, portal_email, portal_password)
-
-    if p2_tok:
-        status_code, payload, _ = _athena_get_rides(p2_tok)
-        if status_code == 200 and isinstance(payload, dict):
-            data_all = (payload or {}).get("data") or []
-            data_kept = _filter_rides_by_bl_uuid(data_all, bl_uuid) if bl_uuid else []
-            for r in data_kept:
-                rid = str(r.get("id") or "")
-                if not rid:
-                    continue
-                attrs = r.get("attributes") or {}
-                intervals = _extract_intervals_from_rides(
-                    [attrs | {"starts_at": attrs.get("starts_at")}]
-                )
-                if intervals:
-                    rides_dict[f"p2_{rid}"] = intervals[0]
 
     if p1_token:
         status_code, ride_results = get_rides_p1(p1_token, headers=p1_headers)

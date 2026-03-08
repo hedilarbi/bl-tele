@@ -548,7 +548,7 @@ def poll_user(user):
         if cached_intervals is None:
             # First time: lazy-init rides cache in background (one-shot fetch)
             p2_init_token = portal_token if portal_token else None
-            p1_init_token = token if (not has_portal_creds and token and str(token).strip()) else None
+            p1_init_token = token if (token and str(token).strip()) else None
             if p2_init_token or p1_init_token:
                 _init_rides_cache_async(
                     bot_id,
