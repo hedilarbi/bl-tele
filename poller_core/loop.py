@@ -357,6 +357,7 @@ def poll_user(user):
                         token = new_token
                         _p1_fail_counts.pop(_fail_key, None)
                         _auto_refresh_fail_counts.pop(_ar_key, None)
+                        set_token_status(bot_id, telegram_id, "valid")
                         set_token_ok_mem(bot_id, telegram_id, cache_version)
                         unpin_warning_if_any(bot_id, telegram_id, "expired")
                         unpin_warning_if_any(bot_id, telegram_id, "no_token")
