@@ -25,6 +25,8 @@ from db_core.users import (
     get_bl_account_full,
     set_bl_uuid,
     get_bl_uuid,
+    get_token_auto_refresh,
+    set_token_auto_refresh,
 )
 from db_core.bots import (
     add_bot_instance,

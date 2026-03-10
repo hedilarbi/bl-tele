@@ -159,6 +159,11 @@ def init_db():
             c.execute(alter_sql)
         except Exception:
             pass
+    for alter_sql in ["ALTER TABLE users ADD COLUMN token_auto_refresh INTEGER DEFAULT 0"]:
+        try:
+            c.execute(alter_sql)
+        except Exception:
+            pass
 
     # booked slots
     c.execute(

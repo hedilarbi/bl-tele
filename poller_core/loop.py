@@ -43,6 +43,7 @@ from .state import (
 )
 from .utils import _normalize_formulas
 from .p1_client import get_offers_p1
+from .p1_auth import get_playwright_p1_token, save_playwright_p1_token
 from .p2_client import (
     _map_portal_offer,
     _athena_get_offers,
@@ -72,6 +73,8 @@ from db import (
     get_bl_uuid,
     get_bl_account_full,
     get_mobile_headers,
+    get_token_auto_refresh,
+    set_token_auto_refresh,
 )
 
 
@@ -88,6 +91,17 @@ print = _quiet_print
 _burst_until = 0.0
 _burst_lock = threading.Lock()
 _user_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+# Consecutive P1 401/403 counter per (bot_id, telegram_id).
+# Token is only marked invalid after _P1_FAIL_THRESHOLD consecutive failures
+# to absorb transient Auth0 hiccups that resolve on their own.
+_p1_fail_counts: Dict[Tuple[str, int], int] = {}
+_P1_FAIL_THRESHOLD = 3
+# Consecutive auto-refresh failures per (bot_id, telegram_id).
+# When auto_refresh mode is ON and Playwright re-login fails this many times,
+# the mode is disabled and the user is notified to update manually.
+_auto_refresh_fail_counts: Dict[Tuple[str, int], int] = {}
+_AUTO_REFRESH_FAIL_THRESHOLD = 3
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
 _fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
@@ -310,10 +324,59 @@ def poll_user(user):
         status_code, results = get_offers_p1(token, headers=mobile_headers)
         observe_ms("p1_fetch_ms", (time.perf_counter() - t0) * 1000.0)
         if status_code in (401, 403):
-            _set_token_problem("expired")
-            _poll_log(f"⚠️ P1 offers {status_code} for user {telegram_id} — token marked invalid")
-            return []
+            _fail_key = (str(bot_id), int(telegram_id))
+            _p1_fail_counts[_fail_key] = _p1_fail_counts.get(_fail_key, 0) + 1
+            _fail_n = _p1_fail_counts[_fail_key]
+            _poll_log(
+                f"⚠️ P1 offers {status_code} for user {telegram_id} "
+                f"(consecutive fail {_fail_n}/{_P1_FAIL_THRESHOLD})"
+            )
+            if _fail_n < _P1_FAIL_THRESHOLD:
+                # Transient failure — skip this cycle without marking invalid
+                return []
+            # Threshold reached — check auto-refresh mode
+            _poll_log(f"⚠️ P1 threshold reached for {telegram_id} — checking auto-refresh mode...")
+            auto_refresh = get_token_auto_refresh(str(bot_id), int(telegram_id))
+            _ar_key = (str(bot_id), int(telegram_id))
+            if auto_refresh and email and password:
+                # Auto-refresh ON: attempt Playwright re-login
+                ok, new_token, new_refresh, note = get_playwright_p1_token(bot_id, telegram_id, email, password)
+                if ok and new_token:
+                    status_code2, results2 = get_offers_p1(new_token, headers=mobile_headers)
+                    if status_code2 == 200:
+                        # Token works — save and reset counters
+                        save_playwright_p1_token(bot_id, telegram_id, new_token, new_refresh, mobile_headers)
+                        token = new_token
+                        _p1_fail_counts.pop(_fail_key, None)
+                        _auto_refresh_fail_counts.pop(_ar_key, None)
+                        set_token_ok_mem(bot_id, telegram_id, cache_version)
+                        _log_offers_found("P1", telegram_id, results2 or [])
+                        return results2 or []
+                    _poll_log(f"⚠️ P1 auto-refresh new token still {status_code2} for {telegram_id}")
+                else:
+                    _poll_log(f"⚠️ P1 auto-refresh Playwright failed for {telegram_id}: {note}")
+                # Auto-refresh attempt failed
+                _ar_n = _auto_refresh_fail_counts.get(_ar_key, 0) + 1
+                _auto_refresh_fail_counts[_ar_key] = _ar_n
+                _poll_log(f"⚠️ P1 auto-refresh fail {_ar_n}/{_AUTO_REFRESH_FAIL_THRESHOLD} for {telegram_id}")
+                if _ar_n >= _AUTO_REFRESH_FAIL_THRESHOLD:
+                    # Disable auto-refresh and notify user with pinned warning
+                    set_token_auto_refresh(str(bot_id), int(telegram_id), False)
+                    _auto_refresh_fail_counts.pop(_ar_key, None)
+                    _poll_log(f"⚠️ Auto-refresh disabled for {telegram_id} after {_AUTO_REFRESH_FAIL_THRESHOLD} failures")
+                    _set_token_problem("expired")
+                else:
+                    # Let polling continue so another attempt can be made
+                    _p1_fail_counts.pop(_fail_key, None)
+                return []
+            else:
+                # Auto-refresh OFF or no credentials: notify user to update manually
+                if auto_refresh and not (email and password):
+                    _poll_log(f"⚠️ Auto-refresh ON for {telegram_id} but no BL credentials — falling back to manual")
+                _set_token_problem("expired")
+                return []
         if status_code == 200:
+            _p1_fail_counts.pop((str(bot_id), int(telegram_id)), None)
             if not is_token_ok_mem(bot_id, telegram_id, cache_version):
                 set_token_status(bot_id, telegram_id, "valid")
                 unpin_warning_if_any(bot_id, telegram_id, "expired")

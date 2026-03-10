@@ -1,7 +1,9 @@
+import asyncio
 import base64
 import hashlib
 import json
 import re
+import secrets
 import threading
 import time
 import builtins as _builtins
@@ -327,3 +329,125 @@ def maybe_refresh_p1_session(
 
     runtime_headers = next_headers if next_headers else None
     return new_token, runtime_headers, True, "ok"
+
+
+_PKCE_REDIRECT_URI = "com.blacklane.chauffeur://login-chauffeur.blacklane.com/ios/com.blacklane.chauffeur/callback"
+
+
+async def _playwright_pkce_login(email: str, password: str) -> Tuple[bool, Optional[str], Optional[str], str]:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return False, None, None, "playwright_not_installed"
+
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    state_val = base64.urlsafe_b64encode(secrets.token_bytes(16)).rstrip(b"=").decode()
+
+    authorize_url = (
+        f"{MOBILE_AUTH_BASE}/authorize?response_type=code&state={state_val}"
+        f"&scope=openid%20profile%20email%20read:current_user%20offline_access"
+        f"&code_challenge={code_challenge}&code_challenge_method=S256"
+        f"&audience=https://blacklane.com"
+        f"&redirect_uri={_PKCE_REDIRECT_URI}&client_id={MOBILE_CLIENT_ID}"
+    )
+
+    code_holder: dict = {}
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await (await browser.new_context()).new_page()
+
+            async def _on_request(request):
+                if request.url.startswith("com.blacklane"):
+                    m = re.search(r"[?&]code=([^&]+)", request.url)
+                    if m:
+                        code_holder["code"] = m.group(1)
+
+            page.on("request", _on_request)
+            await page.goto(authorize_url)
+            await page.fill('input[name="username"]', email)
+            await page.fill('input[name="password"]', password)
+            try:
+                await page.click('button[type="submit"]', timeout=10000)
+                await page.wait_for_timeout(4000)
+            except Exception:
+                pass
+            await browser.close()
+    except Exception as e:
+        return False, None, None, f"playwright_browser:{type(e).__name__}"
+
+    code = code_holder.get("code")
+    if not code:
+        return False, None, None, "playwright:no_code_captured"
+
+    try:
+        r = _session_request(
+            "POST",
+            f"{MOBILE_AUTH_BASE}/oauth/token",
+            json={
+                "grant_type": "authorization_code",
+                "client_id": MOBILE_CLIENT_ID,
+                "code": code,
+                "code_verifier": code_verifier,
+                "redirect_uri": _PKCE_REDIRECT_URI,
+            },
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            access = data.get("access_token")
+            new_refresh = data.get("refresh_token")
+            if access:
+                return True, f"Bearer {access.strip()}", new_refresh, "ok"
+            return False, None, None, "playwright:no_access_token"
+        return False, None, None, f"playwright:token_exchange_{r.status_code}"
+    except Exception as e:
+        return False, None, None, f"playwright:exchange_error:{type(e).__name__}"
+
+
+def get_playwright_p1_token(
+    bot_id: str,
+    telegram_id: int,
+    email: str,
+    password: str,
+) -> Tuple[bool, Optional[str], Optional[str], str]:
+    """Run headless PKCE login. Returns (ok, access_token, refresh_token, note). Does NOT save to DB."""
+    if not email or not password:
+        return False, None, None, "missing_credentials"
+    _builtins.print(f"[{datetime.now()}] 🔐 P1 Playwright re-login for {bot_id}/{telegram_id}")
+    try:
+        loop = asyncio.new_event_loop()
+        ok, new_token, new_refresh, note = loop.run_until_complete(
+            _playwright_pkce_login(email, password)
+        )
+        loop.close()
+    except Exception as e:
+        _builtins.print(f"[{datetime.now()}] ❌ P1 Playwright error for {bot_id}/{telegram_id}: {e}")
+        return False, None, None, f"playwright_exception:{type(e).__name__}"
+
+    if not ok or not new_token:
+        _builtins.print(f"[{datetime.now()}] ⚠️ P1 Playwright failed for {bot_id}/{telegram_id}: {note}")
+        return False, None, None, note
+
+    _builtins.print(f"[{datetime.now()}] ✅ P1 Playwright login success for {bot_id}/{telegram_id}")
+    return True, new_token, new_refresh, "ok"
+
+
+def save_playwright_p1_token(
+    bot_id: str,
+    telegram_id: int,
+    new_token: str,
+    new_refresh: Optional[str],
+    mobile_headers: Optional[dict] = None,
+) -> None:
+    """Persist a Playwright-obtained token to DB after verifying it works."""
+    auth_meta = get_mobile_auth(bot_id, telegram_id) or {}
+    auth_meta["client_id"] = str(auth_meta.get("client_id") or MOBILE_CLIENT_ID)
+    if new_refresh:
+        auth_meta["refresh_token"] = str(new_refresh)
+    update_token(bot_id, telegram_id, new_token, headers=mobile_headers, auth_meta=auth_meta)
+    set_token_status(bot_id, telegram_id, "valid")
+    _builtins.print(f"[{datetime.now()}] 💾 P1 Playwright token saved for {bot_id}/{telegram_id}")

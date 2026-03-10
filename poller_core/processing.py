@@ -37,6 +37,7 @@ from .filters import (
     _find_conflict,
 )
 from .notify import maybe_send_message, _platform_icon
+from .offer_coordinator import register_candidate, claim_offer, is_claimed_by_peer
 from .state import (
     accepted_per_user,
     rejected_per_user,
@@ -887,6 +888,24 @@ def _process_offers_for_user(
         # Accepted candidate:
         # submit reserve immediately so network race starts before full offer scan ends.
         predicted_end = parse_iso_dt_or_none((offer.get("rides") or [{}])[0].get("endsAt"))
+
+        # Register this user as a candidate for cross-user coordination.
+        if AUTO_RESERVE_ENABLED and oid:
+            register_candidate(
+                f"{platform}:{oid}",
+                bot_id,
+                telegram_id,
+                {
+                    "bot_id": bot_id,
+                    "telegram_id": telegram_id,
+                    "offer": offer,
+                    "tz_name": tz_name,
+                    "filter_results": filter_results,
+                    "platform": platform,
+                    "forced_accept": bool(accept_override and failed_filters),
+                },
+            )
+
         reserve_future = None
         if AUTO_RESERVE_ENABLED:
             if platform == "p1" and p1_token:
@@ -1008,46 +1027,60 @@ def _process_offers_for_user(
             final_status = "not_accepted"
         if final_status == "accepted" and pickup_dt is not None:
             accepted_intervals.append((pickup_dt, predicted_end))
-        final_reason = reserve_reason_user if final_status == "not_accepted" else None
-        final_reason_for_log = reserve_reason if final_status == "not_accepted" else reason_for_log
-        _log_offer_decision_async(bot_id, telegram_id, offer_to_log, final_status, final_reason_for_log)
 
-        header_line = _build_offer_header_line(
-            offer_to_log,
-            final_status,
-            platform,
-            forced_accept=forced_accept,
-        )
-        notify_line = header_line
-        if final_status == "not_accepted" and final_reason:
-            notify_line = f"{header_line}\n⚠️ {_esc(final_reason)}"
+        offer_key = f"{platform}:{oid}" if oid else None
 
-        details_key = uuid.uuid4().hex[:16]
-        _save_offer_details_render_async(
-            bot_id,
-            telegram_id,
-            details_key,
-            offer_to_log,
-            final_status,
-            final_reason,
-            tz_name,
-            filter_results=filter_results,
-            platform=platform,
-            forced_accept=forced_accept,
-        )
-        kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
-        _queue_notification(
-            final_status,
-            notify_line,
-            platform,
-            reply_markup=kb,
-            force_notify=(final_status in ("rejected", "not_accepted")),
-        )
-        if OFFER_MEMORY_DEDUPE:
-            if final_status == "accepted":
+        if final_status == "accepted":
+            final_reason_for_log = reason_for_log
+            _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "accepted", final_reason_for_log)
+
+            # Notify this user: accepted
+            header_line = _build_offer_header_line(offer_to_log, "accepted", platform, forced_accept=forced_accept)
+            details_key = uuid.uuid4().hex[:16]
+            _save_offer_details_render_async(
+                bot_id, telegram_id, details_key, offer_to_log, "accepted",
+                None, tz_name, filter_results=filter_results, platform=platform, forced_accept=forced_accept,
+            )
+            kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
+            _queue_notification("accepted", header_line, platform, reply_markup=kb)
+
+            if OFFER_MEMORY_DEDUPE:
                 accepted_per_user[bot_id][telegram_id].add(oid)
-            else:
+
+            # Notify peers who also passed filters for this offer
+            if offer_key:
+                peers = claim_offer(offer_key, bot_id, telegram_id)
+                for peer in peers:
+                    p_bot_id = peer["bot_id"]
+                    p_tid = peer["telegram_id"]
+                    p_offer = peer["offer"]
+                    p_tz = peer["tz_name"]
+                    p_fr = peer["filter_results"]
+                    p_plat = peer["platform"]
+                    p_fa = peer["forced_accept"]
+                    _log_offer_decision_async(p_bot_id, p_tid, p_offer, "not_accepted", f"peer_accepted:{bot_id}:{telegram_id}")
+                    peer_header = _build_offer_header_line(p_offer, "not_accepted", p_plat, forced_accept=p_fa)
+                    peer_notify = peer_header
+                    peer_key = uuid.uuid4().hex[:16]
+                    _save_offer_details_render_async(
+                        p_bot_id, p_tid, peer_key, p_offer, "not_accepted",
+                        None, p_tz, filter_results=p_fr, platform=p_plat, forced_accept=p_fa,
+                    )
+                    peer_kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{peer_key}"}]]}
+                    _send_notification_async(p_bot_id, p_tid, "not_accepted", peer_notify, p_plat, reply_markup=peer_kb, force_notify=True)
+
+        else:
+            # not_accepted: suppress notification — only send if a peer accepted (handled above)
+            final_reason_for_log = reserve_reason
+            _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "not_accepted", final_reason_for_log)
+
+            if OFFER_MEMORY_DEDUPE:
                 rejected_per_user[bot_id][telegram_id][platform].add(oid)
+
+            # Suppress retries of offers that failed at reserve stage.
+            if oid:
+                mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
+
         observe_ms("offer_end2end_ms", _poll_latency_ms(offer_to_log))
 
     for kind, text, platform_name, reply_markup, force_notify in pending_notifications:

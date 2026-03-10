@@ -61,6 +61,8 @@ from db import (
     set_notification,
     get_offer_message,
     get_bot_instance,
+    get_token_auto_refresh,
+    set_token_auto_refresh,
 )
 
 
@@ -292,6 +294,13 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
+    if query.data == "toggle_auto_refresh":
+        current = get_token_auto_refresh(bot_id, user_id)
+        set_token_auto_refresh(bot_id, user_id, not current)
+        info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode, as_user_id=user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
     # Mobile sessions
     if query.data == "mobile_sessions":
         add_user(bot_id, user_id)
@@ -301,7 +310,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data in ("add_mobile_session", "open_mobile_sessions"):
         add_user(bot_id, user_id)
         user_waiting_input[state_key] = "set_token"
-        await query.edit_message_text(
+        await query.answer()
+        await query.message.reply_text(
             "🔑 *Send full HTTP dump*\n\n"
             "Accepted only:\n"
             "• full HTTP request dump with `Authorization: Bearer ...`\n"
@@ -553,12 +563,12 @@ async def _tap_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cb_data = (cb.data or "") if cb else ""
         is_token_recovery_cb = cb_data in ("open_mobile_sessions", "add_mobile_session")
         chat_id = getattr(update.effective_chat, "id", None)
-        if is_token_recovery_cb and chat_id is not None and int(chat_id) == int(user.id):
+        is_private_chat = chat_id is not None and int(chat_id) == int(user.id)
+        state_key = _state_key(bot_id, int(user.id))
+        is_awaiting_token = user_waiting_input.get(state_key) == "set_token"
+        if is_private_chat and (is_token_recovery_cb or is_awaiting_token):
             _capture_from_update(update, bot_id)
             return
-        msg = update.effective_message
-        if msg:
-            await msg.reply_text("⛔ This bot is already assigned to another user.")
         raise ApplicationHandlerStop
 
     _capture_from_update(update, bot_id)

@@ -29,6 +29,7 @@ from db import (
     get_offer_logs_counts,
     get_offer_logs,
     get_offer_stats,
+    get_token_auto_refresh,
 )
 
 
@@ -55,6 +56,7 @@ def build_settings_menu(user_id: int, bot_id: Optional[str] = None, allow_tz_cha
     tz = get_user_timezone(bot_id, user_id) if bot_id else "—"
     token_status = get_token_status(bot_id, user_id) if bot_id else "unknown"
     dot = "🟢" if token_status == "valid" else ("🔴" if token_status == "expired" else "⚪")
+    auto_refresh = get_token_auto_refresh(bot_id, user_id) if bot_id else False
 
     # Notifications status summary
     prefs = get_notifications(bot_id, user_id) if bot_id else {}
@@ -86,13 +88,18 @@ def build_settings_menu(user_id: int, bot_id: Optional[str] = None, allow_tz_cha
     bl_email_disp = mask_email(bl_email) if bl_email else "—"
     bl_email_line = f"`{bl_email_disp}`" if bl_email_disp != "—" else "—"
 
+    ar_icon = "🟢" if auto_refresh else "🔴"
+    ar_label = "ON" if auto_refresh else "OFF"
+
     info_text = (
         "🔧 *Settings*\n\n"
         f"🌍 Timezone: `{tz}`\n"
         f"📱 Mobile session: {dot} ({token_status})\n"
+        f"🔄 Auto refresh token: {ar_icon} {ar_label}\n"
         f"🔔 Notifications: {notif_line}\n"
         f"🪪 BL account: {bl_email_line}\n\n"
         "• *Mobile sessions* to add/update your Blacklane token\n"
+        "• *Auto refresh* lets the bot renew your token automatically\n"
         "• *BL account* to set your Blacklane email/password"
     )
 
@@ -100,6 +107,7 @@ def build_settings_menu(user_id: int, bot_id: Optional[str] = None, allow_tz_cha
         [InlineKeyboardButton("🔔 Notifications", callback_data="notifications")],
         [InlineKeyboardButton("🪪 BL account", web_app=WebAppInfo(url=_with_bot_id(BL_ACCOUNT_URL, bot_id, as_user_id)))],
         [InlineKeyboardButton("📱 Mobile sessions", callback_data="mobile_sessions")],
+        [InlineKeyboardButton(f"🔄 Auto refresh: {ar_label}", callback_data="toggle_auto_refresh")],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
     ]
     if allow_tz_change:
