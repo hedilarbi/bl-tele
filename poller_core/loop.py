@@ -241,9 +241,12 @@ def poll_user(user):
         if get_token_auto_refresh(str(bot_id), int(telegram_id)) and email and password:
             # Auto-refresh is ON: clear invalid mark and pre-arm fail counter so
             # the very next 401/403 triggers Playwright immediately (skip the 3-cycle warmup).
+            _poll_log(f"🔄 [AUTO-REFRESH] Token invalid for {telegram_id} ({bot_id}) — auto-refresh ON, clearing invalid mark and arming for Playwright")
             clear_token_invalid(str(bot_id), int(telegram_id))
             _p1_fail_counts[(str(bot_id), int(telegram_id))] = _P1_FAIL_THRESHOLD - 1
         else:
+            ar = get_token_auto_refresh(str(bot_id), int(telegram_id))
+            _poll_log(f"⏭️ Skipped {telegram_id} ({bot_id}) — token invalid, auto_refresh={ar}, has_creds={bool(email and password)}")
             return f"Skipped {telegram_id} (token invalid — waiting for update)"
 
     def _set_token_problem(kind: str):
@@ -343,12 +346,14 @@ def poll_user(user):
                 # Transient failure — skip this cycle without marking invalid
                 return []
             # Threshold reached — check auto-refresh mode
-            _poll_log(f"⚠️ P1 threshold reached for {telegram_id} — checking auto-refresh mode...")
             auto_refresh = get_token_auto_refresh(str(bot_id), int(telegram_id))
             _ar_key = (str(bot_id), int(telegram_id))
+            _poll_log(f"🔄 [AUTO-REFRESH] Threshold reached for {telegram_id} ({bot_id}) — auto_refresh={auto_refresh}, has_creds={bool(email and password)}")
             if auto_refresh and email and password:
                 # Auto-refresh ON: attempt Playwright re-login
+                _poll_log(f"🔄 [AUTO-REFRESH] Starting Playwright re-login for {telegram_id} ({bot_id}) with email={email}")
                 ok, new_token, new_refresh, note = get_playwright_p1_token(bot_id, telegram_id, email, password)
+                _poll_log(f"🔄 [AUTO-REFRESH] Playwright result for {telegram_id}: ok={ok}, has_token={bool(new_token)}, note={note}")
                 if ok and new_token:
                     status_code2, results2 = get_offers_p1(new_token, headers=mobile_headers)
                     if status_code2 == 200:
