@@ -234,12 +234,12 @@ def poll_user(user):
     _ar_key_startup = (str(bot_id), int(telegram_id))
     if _ar_key_startup not in _ar_startup_logged:
         _ar_startup_logged.add(_ar_key_startup)
-        if get_token_auto_refresh(str(bot_id), int(telegram_id)):
-            _poll_log(
-                f"🔄 [AUTO-REFRESH] User {telegram_id} ({bot_id}) — auto-refresh=ON, "
-                f"has_email={bool(email)}, has_password={bool(password)}, "
-                f"token_invalid={is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version))}"
-            )
+        _ar_val = get_token_auto_refresh(str(bot_id), int(telegram_id))
+        _poll_log(
+            f"🔄 [AUTO-REFRESH] User {telegram_id} ({bot_id}) — auto-refresh={_ar_val}, "
+            f"has_email={bool(email)}, has_password={bool(password)}, "
+            f"token_invalid={is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version))}"
+        )
 
     # ---------- Build busy intervals from Rides (Athena preferred) ----------
     accepted_intervals: List[Tuple[datetime, Optional[datetime]]] = []
