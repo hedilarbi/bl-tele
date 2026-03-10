@@ -235,7 +235,7 @@ def poll_user(user):
         _ar_startup_logged.add(_ar_key_startup)
         _ar_val = get_token_auto_refresh(str(bot_id), int(telegram_id))
         _poll_log(
-            f"🔄 [AUTO-REFRESH] User {telegram_id} ({bot_id}) — auto-refresh={_ar_val}, "
+            f"🔄 [AUTO-REFRESH] [{bot_id}] auto-refresh={_ar_val}, "
             f"has_email={bool(email)}, has_password={bool(password)}, "
             f"token_invalid={is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version))}"
         )
@@ -254,12 +254,12 @@ def poll_user(user):
         if _ar and email and password:
             # Auto-refresh is ON: clear invalid mark and pre-arm fail counter so
             # the very next 401/403 triggers Playwright immediately (skip the 3-cycle warmup).
-            _poll_log(f"🔄 [AUTO-REFRESH] Token invalid for {telegram_id} ({bot_id}) — auto-refresh ON, clearing invalid mark and arming for Playwright")
+            _poll_log(f"🔄 [AUTO-REFRESH] [{bot_id}] Token invalid — auto-refresh ON, clearing invalid mark and arming for Playwright")
             clear_token_invalid(str(bot_id), int(telegram_id))
             _p1_fail_counts[(str(bot_id), int(telegram_id))] = _P1_FAIL_THRESHOLD - 1
         else:
             if _ar:
-                _poll_log(f"🔄 [AUTO-REFRESH] Token invalid for {telegram_id} ({bot_id}) — auto-refresh ON but missing BL credentials (email={bool(email)}, password={bool(password)})")
+                _poll_log(f"🔄 [AUTO-REFRESH] [{bot_id}] Token invalid — auto-refresh ON but missing BL credentials (email={bool(email)}, password={bool(password)})")
             return f"Skipped {telegram_id} (token invalid — waiting for update)"
 
     def _set_token_problem(kind: str):
@@ -352,7 +352,7 @@ def poll_user(user):
             _p1_fail_counts[_fail_key] = _p1_fail_counts.get(_fail_key, 0) + 1
             _fail_n = _p1_fail_counts[_fail_key]
             _poll_log(
-                f"⚠️ P1 offers {status_code} for user {telegram_id} "
+                f"⚠️ P1 [{bot_id}] status={status_code} "
                 f"(consecutive fail {_fail_n}/{_P1_FAIL_THRESHOLD})"
             )
             if _fail_n < _P1_FAIL_THRESHOLD:
@@ -363,9 +363,9 @@ def poll_user(user):
             _ar_key = (str(bot_id), int(telegram_id))
             if auto_refresh and email and password:
                 # Auto-refresh ON: attempt Playwright re-login
-                _poll_log(f"🔄 [AUTO-REFRESH] Starting Playwright re-login for {telegram_id} ({bot_id}) with email={email}")
+                _poll_log(f"🔄 [AUTO-REFRESH] [{bot_id}] Starting Playwright re-login with email={email}")
                 ok, new_token, new_refresh, note = get_playwright_p1_token(bot_id, telegram_id, email, password)
-                _poll_log(f"🔄 [AUTO-REFRESH] Playwright result for {telegram_id}: ok={ok}, has_token={bool(new_token)}, note={note}")
+                _poll_log(f"🔄 [AUTO-REFRESH] [{bot_id}] Playwright result: ok={ok}, has_token={bool(new_token)}, note={note}")
                 if ok and new_token:
                     status_code2, results2 = get_offers_p1(new_token, headers=mobile_headers)
                     if status_code2 == 200:
@@ -382,18 +382,18 @@ def poll_user(user):
                         tg_send_message(bot_tok, telegram_id, "✅ <b>Token refreshed successfully</b> — bot is back online.")
                         _log_offers_found("P1", telegram_id, results2 or [])
                         return results2 or []
-                    _poll_log(f"⚠️ P1 auto-refresh new token still {status_code2} for {telegram_id}")
+                    _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] New token still {status_code2}")
                 else:
-                    _poll_log(f"⚠️ P1 auto-refresh Playwright failed for {telegram_id}: {note}")
+                    _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Playwright failed: {note}")
                 # Auto-refresh attempt failed
                 _ar_n = _auto_refresh_fail_counts.get(_ar_key, 0) + 1
                 _auto_refresh_fail_counts[_ar_key] = _ar_n
-                _poll_log(f"⚠️ P1 auto-refresh fail {_ar_n}/{_AUTO_REFRESH_FAIL_THRESHOLD} for {telegram_id}")
+                _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Fail {_ar_n}/{_AUTO_REFRESH_FAIL_THRESHOLD}")
                 if _ar_n >= _AUTO_REFRESH_FAIL_THRESHOLD:
                     # Disable auto-refresh and notify user with pinned warning
                     set_token_auto_refresh(str(bot_id), int(telegram_id), False)
                     _auto_refresh_fail_counts.pop(_ar_key, None)
-                    _poll_log(f"⚠️ Auto-refresh disabled for {telegram_id} after {_AUTO_REFRESH_FAIL_THRESHOLD} failures")
+                    _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Disabled after {_AUTO_REFRESH_FAIL_THRESHOLD} failures")
                     _set_token_problem("expired")
                 else:
                     # Let polling continue so another attempt can be made
@@ -402,7 +402,7 @@ def poll_user(user):
             else:
                 # Auto-refresh OFF or no credentials: notify user to update manually
                 if auto_refresh and not (email and password):
-                    _poll_log(f"⚠️ Auto-refresh ON for {telegram_id} but no BL credentials — falling back to manual")
+                    _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] ON but no BL credentials — falling back to manual")
                 _set_token_problem("expired")
                 return []
         if status_code == 200:
@@ -413,16 +413,17 @@ def poll_user(user):
                 unpin_warning_if_any(bot_id, telegram_id, "no_token")
                 set_token_ok_mem(bot_id, telegram_id, cache_version)
             offers = results or []
+            _poll_log(f"✅ P1 [{bot_id}] status=200 offers={len(offers)}")
             _log_offers_found("P1", telegram_id, offers)
             return offers
         if status_code is None:
             err_detail = results.get("error") if isinstance(results, dict) else None
             if err_detail:
-                _poll_log(f"⚠️ P1 offers error for user {telegram_id} | {err_detail}")
+                _poll_log(f"⚠️ P1 [{bot_id}] status=None | {err_detail}")
             else:
-                _poll_log(f"⚠️ P1 offers returned None for user {telegram_id} | body={results}")
+                _poll_log(f"⚠️ P1 [{bot_id}] status=None | body={results}")
         else:
-            _poll_log(f"⚠️ P1 offers returned {status_code} for user {telegram_id} | body={results}")
+            _poll_log(f"⚠️ P1 [{bot_id}] status={status_code} | body={results}")
         return []
 
     # ---------- PLATFORM 2 OFFERS (Portal/Athena) ----------
