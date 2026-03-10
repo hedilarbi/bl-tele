@@ -104,6 +104,8 @@ _P1_FAIL_THRESHOLD = 3
 # the mode is disabled and the user is notified to update manually.
 _auto_refresh_fail_counts: Dict[Tuple[str, int], int] = {}
 _AUTO_REFRESH_FAIL_THRESHOLD = 3
+# Set of (bot_id, telegram_id) already logged at startup for auto-refresh — avoids spam every 300ms
+_ar_startup_logged: set = set()
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
 _fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
@@ -227,6 +229,17 @@ def poll_user(user):
                 "password": password,
             },
         )
+
+    # ---------- One-time auto-refresh state log per restart ----------
+    _ar_key_startup = (str(bot_id), int(telegram_id))
+    if _ar_key_startup not in _ar_startup_logged:
+        _ar_startup_logged.add(_ar_key_startup)
+        if get_token_auto_refresh(str(bot_id), int(telegram_id)):
+            _poll_log(
+                f"🔄 [AUTO-REFRESH] User {telegram_id} ({bot_id}) — auto-refresh=ON, "
+                f"has_email={bool(email)}, has_password={bool(password)}, "
+                f"token_invalid={is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version))}"
+            )
 
     # ---------- Build busy intervals from Rides (Athena preferred) ----------
     accepted_intervals: List[Tuple[datetime, Optional[datetime]]] = []
