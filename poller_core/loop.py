@@ -58,6 +58,7 @@ from .notify import (
     unpin_warning_if_any,
     _resolve_bot_token,
     tg_unpin_message,
+    tg_send_message,
 )
 from db import (
     init_db,
@@ -350,6 +351,10 @@ def poll_user(user):
                         _p1_fail_counts.pop(_fail_key, None)
                         _auto_refresh_fail_counts.pop(_ar_key, None)
                         set_token_ok_mem(bot_id, telegram_id, cache_version)
+                        unpin_warning_if_any(bot_id, telegram_id, "expired")
+                        unpin_warning_if_any(bot_id, telegram_id, "no_token")
+                        bot_tok = _resolve_bot_token(bot_id, telegram_id)
+                        tg_send_message(bot_tok, telegram_id, "✅ <b>Token refreshed successfully</b> — bot is back online.")
                         _log_offers_found("P1", telegram_id, results2 or [])
                         return results2 or []
                     _poll_log(f"⚠️ P1 auto-refresh new token still {status_code2} for {telegram_id}")
