@@ -34,6 +34,7 @@ from .state import (
     get_user_runtime_cache,
     set_user_runtime_cache,
     mark_token_invalid,
+    clear_token_invalid,
     is_token_invalid,
     get_portal_token_mem,
     set_portal_token_mem,
@@ -237,7 +238,13 @@ def poll_user(user):
 
     # Skip immediately if this user's token was already marked invalid (unchanged since 401/403)
     if is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version)):
-        return f"Skipped {telegram_id} (token invalid — waiting for update)"
+        if get_token_auto_refresh(str(bot_id), int(telegram_id)) and email and password:
+            # Auto-refresh is ON: clear invalid mark and pre-arm fail counter so
+            # the very next 401/403 triggers Playwright immediately (skip the 3-cycle warmup).
+            clear_token_invalid(str(bot_id), int(telegram_id))
+            _p1_fail_counts[(str(bot_id), int(telegram_id))] = _P1_FAIL_THRESHOLD - 1
+        else:
+            return f"Skipped {telegram_id} (token invalid — waiting for update)"
 
     def _set_token_problem(kind: str):
         """Mark token invalid in memory + send pinned warning. kind: 'no_token' | 'expired'"""
