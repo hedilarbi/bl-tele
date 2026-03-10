@@ -238,13 +238,16 @@ def poll_user(user):
 
     # Skip immediately if this user's token was already marked invalid (unchanged since 401/403)
     if is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version)):
-        if get_token_auto_refresh(str(bot_id), int(telegram_id)) and email and password:
+        _ar = get_token_auto_refresh(str(bot_id), int(telegram_id))
+        if _ar and email and password:
             # Auto-refresh is ON: clear invalid mark and pre-arm fail counter so
             # the very next 401/403 triggers Playwright immediately (skip the 3-cycle warmup).
             _poll_log(f"🔄 [AUTO-REFRESH] Token invalid for {telegram_id} ({bot_id}) — auto-refresh ON, clearing invalid mark and arming for Playwright")
             clear_token_invalid(str(bot_id), int(telegram_id))
             _p1_fail_counts[(str(bot_id), int(telegram_id))] = _P1_FAIL_THRESHOLD - 1
         else:
+            if _ar:
+                _poll_log(f"🔄 [AUTO-REFRESH] Token invalid for {telegram_id} ({bot_id}) — auto-refresh ON but missing BL credentials (email={bool(email)}, password={bool(password)})")
             return f"Skipped {telegram_id} (token invalid — waiting for update)"
 
     def _set_token_problem(kind: str):
