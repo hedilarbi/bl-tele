@@ -13,7 +13,6 @@ from .config import (
     USE_MOCK_P2,
     ENABLE_P1,
     ENABLE_P2,
-    ATHENA_PRINT_DEBUG,
     POLL_INTERVAL,
     BURST_POLL_INTERVAL_S,
     BURST_DURATION_S,
@@ -742,7 +741,7 @@ def run():
             inflight.pop(key, None)
             try:
                 res = fut.result()
-                if res and ATHENA_PRINT_DEBUG:
+                if res:
                     _poll_log(f"✅ {res}")
             except Exception as e:
                 _poll_log(f"❌ Poll error ({key[0]}/{key[1]}): {e}")
