@@ -103,8 +103,6 @@ _P1_FAIL_THRESHOLD = 3
 # the mode is disabled and the user is notified to update manually.
 _auto_refresh_fail_counts: Dict[Tuple[str, int], int] = {}
 _AUTO_REFRESH_FAIL_THRESHOLD = 3
-# Set of (bot_id, telegram_id) already logged at startup for auto-refresh — avoids spam every 300ms
-_ar_startup_logged: set = set()
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
 _fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
@@ -227,17 +225,6 @@ def poll_user(user):
                 "email": email,
                 "password": password,
             },
-        )
-
-    # ---------- One-time auto-refresh state log per restart ----------
-    _ar_key_startup = (str(bot_id), int(telegram_id))
-    if _ar_key_startup not in _ar_startup_logged:
-        _ar_startup_logged.add(_ar_key_startup)
-        _ar_val = get_token_auto_refresh(str(bot_id), int(telegram_id))
-        _poll_log(
-            f"🔄 [AUTO-REFRESH] [{bot_id}] auto-refresh={_ar_val}, "
-            f"has_email={bool(email)}, has_password={bool(password)}, "
-            f"token_invalid={is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version))}"
         )
 
     # ---------- Build busy intervals from Rides (Athena preferred) ----------
@@ -413,7 +400,6 @@ def poll_user(user):
                 unpin_warning_if_any(bot_id, telegram_id, "no_token")
                 set_token_ok_mem(bot_id, telegram_id, cache_version)
             offers = results or []
-            _poll_log(f"✅ P1 [{bot_id}] status=200 offers={len(offers)}")
             _log_offers_found("P1", telegram_id, offers)
             return offers
         if status_code is None:
@@ -741,9 +727,7 @@ def run():
             completed += 1
             inflight.pop(key, None)
             try:
-                res = fut.result()
-                if res:
-                    _poll_log(f"✅ {res}")
+                fut.result()
             except Exception as e:
                 _poll_log(f"❌ Poll error ({key[0]}/{key[1]}): {e}")
                 _quiet_exc()
