@@ -580,7 +580,10 @@ def poll_user(user):
                 mapped = _map_portal_offer(raw, included)
                 if mapped:
                     offers.append(mapped)
+            _poll_log(f"✅ P2 [{bot_id}] status=200 offers={len(offers)}")
             _log_offers_found("P2", telegram_id, offers)
+        else:
+            _poll_log(f"⚠️ P2 [{bot_id}] status={status_code} has_token={bool(tok)}")
         return offers, tok
 
     if not USE_MOCK_P1 or not USE_MOCK_P2:
