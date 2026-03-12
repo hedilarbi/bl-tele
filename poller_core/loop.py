@@ -3,7 +3,7 @@ import time
 import traceback
 import threading
 import builtins as _builtins
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Set
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -103,6 +103,9 @@ _P1_FAIL_THRESHOLD = 3
 # the mode is disabled and the user is notified to update manually.
 _auto_refresh_fail_counts: Dict[Tuple[str, int], int] = {}
 _AUTO_REFRESH_FAIL_THRESHOLD = 3
+# P2 presence tracking: offer IDs currently visible in Athena per user.
+# An offer is processed only when it first appears; re-processed only after it disappears and comes back.
+_p2_active_offers: Dict[Tuple[str, int], Set[str]] = {}
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
 _fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
@@ -608,19 +611,22 @@ def poll_user(user):
             if ENABLE_P2 and not USE_MOCK_P2:
                 offers_p2, portal_token = _fetch_p2_offers_real()
 
+    # ---------- P2 presence tracking ----------
+    # Only pass NEW P2 offers (not currently active) to processing.
+    # An offer is processed when it first appears, then ignored until it disappears and reappears.
+    user_key = (str(bot_id), int(telegram_id))
+    current_p2_ids: Set[str] = {o["id"] for o in (offers_p2 or []) if isinstance(o, dict) and o.get("id")}
+    prev_p2_ids = _p2_active_offers.get(user_key, set())
+    new_p2_offers = [o for o in (offers_p2 or []) if isinstance(o, dict) and o.get("id") not in prev_p2_ids]
+    _p2_active_offers[user_key] = current_p2_ids
+
     # ---------- Combine and process ----------
-    # Deduplicate by offer id: P1 wins if the same id appears on both platforms.
+    # P1 and P2 are processed independently — same offer ID on both platforms produces 2 notifications.
     now_ts = time.time()
-    _seen_ids: set = set()
     all_offers: List[dict] = []
-    for offer in (offers_p1 or []) + (offers_p2 or []):
+    for offer in (offers_p1 or []) + new_p2_offers:
         if not isinstance(offer, dict):
             continue
-        oid = offer.get("id")
-        if oid and oid in _seen_ids:
-            continue
-        if oid:
-            _seen_ids.add(oid)
         if offer.get("_poll_ts") is None:
             offer["_poll_ts"] = now_ts
         all_offers.append(offer)
