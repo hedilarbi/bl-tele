@@ -596,14 +596,6 @@ def _process_offers_for_user(
         matched_vc = next((cls for cls in otype_dict.keys() if cls.lower() == raw_vc.lower()), None)
         enabled = otype_dict.get(matched_vc, 0) if matched_vc else 0
         record_result("Classe véhicule", bool(enabled), f"{otype} '{raw_vc}' désactivé" if not enabled else None)
-        if not enabled:
-            # Vehicle class disabled: skip all remaining filters immediately.
-            if oid:
-                mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
-            _log_offer_decision_async(bot_id, telegram_id, offer, "rejected", f"{otype} '{raw_vc}' désactivé")
-            observe_ms("offer_filter_ms", (time.perf_counter() - filter_t0) * 1000.0)
-            observe_ms("offer_end2end_ms", _poll_latency_ms(offer))
-            continue
 
         # --- 0b) Working hours & blocked days (user timezone) ---
         pickup_local = pickup.astimezone(gettz(tz_name))

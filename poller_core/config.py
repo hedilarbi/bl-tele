@@ -36,7 +36,7 @@ P1_FORCE_FRESH_REQUEST_IDS = os.getenv("P1_FORCE_FRESH_REQUEST_IDS", "1") == "1"
 
 # Toggle mock data for development (default: real polling)
 USE_MOCK_P1 = False    
-USE_MOCK_P2 = False     
+USE_MOCK_P2 = False
 ENABLE_P1 = True
 ENABLE_P2 = os.getenv("ENABLE_P2", "1") == "1"
 ALWAYS_POLL_REAL_ORDERS = True  # always poll real /rides (both platforms when available)

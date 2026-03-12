@@ -418,12 +418,12 @@ def poll_user(user):
         portal_sample = {
             "data": [
                 {
-                    "id": "bfd8e29a-964d-4bce-9f21-9f336d30cb91",
+                    "id": f"mock-van-{int(time.time())}",
                     "type": "offers",
                     "attributes": {
-                        "starts_at": "2026-01-14T11:16:00-05:00",
-                        "ends_at": "2026-01-14T10:11:20-05:00",
-                        "created_at": "2026-01-14T16:02:16+01:00",
+                        "starts_at": "2026-03-14T11:16:00-05:00",
+                        "ends_at": "2026-03-14T14:00:00-05:00",
+                        "created_at": "2026-03-12T16:02:16+01:00",
                         "price": "175.77",
                         "next_price_change_in": 42,
                         "currency": "USD",
@@ -448,12 +448,12 @@ def poll_user(user):
                     },
                 },
                 {
-                    "id": "fa9d91b3-4189-4135-a36b-03ccd847bbe6",
+                    "id": f"mock-biz-{int(time.time())}",
                     "type": "offers",
                     "attributes": {
-                        "starts_at": "2026-01-14T11:16:35-05:00",
-                        "ends_at": "2026-01-14T10:27:01-05:00",
-                        "created_at": "2026-01-14T15:22:00+01:00",
+                        "starts_at": "2026-03-14T11:16:35-05:00",
+                        "ends_at": "2026-03-14T14:00:00-05:00",
+                        "created_at": "2026-03-12T15:22:00+01:00",
                         "price": "160.58",
                         "next_price_change_in": 143,
                         "currency": "USD",
