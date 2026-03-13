@@ -4,7 +4,7 @@ import json as _json
 from .config import DB_FILE
 
 
-def log_offer_decision(bot_id: str, telegram_id: int, offer: dict, status: str, reason: str = None):
+def log_offer_decision(bot_id: str, telegram_id: int, offer: dict, status: str, reason: str = None, notify_text: str = None):
     rid = (offer.get("rides") or [{}])[0] if offer else {}
 
     offer_id = offer.get("id")
@@ -45,8 +45,8 @@ def log_offer_decision(bot_id: str, telegram_id: int, offer: dict, status: str, 
             bot_id, telegram_id, offer_id, status, type, vehicle_class, price, currency,
             pickup_time, ends_at, pu_address, do_address, estimated_distance_meters,
             duration_minutes, km_included, guest_requests, flight_number,
-            rejection_reason, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            rejection_reason, notify_text, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(bot_id, telegram_id, offer_id) DO UPDATE SET
             status = excluded.status,
             type = excluded.type,
@@ -63,6 +63,7 @@ def log_offer_decision(bot_id: str, telegram_id: int, offer: dict, status: str, 
             guest_requests = excluded.guest_requests,
             flight_number = excluded.flight_number,
             rejection_reason = excluded.rejection_reason,
+            notify_text = excluded.notify_text,
             created_at = CURRENT_TIMESTAMP
     """,
         (
@@ -84,6 +85,7 @@ def log_offer_decision(bot_id: str, telegram_id: int, offer: dict, status: str, 
             guest_requests,
             flight_number,
             reason,
+            notify_text,
         ),
     )
     conn.commit()
@@ -107,7 +109,7 @@ def get_offer_logs(bot_id: str, telegram_id: int, limit: int = 10, offset: int =
         SELECT offer_id, status, type, vehicle_class, price, currency, pickup_time, ends_at,
                pu_address, do_address, estimated_distance_meters, duration_minutes, km_included,
                guest_requests, flight_number,
-               rejection_reason, created_at
+               rejection_reason, notify_text, created_at
         FROM offer_logs
         WHERE bot_id = ? AND telegram_id = ?
         ORDER BY datetime(created_at) DESC, id DESC
@@ -137,7 +139,8 @@ def get_offer_logs(bot_id: str, telegram_id: int, limit: int = 10, offset: int =
                 "guest_requests": r[13],
                 "flight_number": r[14],
                 "rejection_reason": r[15],
-                "created_at": r[16],
+                "notify_text": r[16],
+                "created_at": r[17],
             }
         )
     return results

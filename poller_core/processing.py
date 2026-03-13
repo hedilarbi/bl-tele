@@ -224,10 +224,11 @@ def _log_offer_decision_async(
     offer: dict,
     status: str,
     reason: Optional[str] = None,
+    notify_text: Optional[str] = None,
 ):
     def _job():
         try:
-            log_offer_decision(bot_id, telegram_id, offer, status, reason)
+            log_offer_decision(bot_id, telegram_id, offer, status, reason, notify_text=notify_text)
         except Exception:
             pass
 
@@ -828,13 +829,13 @@ def _process_offers_for_user(
             print(f"[{datetime.now()}] ⛔ Rejected {oid} – {base_reason or 'filtres non respectés'}")
             if oid:
                 mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
-            _log_offer_decision_async(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés")
+            header_line = _build_offer_header_line(offer, "rejected", platform, forced_accept=False)
+            reject_lines = _build_reject_summary_lines(filter_results)
+            notify_text = f"{header_line}\n{reject_lines}" if reject_lines else header_line
+            _log_offer_decision_async(bot_id, telegram_id, offer, "rejected", reason_for_log or "filtres non respectés", notify_text=notify_text)
             if FAST_ACCEPT_MODE:
                 # In race mode, still keep "Show details" so users can inspect rejected offers.
                 if FAST_ACCEPT_NOTIFY_REJECTED:
-                    header_line = _build_offer_header_line(offer, "rejected", platform, forced_accept=False)
-                    reject_lines = _build_reject_summary_lines(filter_results)
-                    notify_text = f"{header_line}\n{reject_lines}" if reject_lines else header_line
                     details_key = uuid.uuid4().hex[:16]
                     _save_offer_details_render_async(
                         bot_id,
@@ -854,9 +855,6 @@ def _process_offers_for_user(
                     rejected_per_user[bot_id][telegram_id][platform].add(oid)
                 observe_ms("offer_end2end_ms", _poll_latency_ms(offer))
                 continue
-            header_line = _build_offer_header_line(offer, "rejected", platform, forced_accept=False)
-            reject_lines = _build_reject_summary_lines(filter_results)
-            notify_text = f"{header_line}\n{reject_lines}" if reject_lines else header_line
             details_key = uuid.uuid4().hex[:16]
             _save_offer_details_render_async(
                 bot_id,
@@ -1024,10 +1022,9 @@ def _process_offers_for_user(
 
         if final_status == "accepted":
             final_reason_for_log = reason_for_log
-            _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "accepted", final_reason_for_log)
-
             # Notify this user: accepted
             header_line = _build_offer_header_line(offer_to_log, "accepted", platform, forced_accept=forced_accept)
+            _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "accepted", final_reason_for_log, notify_text=header_line)
             details_key = uuid.uuid4().hex[:16]
             _save_offer_details_render_async(
                 bot_id, telegram_id, details_key, offer_to_log, "accepted",
@@ -1050,8 +1047,8 @@ def _process_offers_for_user(
                     p_fr = peer["filter_results"]
                     p_plat = peer["platform"]
                     p_fa = peer["forced_accept"]
-                    _log_offer_decision_async(p_bot_id, p_tid, p_offer, "not_accepted", f"peer_accepted:{bot_id}:{telegram_id}")
                     peer_header = _build_offer_header_line(p_offer, "not_accepted", p_plat, forced_accept=p_fa)
+                    _log_offer_decision_async(p_bot_id, p_tid, p_offer, "not_accepted", f"peer_accepted:{bot_id}:{telegram_id}", notify_text=peer_header)
                     peer_notify = peer_header
                     peer_key = uuid.uuid4().hex[:16]
                     _save_offer_details_render_async(
@@ -1064,7 +1061,8 @@ def _process_offers_for_user(
         else:
             # not_accepted: suppress notification — only send if a peer accepted (handled above)
             final_reason_for_log = reserve_reason
-            _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "not_accepted", final_reason_for_log)
+            na_header = _build_offer_header_line(offer_to_log, "not_accepted", platform, forced_accept=forced_accept)
+            _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "not_accepted", final_reason_for_log, notify_text=na_header)
 
             if OFFER_MEMORY_DEDUPE:
                 rejected_per_user[bot_id][telegram_id][platform].add(oid)

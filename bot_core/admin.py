@@ -23,6 +23,8 @@ from db import (
     get_blocked_days,
     list_user_custom_filters,
     get_endtime_formulas,
+    get_offer_logs,
+    get_offer_logs_counts,
 )
 
 
@@ -306,10 +308,13 @@ async def admin_manage_callback(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["admin_target_user_id"] = int(owner_id)
     is_active = get_active(bot_id, int(owner_id))
     menu, status_text = build_main_menu(is_active)
+    admin_kb = [
+        [InlineKeyboardButton("📋 Historique des offres", callback_data=f"admin_offers:{bot_id}:{owner_id}:0")],
+    ] + menu.inline_keyboard
     await query.edit_message_text(
         f"**Admin mode**\n\nBot: `{bot_id}`\nUser: `{owner_id}`\nBot status: {status_text}\n\nChoose your action:",
         parse_mode="Markdown",
-        reply_markup=menu,
+        reply_markup=InlineKeyboardMarkup(admin_kb),
     )
 
 
@@ -429,3 +434,72 @@ async def admin_bot_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flag = context.args[1].strip().lower()
         show_full_token = flag in ("full", "--full", "token", "--token")
     await _send_bot_info(update, bot_id, show_full_token=show_full_token)
+
+
+_ADMIN_OFFERS_PAGE_SIZE = 5
+
+
+async def admin_offers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if not _admin_owner_ok(update, context):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    data = query.data or ""
+    if not data.startswith("admin_offers:"):
+        await query.answer()
+        return
+    await query.answer()
+    parts = data.split(":")
+    if len(parts) < 4:
+        return
+    target_bot_id = parts[1]
+    target_user_id = int(parts[2])
+    page = int(parts[3])
+
+    counts = get_offer_logs_counts(target_bot_id, target_user_id)
+    total = counts.get("total", 0)
+    offset = page * _ADMIN_OFFERS_PAGE_SIZE
+    rows = get_offer_logs(target_bot_id, target_user_id, limit=_ADMIN_OFFERS_PAGE_SIZE, offset=offset)
+
+    header = (
+        f"📋 <b>Messages — {html.escape(target_bot_id)}</b>\n"
+        f"Total: <b>{total}</b>  |  ✅ <b>{counts.get('accepted',0)}</b>  "
+        f"|  ❌ <b>{counts.get('rejected',0)}</b>  |  ⚠️ <b>{counts.get('not_accepted',0)}</b>\n"
+    )
+
+    if not rows:
+        text = header + "\n<i>Aucun message pour ce bot.</i>"
+    else:
+        blocks = []
+        for r in rows:
+            notify = (r.get("notify_text") or "").strip()
+            created = (r.get("created_at") or "")[:16]
+            status = r.get("status") or ""
+            if notify:
+                blocks.append(f"<i>{html.escape(created)}</i>\n{html.escape(notify)}")
+            else:
+                # Fallback for old entries without notify_text
+                icon = "✅" if status == "accepted" else ("⚠️" if status == "not_accepted" else "❌")
+                vc = html.escape(r.get("vehicle_class") or "—")
+                price = r.get("price")
+                price_str = f" ${price}" if price else ""
+                reason = r.get("rejection_reason") or ""
+                line = f"{icon} {vc}{price_str}"
+                if reason:
+                    line += f"\n<i>{html.escape(reason)}</i>"
+                blocks.append(f"<i>{html.escape(created)}</i>\n{line}")
+        text = header + "\n" + "\n\n".join(blocks)
+
+    keyboard = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_offers:{target_bot_id}:{target_user_id}:{page-1}"))
+    if (offset + _ADMIN_OFFERS_PAGE_SIZE) < total:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_offers:{target_bot_id}:{target_user_id}:{page+1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("⬅️ Retour", callback_data=f"admin_manage:{target_bot_id}")])
+
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))

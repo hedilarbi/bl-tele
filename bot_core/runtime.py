@@ -13,6 +13,7 @@ from .admin import (
     admin_bot_info,
     admin_botinfo_callback,
     admin_manage_callback,
+    admin_offers_callback,
 )
 from db import init_db, add_bot_instance, list_bot_instances
 
@@ -41,6 +42,7 @@ def _build_application(bot_row: dict):
         app.add_handler(CommandHandler("listusers", admin_list_users))
         app.add_handler(CallbackQueryHandler(admin_manage_callback, pattern=r"^admin_manage:"))
         app.add_handler(CallbackQueryHandler(admin_botinfo_callback, pattern=r"^admin_botinfo:"))
+        app.add_handler(CallbackQueryHandler(admin_offers_callback, pattern=r"^admin_offers:"))
         app.add_handler(CallbackQueryHandler(handle_buttons))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
         return app

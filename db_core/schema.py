@@ -232,6 +232,7 @@ def init_db():
         ("guest_requests", "TEXT"),
         ("flight_number", "TEXT"),
         ("rejection_reason", "TEXT"),
+        ("notify_text", "TEXT"),
         ("created_at", "TEXT"),
     ]:
         try:
