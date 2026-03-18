@@ -106,6 +106,10 @@ _AUTO_REFRESH_FAIL_THRESHOLD = 3
 # P2 presence tracking: offer IDs currently visible in Athena per user.
 # An offer is processed only when it first appears; re-processed only after it disappears and comes back.
 _p2_active_offers: Dict[Tuple[str, int], Set[str]] = {}
+# P2 rate-limit cooldown: earliest time the next real request is allowed per user.
+_p2_next_poll: Dict[Tuple[str, int], float] = {}
+_P2_POLL_INTERVAL_S = 2.0   # min seconds between successful P2 requests per user
+_P2_BACKOFF_429_S   = 5.0   # extended wait after a 429 response
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
 _fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
@@ -550,6 +554,10 @@ def poll_user(user):
         nonlocal portal_token
         if not ENABLE_P2:
             return [], portal_token
+        # Per-user cooldown: skip if we polled too recently
+        _p2_key = (str(bot_id), int(telegram_id))
+        if time.time() < _p2_next_poll.get(_p2_key, 0):
+            return [], portal_token
         # Check in-memory cache first — avoids a DB read every 200ms cycle.
         tok = portal_token or get_portal_token_mem(bot_id, telegram_id)
         if not tok and has_portal_creds:
@@ -576,6 +584,7 @@ def poll_user(user):
 
         offers: List[dict] = []
         if status_code == 200 and isinstance(payload, dict):
+            _p2_next_poll[_p2_key] = time.time() + _P2_POLL_INTERVAL_S
             if ATHENA_USE_OFFERS_ETAG and new_etag:
                 set_offers_etag(bot_id, telegram_id, new_etag)
             included = payload.get("included") or []
@@ -586,6 +595,8 @@ def poll_user(user):
             _poll_log(f"✅ P2 [{bot_id}] status=200 offers={len(offers)}")
             _log_offers_found("P2", telegram_id, offers)
         else:
+            if status_code == 429:
+                _p2_next_poll[_p2_key] = time.time() + _P2_BACKOFF_429_S
             _poll_log(f"⚠️ P2 [{bot_id}] status={status_code} has_token={bool(tok)}")
         return offers, tok
 

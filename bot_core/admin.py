@@ -310,7 +310,7 @@ async def admin_manage_callback(update: Update, context: ContextTypes.DEFAULT_TY
     menu, status_text = build_main_menu(is_active)
     admin_kb = [
         [InlineKeyboardButton("📋 Historique des offres", callback_data=f"admin_offers:{bot_id}:{owner_id}:0")],
-    ] + menu.inline_keyboard
+    ] + list(menu.inline_keyboard)
     await query.edit_message_text(
         f"**Admin mode**\n\nBot: `{bot_id}`\nUser: `{owner_id}`\nBot status: {status_text}\n\nChoose your action:",
         parse_mode="Markdown",
