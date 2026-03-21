@@ -899,11 +899,6 @@ def _process_offers_for_user(
         reserve_future = None
         if AUTO_RESERVE_ENABLED:
             if platform == "p1" and p1_token:
-                _builtins.print(
-                    f"[{datetime.now()}] ⚡ Reserve P1 user={telegram_id} offer={oid} "
-                    f"price={offer.get('price')} {offer.get('currency','')} "
-                    f"class={offer.get('vehicleClass','')} type={otype}"
-                )
                 reserve_future = _reserve_executor.submit(
                     _reserve_offer_sync,
                     {
@@ -918,11 +913,6 @@ def _process_offers_for_user(
             elif platform == "p2":
                 p2_price = offer.get("price")
                 if p2_token and p2_price is not None:
-                    _builtins.print(
-                        f"[{datetime.now()}] ⚡ Reserve P2 user={telegram_id} offer={oid} "
-                        f"price={p2_price} {offer.get('currency','')} "
-                        f"class={offer.get('vehicleClass','')} type={otype}"
-                    )
                     reserve_future = _reserve_executor.submit(
                         _reserve_offer_sync,
                         {
@@ -1007,10 +997,6 @@ def _process_offers_for_user(
             else:
                 if pickup_dt is not None:
                     add_ride_to_cache(bot_id, telegram_id, oid, pickup_dt, predicted_end)
-                _builtins.print(
-                    f"[{datetime.now()}] ✅ {platform.upper()} reserve {oid} -> {rs} "
-                    f"latency={int(rr.get('latency_ms') or 0)}ms"
-                )
 
         final_status = "accepted"
         if AUTO_RESERVE_ENABLED and reserve_attempted and not reserve_ok:

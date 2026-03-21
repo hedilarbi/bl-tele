@@ -248,12 +248,11 @@ def poll_user(user):
         if _ar and email and password:
             # Auto-refresh is ON: clear invalid mark and pre-arm fail counter so
             # the very next 401/403 triggers Playwright immediately (skip the 3-cycle warmup).
-            _poll_log(f"🔄 [AUTO-REFRESH] [{bot_id}] Token invalid — auto-refresh ON, clearing invalid mark and arming for Playwright")
             clear_token_invalid(str(bot_id), int(telegram_id))
             _p1_fail_counts[(str(bot_id), int(telegram_id))] = _P1_FAIL_THRESHOLD - 1
         else:
             if _ar:
-                _poll_log(f"🔄 [AUTO-REFRESH] [{bot_id}] Token invalid — auto-refresh ON but missing BL credentials (email={bool(email)}, password={bool(password)})")
+                _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Token invalid but BL credentials missing")
             return f"Skipped {telegram_id} (token invalid — waiting for update)"
 
     def _set_token_problem(kind: str):
@@ -357,9 +356,7 @@ def poll_user(user):
             _ar_key = (str(bot_id), int(telegram_id))
             if auto_refresh and email and password:
                 # Auto-refresh ON: attempt Playwright re-login
-                _poll_log(f"🔄 [AUTO-REFRESH] [{bot_id}] Starting Playwright re-login with email={email}")
-                ok, new_token, new_refresh, note = get_playwright_p1_token(bot_id, telegram_id, email, password)
-                _poll_log(f"🔄 [AUTO-REFRESH] [{bot_id}] Playwright result: ok={ok}, has_token={bool(new_token)}, note={note}")
+                ok, new_token, new_refresh, _ = get_playwright_p1_token(bot_id, telegram_id, email, password)
                 if ok and new_token:
                     status_code2, results2 = get_offers_p1(new_token, headers=mobile_headers)
                     if status_code2 == 200:
@@ -376,18 +373,15 @@ def poll_user(user):
                         tg_send_message(bot_tok, telegram_id, "✅ <b>Token refreshed successfully</b> — bot is back online.")
                         _log_offers_found("P1", telegram_id, results2 or [])
                         return results2 or []
-                    _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] New token still {status_code2}")
-                else:
-                    _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Playwright failed: {note}")
+                    _poll_log(f"❌ [AUTO-REFRESH] [{bot_id}] New token still {status_code2} after Playwright login")
                 # Auto-refresh attempt failed
                 _ar_n = _auto_refresh_fail_counts.get(_ar_key, 0) + 1
                 _auto_refresh_fail_counts[_ar_key] = _ar_n
-                _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Fail {_ar_n}/{_AUTO_REFRESH_FAIL_THRESHOLD}")
                 if _ar_n >= _AUTO_REFRESH_FAIL_THRESHOLD:
                     # Disable auto-refresh and notify user with pinned warning
                     set_token_auto_refresh(str(bot_id), int(telegram_id), False)
                     _auto_refresh_fail_counts.pop(_ar_key, None)
-                    _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Disabled after {_AUTO_REFRESH_FAIL_THRESHOLD} failures")
+                    _poll_log(f"❌ [AUTO-REFRESH] [{bot_id}] Disabled after {_AUTO_REFRESH_FAIL_THRESHOLD} consecutive failures")
                     _set_token_problem("expired")
                 else:
                     # Let polling continue so another attempt can be made
@@ -396,7 +390,7 @@ def poll_user(user):
             else:
                 # Auto-refresh OFF or no credentials: notify user to update manually
                 if auto_refresh and not (email and password):
-                    _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] ON but no BL credentials — falling back to manual")
+                    _poll_log(f"❌ [AUTO-REFRESH] [{bot_id}] ON but BL credentials missing — falling back to manual")
                 _set_token_problem("expired")
                 return []
         if status_code == 200:
@@ -592,7 +586,6 @@ def poll_user(user):
                 mapped = _map_portal_offer(raw, included)
                 if mapped:
                     offers.append(mapped)
-            _poll_log(f"✅ P2 [{bot_id}] status=200 offers={len(offers)}")
             _log_offers_found("P2", telegram_id, offers)
         else:
             if status_code == 429:

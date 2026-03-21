@@ -220,17 +220,13 @@ def refresh_p1_access_token(
     }
     headers = _build_oauth_headers(None, oauth_headers)
     timeout_s = max(5, int(P1_POLL_TIMEOUT_S))
-    _builtins.print(
-        f"[{datetime.now()}] 🔐 P1 refresh call -> POST {url} "
-        f"(client_id={_mask_value(client_id, keep=5)} fp={_fp8(client_id)}, "
-        f"refresh_token={_mask_value(refresh_token, keep=6)} len={len(str(refresh_token or ''))} fp={_fp8(refresh_token)})"
-    )
     try:
         r = _session_request("POST", url, headers=headers, json=payload, timeout=timeout_s)
-        _builtins.print(
-            f"[{datetime.now()}] 🧾 P1 refresh response status={r.status_code} "
-            f"body={_redact_sensitive_text(r.text)}"
-        )
+        if not (200 <= r.status_code < 300):
+            _builtins.print(
+                f"[{datetime.now()}] ❌ P1 refresh failed status={r.status_code} "
+                f"body={_redact_sensitive_text(r.text)}"
+            )
         if 200 <= r.status_code < 300:
             try:
                 j = r.json() or {}
@@ -276,22 +272,7 @@ def maybe_refresh_p1_session(
             )
         return current_token, mobile_headers, False, "missing_refresh_material"
 
-    _builtins.print(
-        f"[{datetime.now()}] 🔄 P1 refresh attempt for {bot_id}/{telegram_id} "
-        f"trigger={trigger} force={force} token_present={'yes' if current_token else 'no'} "
-        f"client_id={_mask_value(client_id, keep=5)} fp={_fp8(client_id)} "
-        f"refresh_fp={_fp8(refresh_token)}"
-    )
     req_headers = _build_oauth_headers(mobile_headers, oauth_headers)
-    cookie_raw = _header_get(req_headers, "Cookie") or _header_get(req_headers, "cookie") or ""
-    _builtins.print(
-        f"[{datetime.now()}] 🍪 P1 refresh headers for {bot_id}/{telegram_id} "
-        f"cookie_present={'yes' if bool(cookie_raw) else 'no'} "
-        f"cookie_len={len(str(cookie_raw)) if cookie_raw else 0} "
-        f"cookie_fp={_fp8(cookie_raw)} "
-        f"auth0_client_present={'yes' if bool(_header_get(req_headers, 'Auth0-Client')) else 'no'} "
-        f"user_agent_present={'yes' if bool(_header_get(req_headers, 'User-Agent')) else 'no'}"
-    )
     ok, new_token, new_refresh, note = refresh_p1_access_token(
         refresh_token=str(refresh_token),
         client_id=str(client_id),
@@ -417,7 +398,6 @@ def get_playwright_p1_token(
     """Run headless PKCE login. Returns (ok, access_token, refresh_token, note). Does NOT save to DB."""
     if not email or not password:
         return False, None, None, "missing_credentials"
-    _builtins.print(f"[{datetime.now()}] 🔐 P1 Playwright re-login for {bot_id}/{telegram_id}")
     try:
         loop = asyncio.new_event_loop()
         ok, new_token, new_refresh, note = loop.run_until_complete(
@@ -429,10 +409,9 @@ def get_playwright_p1_token(
         return False, None, None, f"playwright_exception:{type(e).__name__}"
 
     if not ok or not new_token:
-        _builtins.print(f"[{datetime.now()}] ⚠️ P1 Playwright failed for {bot_id}/{telegram_id}: {note}")
+        _builtins.print(f"[{datetime.now()}] ❌ P1 Playwright failed for {bot_id}/{telegram_id}: {note}")
         return False, None, None, note
 
-    _builtins.print(f"[{datetime.now()}] ✅ P1 Playwright login success for {bot_id}/{telegram_id}")
     return True, new_token, new_refresh, "ok"
 
 
@@ -450,4 +429,3 @@ def save_playwright_p1_token(
         auth_meta["refresh_token"] = str(new_refresh)
     update_token(bot_id, telegram_id, new_token, headers=mobile_headers, auth_meta=auth_meta)
     set_token_status(bot_id, telegram_id, "valid")
-    _builtins.print(f"[{datetime.now()}] 💾 P1 Playwright token saved for {bot_id}/{telegram_id}")
