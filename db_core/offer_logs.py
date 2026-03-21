@@ -3,6 +3,23 @@ import json as _json
 
 from .config import DB_FILE
 
+_OFFER_LOGS_KEEP_DAYS = 30
+
+
+def prune_offer_logs(days_to_keep: int = _OFFER_LOGS_KEEP_DAYS):
+    """Delete offer_logs rows older than `days_to_keep` days. Called at startup."""
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    c = conn.cursor()
+    c.execute("PRAGMA busy_timeout=5000")
+    c.execute(
+        "DELETE FROM offer_logs WHERE created_at < datetime('now', ?)",
+        (f"-{days_to_keep} days",),
+    )
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
 
 def log_offer_decision(bot_id: str, telegram_id: int, offer: dict, status: str, reason: str = None, notify_text: str = None):
     rid = (offer.get("rides") or [{}])[0] if offer else {}
