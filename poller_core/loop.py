@@ -108,7 +108,7 @@ _AUTO_REFRESH_FAIL_THRESHOLD = 3
 _p2_active_offers: Dict[Tuple[str, int], Set[str]] = {}
 # P2 rate-limit cooldown: earliest time the next real request is allowed per user.
 _p2_next_poll: Dict[Tuple[str, int], float] = {}
-_P2_POLL_INTERVAL_S = 2.0   # min seconds between successful P2 requests per user
+_P2_POLL_INTERVAL_S = 0.5   # min seconds between successful P2 requests per user
 _P2_BACKOFF_429_S   = 5.0   # extended wait after a 429 response
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.

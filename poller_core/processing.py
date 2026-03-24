@@ -2,6 +2,7 @@ import uuid
 import json
 import re
 import time
+import threading
 import concurrent.futures
 import builtins as _builtins
 from typing import Optional, List, Tuple, Dict, Any
@@ -183,6 +184,126 @@ def _init_rides_cache_async(
 
 _db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 _reserve_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+
+# Offers currently being reserved (fire-and-forget).
+# Prevents the same offer from being re-submitted across consecutive poll cycles
+# while the reserve HTTP call is still in flight.
+_pending_reserves: Dict[str, float] = {}  # offer_key -> submitted_at (monotonic)
+_pending_reserves_lock = threading.Lock()
+_PENDING_RESERVE_TTL_S = 15.0  # safety TTL — entry removed by callback, not by timer
+
+
+def _pending_reserve_add(offer_key: str):
+    with _pending_reserves_lock:
+        _pending_reserves[offer_key] = time.monotonic()
+
+
+def _pending_reserve_remove(offer_key: str):
+    with _pending_reserves_lock:
+        _pending_reserves.pop(offer_key, None)
+
+
+def _pending_reserve_stale_cleanup():
+    now = time.monotonic()
+    with _pending_reserves_lock:
+        stale = [k for k, ts in _pending_reserves.items() if now - ts > _PENDING_RESERVE_TTL_S]
+        for k in stale:
+            del _pending_reserves[k]
+
+
+def is_pending_reserve(offer_key: str) -> bool:
+    with _pending_reserves_lock:
+        ts = _pending_reserves.get(offer_key)
+        if ts is None:
+            return False
+        if time.monotonic() - ts > _PENDING_RESERVE_TTL_S:
+            del _pending_reserves[offer_key]
+            return False
+        return True
+
+
+def _on_reserve_done(future: concurrent.futures.Future, cand: dict):
+    """
+    Callback fired in _reserve_executor thread when the reserve HTTP call completes.
+    Handles result, sends notification, logs to DB.
+    The poll cycle has already returned — this runs fully async.
+    """
+    offer_key = cand.get("offer_key")
+    if offer_key:
+        _pending_reserve_remove(offer_key)
+
+    bot_id = cand["bot_id"]
+    telegram_id = cand["telegram_id"]
+    tz_name = cand["tz_name"]
+    offer_to_log = cand["offer"]
+    oid = cand["oid"]
+    platform = cand["platform"]
+    filter_results = cand["filter_results"]
+    reason_for_log = cand["reason_for_log"]
+    forced_accept = cand["forced_accept"]
+    pickup_dt = cand.get("pickup")
+    predicted_end = cand.get("predicted_end")
+    cache_version = cand["cache_version"]
+
+    try:
+        rr = future.result()
+    except Exception as e:
+        rr = {"status_code": None, "body": {"error": f"{type(e).__name__}: {e}"}, "latency_ms": None}
+
+    rs = rr.get("status_code")
+    rb = rr.get("body")
+    reserve_ok = 200 <= (rs or 0) < 300
+    observe_ms("reserve_rtt_ms", rr.get("latency_ms"))
+
+    if not reserve_ok:
+        if platform == "p1" and rs == 401:
+            set_token_status(bot_id, telegram_id, "expired")
+        _builtins.print(
+            f"[{datetime.now()}] ❌ {platform.upper()} reserve {oid} -> {rs} "
+            f"latency={int(rr.get('latency_ms') or 0)}ms body={rb}"
+        )
+        na_header = _build_offer_header_line(offer_to_log, "not_accepted", platform, forced_accept=forced_accept)
+        _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "not_accepted", f"reserve_failed:{rs}", notify_text=na_header)
+        if oid:
+            mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
+        if OFFER_MEMORY_DEDUPE:
+            rejected_per_user[bot_id][telegram_id][platform].add(oid)
+    else:
+        if pickup_dt is not None:
+            add_ride_to_cache(bot_id, telegram_id, oid, pickup_dt, predicted_end)
+        header_line = _build_offer_header_line(offer_to_log, "accepted", platform, forced_accept=forced_accept)
+        _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "accepted", reason_for_log, notify_text=header_line)
+        details_key = uuid.uuid4().hex[:16]
+        _save_offer_details_render_async(
+            bot_id, telegram_id, details_key, offer_to_log, "accepted",
+            None, tz_name, filter_results=filter_results, platform=platform, forced_accept=forced_accept,
+        )
+        kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
+        _send_notification_async(bot_id, telegram_id, "accepted", header_line, platform, reply_markup=kb)
+        if OFFER_MEMORY_DEDUPE:
+            accepted_per_user[bot_id][telegram_id].add(oid)
+        # Notify peers (other users who also passed filters for the same offer)
+        if offer_key:
+            peers = claim_offer(offer_key, bot_id, telegram_id)
+            for peer in peers:
+                p_bot_id = peer["bot_id"]
+                p_tid = peer["telegram_id"]
+                p_offer = peer["offer"]
+                p_tz = peer["tz_name"]
+                p_fr = peer["filter_results"]
+                p_plat = peer["platform"]
+                p_fa = peer["forced_accept"]
+                peer_header = _build_offer_header_line(p_offer, "not_accepted", p_plat, forced_accept=p_fa)
+                _log_offer_decision_async(p_bot_id, p_tid, p_offer, "not_accepted", f"peer_accepted:{bot_id}:{telegram_id}", notify_text=peer_header)
+                peer_key = uuid.uuid4().hex[:16]
+                _save_offer_details_render_async(
+                    p_bot_id, p_tid, peer_key, p_offer, "not_accepted",
+                    None, p_tz, filter_results=p_fr, platform=p_plat, forced_accept=p_fa,
+                )
+                peer_kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{peer_key}"}]]}
+                _send_notification_async(p_bot_id, p_tid, "not_accepted", peer_header, p_plat, reply_markup=peer_kb, force_notify=True)
+
+    observe_ms("offer_end2end_ms", _poll_latency_ms(offer_to_log))
 
 
 def _reserve_offer_sync(task: dict) -> dict:
@@ -522,9 +643,7 @@ def _process_offers_for_user(
     if user_cfilters is None:
         user_cfilters = _get_enabled_filter_slugs(bot_id, telegram_id)
     pending_notifications: List[Tuple[str, str, str, Optional[dict], bool]] = []
-    reserve_candidates: List[dict] = []
     pending_intervals: List[Tuple[datetime, Optional[datetime]]] = []
-    reserve_batch_started_at: Optional[float] = None
 
     def _queue_notification(
         kind: str,
@@ -541,10 +660,15 @@ def _process_offers_for_user(
     else:
         print(f"[{datetime.now()}] 🧩 Custom filters for {bot_id}/{telegram_id}: none")
 
+    _pending_reserve_stale_cleanup()
+
     for offer in offers:
         filter_t0 = time.perf_counter()
         oid = offer.get("id")
         platform = offer.get("_platform", "p1")
+        # Skip offers currently being reserved (fire-and-forget in flight)
+        if oid and is_pending_reserve(f"{platform}:{oid}"):
+            continue
         if oid and is_recent_not_valid(bot_id, telegram_id, platform, str(oid), cache_version=cache_version):
             print(f"[{datetime.now()}] ⏭️ Skipping recent not-valid offer {oid} for user {telegram_id} (cached 1m).")
             continue
@@ -875,14 +999,16 @@ def _process_offers_for_user(
             observe_ms("offer_end2end_ms", _poll_latency_ms(offer))
             continue
 
-        # Accepted candidate:
-        # submit reserve immediately so network race starts before full offer scan ends.
+        # Accepted candidate — fire-and-forget reserve.
+        # The poll cycle does NOT block waiting for the reserve HTTP response.
+        # A callback (_on_reserve_done) handles the result asynchronously.
         predicted_end = parse_iso_dt_or_none((offer.get("rides") or [{}])[0].get("endsAt"))
+        offer_key = f"{platform}:{oid}" if oid else None
 
         # Register this user as a candidate for cross-user coordination.
         if AUTO_RESERVE_ENABLED and oid:
             register_candidate(
-                f"{platform}:{oid}",
+                offer_key,
                 bot_id,
                 telegram_id,
                 {
@@ -896,13 +1022,30 @@ def _process_offers_for_user(
                 },
             )
 
+        # Build callback context — everything the callback needs to notify the user.
+        cb_ctx = {
+            "bot_id": bot_id,
+            "telegram_id": telegram_id,
+            "tz_name": tz_name,
+            "offer": offer,
+            "oid": oid,
+            "platform": platform,
+            "filter_results": filter_results,
+            "reason_for_log": reason_for_log,
+            "forced_accept": bool(accept_override and failed_filters),
+            "pickup": pickup,
+            "predicted_end": predicted_end,
+            "cache_version": cache_version,
+            "offer_key": offer_key,
+        }
+
         reserve_future = None
         if AUTO_RESERVE_ENABLED:
             if platform == "p1" and p1_token:
                 reserve_future = _reserve_executor.submit(
                     _reserve_offer_sync,
                     {
-                        "task_key": len(reserve_candidates),
+                        "task_key": 0,
                         "platform": "p1",
                         "offer_id": oid,
                         "token": p1_token,
@@ -916,7 +1059,7 @@ def _process_offers_for_user(
                     reserve_future = _reserve_executor.submit(
                         _reserve_offer_sync,
                         {
-                            "task_key": len(reserve_candidates),
+                            "task_key": 0,
                             "platform": "p2",
                             "offer_id": oid,
                             "token": p2_token,
@@ -924,140 +1067,39 @@ def _process_offers_for_user(
                             "bl_user_id": bl_uuid,
                         },
                     )
-            if reserve_future is not None and reserve_batch_started_at is None:
-                reserve_batch_started_at = time.perf_counter()
 
-        # Keep a pending interval guard to avoid accepting overlapping rides
-        # in the same cycle before reserve responses come back.
-        pending_intervals.append((pickup, predicted_end))
-        reserve_candidates.append(
-            {
-                "offer": offer,
-                "oid": oid,
-                "platform": platform,
-                "reason_for_log": reason_for_log,
-                "filter_results": filter_results,
-                "forced_accept": bool(accept_override and failed_filters),
-                "pickup": pickup,
-                "predicted_end": predicted_end,
-                "reserve_future": reserve_future,
-            }
-        )
-
-    reserve_results: Dict[int, dict] = {}
-    if AUTO_RESERVE_ENABLED and reserve_candidates:
-        for idx, cand in enumerate(reserve_candidates):
-            fut = cand.get("reserve_future")
-            if fut is None:
-                continue
-            try:
-                rr = fut.result()
-            except Exception as e:
-                rr = {
-                    "task_key": idx,
-                    "offer_id": cand.get("oid"),
-                    "status_code": None,
-                    "body": {"error": f"{type(e).__name__}: {e}"},
-                    "latency_ms": None,
-                }
-            reserve_results[idx] = rr
-            observe_ms("reserve_rtt_ms", rr.get("latency_ms"))
-        if reserve_batch_started_at is not None:
-            observe_ms("reserve_batch_ms", (time.perf_counter() - reserve_batch_started_at) * 1000.0)
-
-    for idx, cand in enumerate(reserve_candidates):
-        offer_to_log = cand["offer"]
-        oid = cand["oid"]
-        platform = cand["platform"]
-        reason_for_log = cand["reason_for_log"]
-        filter_results = cand["filter_results"]
-        forced_accept = cand["forced_accept"]
-        pickup_dt = cand.get("pickup")
-        predicted_end = cand.get("predicted_end")
-
-        reserve_attempted = idx in reserve_results
-        reserve_ok = True
-        reserve_reason = None
-        reserve_reason_user = None
-
-        if AUTO_RESERVE_ENABLED and reserve_attempted:
-            rr = reserve_results.get(idx) or {}
-            rs = rr.get("status_code")
-            rb = rr.get("body")
-            reserve_ok = 200 <= (rs or 0) < 300
-            if not reserve_ok:
-                if platform == "p1" and rs == 401:
-                    set_token_status(bot_id, telegram_id, "expired")
-                reserve_reason = f"reserve_failed:{rs}"
-                reserve_reason_user = _reserve_failure_human_reason(rs, rb)
-                _builtins.print(
-                    f"[{datetime.now()}] ❌ {platform.upper()} reserve {oid} -> {rs} "
-                    f"latency={int(rr.get('latency_ms') or 0)}ms body={rb}"
-                )
-            else:
-                if pickup_dt is not None:
-                    add_ride_to_cache(bot_id, telegram_id, oid, pickup_dt, predicted_end)
-
-        final_status = "accepted"
-        if AUTO_RESERVE_ENABLED and reserve_attempted and not reserve_ok:
-            final_status = "not_accepted"
-        if final_status == "accepted" and pickup_dt is not None:
-            accepted_intervals.append((pickup_dt, predicted_end))
-
-        offer_key = f"{platform}:{oid}" if oid else None
-
-        if final_status == "accepted":
-            final_reason_for_log = reason_for_log
-            # Notify this user: accepted
-            header_line = _build_offer_header_line(offer_to_log, "accepted", platform, forced_accept=forced_accept)
-            _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "accepted", final_reason_for_log, notify_text=header_line)
-            details_key = uuid.uuid4().hex[:16]
-            _save_offer_details_render_async(
-                bot_id, telegram_id, details_key, offer_to_log, "accepted",
-                None, tz_name, filter_results=filter_results, platform=platform, forced_accept=forced_accept,
-            )
-            kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
-            _queue_notification("accepted", header_line, platform, reply_markup=kb)
-
-            if OFFER_MEMORY_DEDUPE:
-                accepted_per_user[bot_id][telegram_id].add(oid)
-
-            # Notify peers who also passed filters for this offer
+        if reserve_future is not None:
+            # Mark as in-flight so next poll cycle skips this offer
             if offer_key:
-                peers = claim_offer(offer_key, bot_id, telegram_id)
-                for peer in peers:
-                    p_bot_id = peer["bot_id"]
-                    p_tid = peer["telegram_id"]
-                    p_offer = peer["offer"]
-                    p_tz = peer["tz_name"]
-                    p_fr = peer["filter_results"]
-                    p_plat = peer["platform"]
-                    p_fa = peer["forced_accept"]
-                    peer_header = _build_offer_header_line(p_offer, "not_accepted", p_plat, forced_accept=p_fa)
-                    _log_offer_decision_async(p_bot_id, p_tid, p_offer, "not_accepted", f"peer_accepted:{bot_id}:{telegram_id}", notify_text=peer_header)
-                    peer_notify = peer_header
-                    peer_key = uuid.uuid4().hex[:16]
-                    _save_offer_details_render_async(
-                        p_bot_id, p_tid, peer_key, p_offer, "not_accepted",
-                        None, p_tz, filter_results=p_fr, platform=p_plat, forced_accept=p_fa,
-                    )
-                    peer_kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{peer_key}"}]]}
-                    _send_notification_async(p_bot_id, p_tid, "not_accepted", peer_notify, p_plat, reply_markup=peer_kb, force_notify=True)
-
+                _pending_reserve_add(offer_key)
+            # Attach callback — fires in _reserve_executor thread, does NOT block poll
+            reserve_future.add_done_callback(lambda f, ctx=cb_ctx: _on_reserve_done(f, ctx))
         else:
-            # not_accepted: suppress notification — only send if a peer accepted (handled above)
-            final_reason_for_log = reserve_reason
-            na_header = _build_offer_header_line(offer_to_log, "not_accepted", platform, forced_accept=forced_accept)
-            _log_offer_decision_async(bot_id, telegram_id, offer_to_log, "not_accepted", final_reason_for_log, notify_text=na_header)
+            # No reserve submitted (AUTO_RESERVE_ENABLED=False or missing token/price)
+            # Treat as accepted immediately (dry-run or no-token-yet)
+            if AUTO_RESERVE_ENABLED:
+                # Has reserve enabled but couldn't submit (no token) — not_accepted
+                na_header = _build_offer_header_line(offer, "not_accepted", platform, forced_accept=bool(accept_override and failed_filters))
+                _log_offer_decision_async(bot_id, telegram_id, offer, "not_accepted", "no_token_for_reserve", notify_text=na_header)
+                if oid:
+                    mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
+            else:
+                # Dry-run: notify as accepted without reserving
+                header_line = _build_offer_header_line(offer, "accepted", platform, forced_accept=bool(accept_override and failed_filters))
+                _log_offer_decision_async(bot_id, telegram_id, offer, "accepted", reason_for_log, notify_text=header_line)
+                details_key = uuid.uuid4().hex[:16]
+                _save_offer_details_render_async(
+                    bot_id, telegram_id, details_key, offer, "accepted",
+                    None, tz_name, filter_results=filter_results, platform=platform,
+                    forced_accept=bool(accept_override and failed_filters),
+                )
+                kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
+                _queue_notification("accepted", header_line, platform, reply_markup=kb)
+                if pickup is not None:
+                    accepted_intervals.append((pickup, predicted_end))
 
-            if OFFER_MEMORY_DEDUPE:
-                rejected_per_user[bot_id][telegram_id][platform].add(oid)
-
-            # Suppress retries of offers that failed at reserve stage.
-            if oid:
-                mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
-
-        observe_ms("offer_end2end_ms", _poll_latency_ms(offer_to_log))
+        # Guard same-cycle overlap: mark time slot as pending even before reserve confirms
+        pending_intervals.append((pickup, predicted_end))
 
     for kind, text, platform_name, reply_markup, force_notify in pending_notifications:
         _send_notification_async(
