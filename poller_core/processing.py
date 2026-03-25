@@ -268,6 +268,16 @@ def _on_reserve_done(future: concurrent.futures.Future, cand: dict):
             mark_not_valid_cached(bot_id, telegram_id, platform, str(oid), cache_version=cache_version)
         if OFFER_MEMORY_DEDUPE:
             rejected_per_user[bot_id][telegram_id][platform].add(oid)
+        # 409/410: offer taken or gone — always notify the user regardless of who took it
+        if rs in (409, 410):
+            na_reason = _reserve_failure_human_reason(rs, rb)
+            details_key = uuid.uuid4().hex[:16]
+            _save_offer_details_render_async(
+                bot_id, telegram_id, details_key, offer_to_log, "not_accepted",
+                na_reason, tz_name, filter_results=filter_results, platform=platform, forced_accept=forced_accept,
+            )
+            na_kb = {"inline_keyboard": [[{"text": "Show details", "callback_data": f"show_offer:{details_key}"}]]}
+            _send_notification_async(bot_id, telegram_id, "not_accepted", na_header, platform, reply_markup=na_kb, force_notify=True)
     else:
         if pickup_dt is not None:
             add_ride_to_cache(bot_id, telegram_id, oid, pickup_dt, predicted_end)

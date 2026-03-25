@@ -97,19 +97,25 @@ _user_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 # Token is only marked invalid after _P1_FAIL_THRESHOLD consecutive failures
 # to absorb transient Auth0 hiccups that resolve on their own.
 _p1_fail_counts: Dict[Tuple[str, int], int] = {}
-_P1_FAIL_THRESHOLD = 3
+_P1_FAIL_THRESHOLD = 8  # more tolerance before triggering Playwright
 # Consecutive auto-refresh failures per (bot_id, telegram_id).
 # When auto_refresh mode is ON and Playwright re-login fails this many times,
 # the mode is disabled and the user is notified to update manually.
 _auto_refresh_fail_counts: Dict[Tuple[str, int], int] = {}
 _AUTO_REFRESH_FAIL_THRESHOLD = 3
+# Minimum seconds between two Playwright re-login attempts for the same user.
+# Prevents hammering Blacklane login with rapid retries when the session is broken.
+_ar_last_attempt: Dict[Tuple[str, int], float] = {}
+_AR_MIN_INTERVAL_S = 600.0  # 10 minutes
 # P2 presence tracking: offer IDs currently visible in Athena per user.
 # An offer is processed only when it first appears; re-processed only after it disappears and comes back.
 _p2_active_offers: Dict[Tuple[str, int], Set[str]] = {}
 # P2 rate-limit cooldown: earliest time the next real request is allowed per user.
 _p2_next_poll: Dict[Tuple[str, int], float] = {}
-_P2_POLL_INTERVAL_S = 0.5   # min seconds between successful P2 requests per user
-_P2_BACKOFF_429_S   = 5.0   # extended wait after a 429 response
+_p2_429_count: Dict[Tuple[str, int], int] = {}  # consecutive 429s per user
+_P2_POLL_INTERVAL_S    = 0.5    # min seconds between successful P2 requests per user
+_P2_BACKOFF_429_BASE_S = 10.0   # initial wait after first 429
+_P2_BACKOFF_429_MAX_S  = 300.0  # cap at 5 minutes
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
 _fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
@@ -355,6 +361,14 @@ def poll_user(user):
             auto_refresh = get_token_auto_refresh(str(bot_id), int(telegram_id))
             _ar_key = (str(bot_id), int(telegram_id))
             if auto_refresh and email and password:
+                # Enforce minimum interval between Playwright attempts to avoid Blacklane login detection
+                _last = _ar_last_attempt.get(_ar_key, 0.0)
+                _now = time.time()
+                if _now - _last < _AR_MIN_INTERVAL_S:
+                    # Too soon — reset P1 fail counter and wait for next window
+                    _p1_fail_counts.pop(_fail_key, None)
+                    return []
+                _ar_last_attempt[_ar_key] = _now
                 # Auto-refresh ON: attempt Playwright re-login
                 ok, new_token, new_refresh, _ = get_playwright_p1_token(bot_id, telegram_id, email, password)
                 if ok and new_token:
@@ -365,6 +379,7 @@ def poll_user(user):
                         token = new_token
                         _p1_fail_counts.pop(_fail_key, None)
                         _auto_refresh_fail_counts.pop(_ar_key, None)
+                        _ar_last_attempt.pop(_ar_key, None)
                         set_token_status(bot_id, telegram_id, "valid")
                         set_token_ok_mem(bot_id, telegram_id, cache_version)
                         unpin_warning_if_any(bot_id, telegram_id, "expired")
@@ -579,6 +594,7 @@ def poll_user(user):
         offers: List[dict] = []
         if status_code == 200 and isinstance(payload, dict):
             _p2_next_poll[_p2_key] = time.time() + _P2_POLL_INTERVAL_S
+            _p2_429_count[_p2_key] = 0
             if ATHENA_USE_OFFERS_ETAG and new_etag:
                 set_offers_etag(bot_id, telegram_id, new_etag)
             included = payload.get("included") or []
@@ -589,8 +605,13 @@ def poll_user(user):
             _log_offers_found("P2", telegram_id, offers)
         else:
             if status_code == 429:
-                _p2_next_poll[_p2_key] = time.time() + _P2_BACKOFF_429_S
-            _poll_log(f"⚠️ P2 [{bot_id}] status={status_code} has_token={bool(tok)}")
+                n = _p2_429_count.get(_p2_key, 0) + 1
+                _p2_429_count[_p2_key] = n
+                backoff = min(_P2_BACKOFF_429_BASE_S * (2 ** (n - 1)), _P2_BACKOFF_429_MAX_S)
+                _p2_next_poll[_p2_key] = time.time() + backoff
+                _poll_log(f"⚠️ P2 [{bot_id}] 429 (consecutive={n}, backoff={backoff:.0f}s)")
+            else:
+                _poll_log(f"⚠️ P2 [{bot_id}] status={status_code} has_token={bool(tok)}")
         return offers, tok
 
     if not USE_MOCK_P1 or not USE_MOCK_P2:
