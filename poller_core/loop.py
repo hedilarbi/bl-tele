@@ -127,7 +127,7 @@ _P2_BACKOFF_429_BASE_S = 10.0   # initial wait after first global 429
 _P2_BACKOFF_429_MAX_S  = 300.0  # cap at 5 minutes
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
-_fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2)
+_fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2 + 5)
 
 # Cache for the active-users DB query: refreshed every 3 seconds instead of every 200ms.
 _USERS_CACHE_TTL_S = 3.0
@@ -765,7 +765,7 @@ def run():
     _SCHEDULE_PRUNE_INTERVAL_S = 86400.0  # 24 hours
 
     _CLEANUP_CYCLE_EVERY = 200    # cleanup not_valid cache every ~20s at 100ms poll
-    _WARMUP_CYCLE_EVERY = 300    # re-warm reserve connections every ~30s at 100ms poll
+    _WARMUP_CYCLE_EVERY = 150    # re-warm reserve connections every ~45s at 300ms poll
 
     # Pre-warm reserve connections immediately at startup
     _warmup_reserve_connections_async()

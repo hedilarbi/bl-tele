@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 
 _lock = threading.Lock()
 _TTL_S = 180.0
+_last_cleanup_ts: float = 0.0    # rate-limits _cleanup_locked() to once per 10s
+_CLEANUP_INTERVAL_S: float = 10.0
 
 # offer_key -> {"candidates": {user_key: candidate_dict}, "ts": float}
 _pending: Dict[str, dict] = {}
@@ -45,11 +47,15 @@ def register_candidate(
     candidate_data must contain: bot_id, telegram_id, offer, tz_name,
                                   filter_results, platform, forced_accept.
     """
+    global _last_cleanup_ts
     user_key = f"{bot_id}:{telegram_id}"
     with _lock:
-        _cleanup_locked()
+        now = time.time()
+        if now - _last_cleanup_ts >= _CLEANUP_INTERVAL_S:
+            _cleanup_locked()
+            _last_cleanup_ts = now
         if offer_key not in _pending:
-            _pending[offer_key] = {"candidates": {}, "ts": time.time()}
+            _pending[offer_key] = {"candidates": {}, "ts": now}
         _pending[offer_key]["candidates"][user_key] = candidate_data
 
 

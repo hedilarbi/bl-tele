@@ -30,6 +30,8 @@ from .utils import (
     _fmt_local_iso,
     _extract_addr,
     _parse_user_slot_local,
+    _parse_hhmm,
+    _to_str,
 )
 from .filters import (
     _get_enabled_filter_slugs,
@@ -191,6 +193,8 @@ _reserve_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 _pending_reserves: Dict[str, float] = {}  # offer_key -> submitted_at (monotonic)
 _pending_reserves_lock = threading.Lock()
 _PENDING_RESERVE_TTL_S = 15.0  # safety TTL — entry removed by callback, not by timer
+_reserve_cleanup_state: dict = {"ts": 0.0}   # rate-limits stale cleanup to once per 5s
+_RESERVE_CLEANUP_INTERVAL_S: float = 5.0
 
 
 def _pending_reserve_add(offer_key: str):
@@ -670,7 +674,10 @@ def _process_offers_for_user(
     else:
         print(f"[{datetime.now()}] 🧩 Custom filters for {bot_id}/{telegram_id}: none")
 
-    _pending_reserve_stale_cleanup()
+    _now_cleanup = time.monotonic()
+    if _now_cleanup - _reserve_cleanup_state["ts"] >= _RESERVE_CLEANUP_INTERVAL_S:
+        _pending_reserve_stale_cleanup()
+        _reserve_cleanup_state["ts"] = _now_cleanup
 
     for offer in offers:
         filter_t0 = time.perf_counter()
@@ -739,7 +746,6 @@ def _process_offers_for_user(
         ws = filters.get("work_start")
         we = filters.get("work_end")
         if ws and we:
-            from .utils import _parse_hhmm, _to_str
             ws_hm = _parse_hhmm(_to_str(ws))
             we_hm = _parse_hhmm(_to_str(we))
             if ws_hm and we_hm:
@@ -1015,23 +1021,6 @@ def _process_offers_for_user(
         predicted_end = parse_iso_dt_or_none((offer.get("rides") or [{}])[0].get("endsAt"))
         offer_key = f"{platform}:{oid}" if oid else None
 
-        # Register this user as a candidate for cross-user coordination.
-        if AUTO_RESERVE_ENABLED and oid:
-            register_candidate(
-                offer_key,
-                bot_id,
-                telegram_id,
-                {
-                    "bot_id": bot_id,
-                    "telegram_id": telegram_id,
-                    "offer": offer,
-                    "tz_name": tz_name,
-                    "filter_results": filter_results,
-                    "platform": platform,
-                    "forced_accept": bool(accept_override and failed_filters),
-                },
-            )
-
         # Build callback context — everything the callback needs to notify the user.
         cb_ctx = {
             "bot_id": bot_id,
@@ -1082,6 +1071,22 @@ def _process_offers_for_user(
             # Mark as in-flight so next poll cycle skips this offer
             if offer_key:
                 _pending_reserve_add(offer_key)
+            # Register after submit — off the detection→submit critical path.
+            if AUTO_RESERVE_ENABLED and oid:
+                register_candidate(
+                    offer_key,
+                    bot_id,
+                    telegram_id,
+                    {
+                        "bot_id": bot_id,
+                        "telegram_id": telegram_id,
+                        "offer": offer,
+                        "tz_name": tz_name,
+                        "filter_results": filter_results,
+                        "platform": platform,
+                        "forced_accept": bool(accept_override and failed_filters),
+                    },
+                )
             # Attach callback — fires in _reserve_executor thread, does NOT block poll
             reserve_future.add_done_callback(lambda f, ctx=cb_ctx: _on_reserve_done(f, ctx))
         else:

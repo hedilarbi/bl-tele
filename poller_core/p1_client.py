@@ -134,21 +134,23 @@ def _merge_headers(token: str, base_headers: Optional[dict] = None) -> dict:
             if P1_STRIP_VOLATILE_HEADERS and _is_volatile_header(k):
                 continue
             headers[k] = v
-        if not _has_header(headers, "Host"):
+        # Build lowercase key set once — replaces 8 individual O(N) _has_header scans.
+        _lk = {k.lower() for k in headers}
+        if "host" not in _lk:
             headers["Host"] = API_HOST.replace("https://", "")
-        if not _has_header(headers, "Accept"):
+        if "accept" not in _lk:
             headers["Accept"] = "*/*"
-        if not _has_header(headers, "Accept-Language"):
+        if "accept-language" not in _lk:
             headers["Accept-Language"] = "en-CA,en-US;q=0.9,en;q=0.8"
-        if not _has_header(headers, "Accept-Encoding"):
+        if "accept-encoding" not in _lk:
             headers["Accept-Encoding"] = "gzip, deflate, br"
-        if not _has_header(headers, "Content-Type"):
+        if "content-type" not in _lk:
             headers["Content-Type"] = "application/json"
-        if not _has_header(headers, "X-Operating-System"):
+        if "x-operating-system" not in _lk:
             headers["X-Operating-System"] = "iOS"
-        if not _has_header(headers, "User-Agent"):
+        if "user-agent" not in _lk:
             headers["User-Agent"] = "Chauffeur/18575 CFNetwork/3860.300.31 Darwin/25.2.0"
-        if not _has_header(headers, "Connection"):
+        if "connection" not in _lk:
             headers["Connection"] = "keep-alive"
     else:
         headers = {
