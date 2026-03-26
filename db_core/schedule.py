@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime
 
 from .config import DB_FILE
 
@@ -48,3 +49,24 @@ def delete_blocked_day(bot_id: str, day_id: int):
     c.execute("DELETE FROM blocked_days WHERE id = ? AND bot_id = ?", (day_id, bot_id))
     conn.commit()
     conn.close()
+
+
+def prune_blocked_days() -> int:
+    """Delete blocked days that are strictly in the past. Returns count deleted."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, day FROM blocked_days")
+    rows = c.fetchall()
+    today = datetime.now().date()
+    expired_ids = []
+    for row_id, day in rows:
+        try:
+            if datetime.strptime(day, "%d/%m/%Y").date() < today:
+                expired_ids.append((row_id,))
+        except Exception:
+            pass
+    if expired_ids:
+        c.executemany("DELETE FROM blocked_days WHERE id = ?", expired_ids)
+        conn.commit()
+    conn.close()
+    return len(expired_ids)

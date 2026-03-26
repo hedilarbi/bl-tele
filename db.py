@@ -39,8 +39,8 @@ from db_core.bots import (
     set_bot_admin_active,
     get_bot_admin_active,
 )
-from db_core.slots import add_booked_slot, get_booked_slots, delete_booked_slot
-from db_core.schedule import get_blocked_days, add_blocked_day, delete_blocked_day
+from db_core.slots import add_booked_slot, get_booked_slots, delete_booked_slot, prune_booked_slots
+from db_core.schedule import get_blocked_days, add_blocked_day, delete_blocked_day, prune_blocked_days
 from db_core.vehicles import get_vehicle_classes_state, toggle_vehicle_class
 from db_core.offer_messages import save_offer_message, get_offer_message
 from db_core.offer_logs import (

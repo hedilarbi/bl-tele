@@ -505,3 +505,14 @@ def init_db():
             _builtins.print(f"[init_db] Pruned {deleted} offer_logs rows older than 30 days.")
     except Exception:
         pass
+
+    # Prune past booked_slots and blocked_days at startup.
+    try:
+        from .slots import prune_booked_slots
+        from .schedule import prune_blocked_days
+        n1 = prune_booked_slots()
+        n2 = prune_blocked_days()
+        if n1 or n2:
+            _builtins.print(f"[init_db] Pruned {n1} past booked_slots, {n2} past blocked_days.")
+    except Exception:
+        pass

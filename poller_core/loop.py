@@ -14,6 +14,7 @@ from .config import (
     ENABLE_P1,
     ENABLE_P2,
     POLL_INTERVAL,
+    P2_POLL_INTERVAL_S,
     BURST_POLL_INTERVAL_S,
     BURST_DURATION_S,
     MAX_WORKERS,
@@ -112,9 +113,14 @@ _AR_MIN_INTERVAL_S = 600.0  # 10 minutes
 _p2_active_offers: Dict[Tuple[str, int], Set[str]] = {}
 # P2 rate-limit cooldown: earliest time the next real request is allowed per user.
 _p2_next_poll: Dict[Tuple[str, int], float] = {}
-_p2_429_count: Dict[Tuple[str, int], int] = {}  # consecutive 429s per user
-_P2_POLL_INTERVAL_S    = 0.5    # min seconds between successful P2 requests per user
-_P2_BACKOFF_429_BASE_S = 10.0   # initial wait after first 429
+# min seconds between successful P2 requests per user (configurable via P2_POLL_INTERVAL_S in .env)
+# Global IP-level 429 backoff — shared across ALL users/bots on this server.
+# When Athena rate-limits by IP, blocking one user blocks everyone; this ensures
+# all P2 requests pause together so the IP has a chance to recover.
+_p2_global_blocked_until: float = 0.0
+_p2_global_429_count: int = 0
+_p2_global_lock = threading.Lock()
+_P2_BACKOFF_429_BASE_S = 10.0   # initial wait after first global 429
 _P2_BACKOFF_429_MAX_S  = 300.0  # cap at 5 minutes
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
@@ -560,12 +566,18 @@ def poll_user(user):
                 offers_p2.append(mapped)
 
     def _fetch_p2_offers_real():
+        global _p2_global_blocked_until, _p2_global_429_count
         nonlocal portal_token
         if not ENABLE_P2:
             return [], portal_token
-        # Per-user cooldown: skip if we polled too recently
+        # Global IP-level cooldown: if any user triggered a 429 block, all P2 requests pause.
         _p2_key = (str(bot_id), int(telegram_id))
-        if time.time() < _p2_next_poll.get(_p2_key, 0):
+        _now = time.time()
+        with _p2_global_lock:
+            if _now < _p2_global_blocked_until:
+                return [], portal_token
+        # Per-user cooldown: skip if this specific user polled too recently.
+        if _now < _p2_next_poll.get(_p2_key, 0):
             return [], portal_token
         # Check in-memory cache first — avoids a DB read every 200ms cycle.
         tok = portal_token or get_portal_token_mem(bot_id, telegram_id)
@@ -593,8 +605,10 @@ def poll_user(user):
 
         offers: List[dict] = []
         if status_code == 200 and isinstance(payload, dict):
-            _p2_next_poll[_p2_key] = time.time() + _P2_POLL_INTERVAL_S
-            _p2_429_count[_p2_key] = 0
+            _p2_next_poll[_p2_key] = time.time() + P2_POLL_INTERVAL_S
+            with _p2_global_lock:
+                _p2_global_429_count = 0
+                _p2_global_blocked_until = 0.0
             if ATHENA_USE_OFFERS_ETAG and new_etag:
                 set_offers_etag(bot_id, telegram_id, new_etag)
             included = payload.get("included") or []
@@ -605,11 +619,12 @@ def poll_user(user):
             _log_offers_found("P2", telegram_id, offers)
         else:
             if status_code == 429:
-                n = _p2_429_count.get(_p2_key, 0) + 1
-                _p2_429_count[_p2_key] = n
-                backoff = min(_P2_BACKOFF_429_BASE_S * (2 ** (n - 1)), _P2_BACKOFF_429_MAX_S)
-                _p2_next_poll[_p2_key] = time.time() + backoff
-                _poll_log(f"⚠️ P2 [{bot_id}] 429 (consecutive={n}, backoff={backoff:.0f}s)")
+                with _p2_global_lock:
+                    _p2_global_429_count += 1
+                    n = _p2_global_429_count
+                    backoff = min(_P2_BACKOFF_429_BASE_S * (2 ** (n - 1)), _P2_BACKOFF_429_MAX_S)
+                    _p2_global_blocked_until = time.time() + backoff
+                _poll_log(f"⚠️ P2 [{bot_id}] 429 (global_consecutive={n}, backoff={backoff:.0f}s, all P2 paused)")
             else:
                 _poll_log(f"⚠️ P2 [{bot_id}] status={status_code} has_token={bool(tok)}")
         return offers, tok
@@ -735,6 +750,8 @@ def run():
     _poll_log("🚀 Poller started")
     inflight: Dict[Tuple[str, int], tuple] = {}
     cycle_idx = 0
+    _last_schedule_prune = time.time()
+    _SCHEDULE_PRUNE_INTERVAL_S = 86400.0  # 24 hours
 
     _CLEANUP_CYCLE_EVERY = 200    # cleanup not_valid cache every ~20s at 100ms poll
     _WARMUP_CYCLE_EVERY = 300    # re-warm reserve connections every ~30s at 100ms poll
@@ -748,6 +765,20 @@ def run():
             cleanup_not_valid_cache()
         if cycle_idx % _WARMUP_CYCLE_EVERY == 0:
             _warmup_reserve_connections_async()
+        _now_ts = time.time()
+        if _now_ts - _last_schedule_prune >= _SCHEDULE_PRUNE_INTERVAL_S:
+            _last_schedule_prune = _now_ts
+            def _prune_schedule_job():
+                try:
+                    from db_core.slots import prune_booked_slots
+                    from db_core.schedule import prune_blocked_days
+                    n1 = prune_booked_slots()
+                    n2 = prune_blocked_days()
+                    if n1 or n2:
+                        _poll_log(f"[prune] {n1} past booked_slots, {n2} past blocked_days removed.")
+                except Exception:
+                    pass
+            _fetch_executor.submit(_prune_schedule_job)
         if OFFER_MEMORY_DEDUPE:
             maybe_reset_inmem_caches()
         users = _get_users_cached()

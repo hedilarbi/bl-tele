@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime
 
 from .config import DB_FILE
 
@@ -48,3 +49,24 @@ def delete_booked_slot(bot_id: str, slot_id: int):
     c.execute("DELETE FROM booked_slots WHERE id = ? AND bot_id = ?", (slot_id, bot_id))
     conn.commit()
     conn.close()
+
+
+def prune_booked_slots() -> int:
+    """Delete booked slots whose end time (to_time) is in the past. Returns count deleted."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, to_time FROM booked_slots")
+    rows = c.fetchall()
+    now = datetime.now()
+    expired_ids = []
+    for row_id, to_time in rows:
+        try:
+            if datetime.strptime(to_time, "%d/%m/%Y %H:%M") < now:
+                expired_ids.append((row_id,))
+        except Exception:
+            pass
+    if expired_ids:
+        c.executemany("DELETE FROM booked_slots WHERE id = ?", expired_ids)
+        conn.commit()
+    conn.close()
+    return len(expired_ids)
