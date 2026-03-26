@@ -108,6 +108,9 @@ _AUTO_REFRESH_FAIL_THRESHOLD = 3
 # Prevents hammering Blacklane login with rapid retries when the session is broken.
 _ar_last_attempt: Dict[Tuple[str, int], float] = {}
 _AR_MIN_INTERVAL_S = 600.0  # 10 minutes
+# When Playwright is in cooldown, skip ALL P1 API calls for this user until the
+# cooldown expires. Prevents the 1→8→1→8 spin that spams Blacklane with 403s.
+_p1_skip_until: Dict[Tuple[str, int], float] = {}
 # P2 presence tracking: offer IDs currently visible in Athena per user.
 # An offer is processed only when it first appears; re-processed only after it disappears and comes back.
 _p2_active_offers: Dict[Tuple[str, int], Set[str]] = {}
@@ -254,6 +257,12 @@ def poll_user(user):
 
     poll_real_orders = ALWAYS_POLL_REAL_ORDERS and not (USE_MOCK_P1 and USE_MOCK_P2)
 
+    # Skip P1 entirely if Playwright is in cooldown for this user — avoids the
+    # 1→8→1→8 spin loop that hammers Blacklane with 403s while waiting.
+    _p1_skip_key = (str(bot_id), int(telegram_id))
+    if time.time() < _p1_skip_until.get(_p1_skip_key, 0.0):
+        return f"Skipped {telegram_id} (P1 in Playwright cooldown)"
+
     # Skip immediately if this user's token was already marked invalid (unchanged since 401/403)
     if is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version)):
         _ar = get_token_auto_refresh(str(bot_id), int(telegram_id))
@@ -371,7 +380,8 @@ def poll_user(user):
                 _last = _ar_last_attempt.get(_ar_key, 0.0)
                 _now = time.time()
                 if _now - _last < _AR_MIN_INTERVAL_S:
-                    # Too soon — reset P1 fail counter and wait for next window
+                    # Too soon — silence all P1 calls for this user until cooldown expires
+                    _p1_skip_until[_ar_key] = _last + _AR_MIN_INTERVAL_S
                     _p1_fail_counts.pop(_fail_key, None)
                     return []
                 _ar_last_attempt[_ar_key] = _now
@@ -386,6 +396,7 @@ def poll_user(user):
                         _p1_fail_counts.pop(_fail_key, None)
                         _auto_refresh_fail_counts.pop(_ar_key, None)
                         _ar_last_attempt.pop(_ar_key, None)
+                        _p1_skip_until.pop(_ar_key, None)
                         set_token_status(bot_id, telegram_id, "valid")
                         set_token_ok_mem(bot_id, telegram_id, cache_version)
                         unpin_warning_if_any(bot_id, telegram_id, "expired")
