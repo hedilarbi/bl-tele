@@ -109,6 +109,10 @@ _AUTO_REFRESH_FAIL_THRESHOLD = 3
 # Prevents hammering Blacklane login with rapid retries when the session is broken.
 _ar_last_attempt: Dict[Tuple[str, int], float] = {}
 _AR_MIN_INTERVAL_S = 600.0  # 10 minutes
+# Global Playwright serializer: only one browser session at a time.
+# Concurrent sessions from the same IP amplify Blacklane's abuse detection.
+# Non-blocking tryacquire: if busy, the caller skips and retries next cycle.
+_playwright_lock = threading.Lock()
 # When Playwright is in cooldown, skip ALL P1 API calls for this user until the
 # cooldown expires. Prevents the 1→8→1→8 spin that spams Blacklane with 403s.
 _p1_skip_until: Dict[Tuple[str, int], float] = {}
@@ -392,8 +396,30 @@ def poll_user(user):
                     _p1_fail_counts.pop(_fail_key, None)
                     return []
                 _ar_last_attempt[_ar_key] = _now
-                # Auto-refresh ON: attempt Playwright re-login
-                ok, new_token, new_refresh, _ = get_playwright_p1_token(bot_id, telegram_id, email, password)
+                # IP-block detection: if 2+ users are ALL at the fail threshold right now,
+                # the server is blocking our IP — not rejecting individual tokens.
+                # Playwright can't fix an IP block; skip and wait for it to lift.
+                _users_at_threshold = sum(1 for v in _p1_fail_counts.values() if v >= _P1_FAIL_THRESHOLD)
+                if _users_at_threshold >= 2:
+                    _poll_log(
+                        f"⚠️ [AUTO-REFRESH] [{bot_id}] {_users_at_threshold} users at 403 threshold "
+                        f"— IP-level block suspected, skipping Playwright"
+                    )
+                    _ar_last_attempt.pop(_ar_key, None)  # don't burn the attempt slot
+                    _p1_skip_until[_ar_key] = _now + _AR_MIN_INTERVAL_S
+                    _p1_fail_counts.pop(_fail_key, None)
+                    return []
+                # Serialize Playwright: only one browser session per process at a time.
+                # Concurrent sessions from the same IP amplify abuse detection signals.
+                if not _playwright_lock.acquire(blocking=False):
+                    _poll_log(f"⏸ [AUTO-REFRESH] [{bot_id}] Playwright busy — will retry next window")
+                    _ar_last_attempt.pop(_ar_key, None)  # don't burn the attempt slot
+                    _p1_fail_counts.pop(_fail_key, None)
+                    return []
+                try:
+                    ok, new_token, new_refresh, _ = get_playwright_p1_token(bot_id, telegram_id, email, password)
+                finally:
+                    _playwright_lock.release()
                 if ok and new_token:
                     status_code2, results2 = get_offers_p1(new_token, headers=mobile_headers)
                     if status_code2 == 200:
