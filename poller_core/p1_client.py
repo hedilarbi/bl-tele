@@ -184,8 +184,6 @@ def get_rides_p1(token: str, headers: Optional[dict] = None) -> Tuple[Optional[i
     headers = _merge_headers(token, headers)
     try:
         r = _session_request("GET", f"{API_HOST}/rides", headers=headers, timeout=P1_POLL_TIMEOUT_S)
-        raw_text = r.text
-        _log_poll_response("P1 poll /rides", r.status_code, raw_text)
         if 200 <= r.status_code < 300:
             try:
                 data = r.json()
@@ -211,8 +209,7 @@ def get_offers_p1(token: str, headers: Optional[dict] = None):
     headers = _merge_headers(token, headers)
     try:
         r = _session_request("GET", f"{API_HOST}/offers", headers=headers, timeout=P1_POLL_TIMEOUT_S)
-        raw_text = r.text
-        _log_poll_response("P1 poll /offers", r.status_code, raw_text)
+        raw_text = r.text if LOG_RAW_API_RESPONSES else None
         try:
             body = r.json()
         except Exception:

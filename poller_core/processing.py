@@ -679,6 +679,16 @@ def _process_offers_for_user(
         _pending_reserve_stale_cleanup()
         _reserve_cleanup_state["ts"] = _now_cleanup
 
+    # Pre-parse booked slots once — avoids 4 strptime attempts per slot × per offer.
+    _parsed_booked_slots: List[Tuple[datetime, datetime, dict]] = []
+    for _slot in booked_slots:
+        _s = _parse_user_slot_local(_slot.get("from"), tz_name)
+        _e = _parse_user_slot_local(_slot.get("to"), tz_name)
+        if _s and _e:
+            if _e < _s:
+                _s, _e = _e, _s
+            _parsed_booked_slots.append((_s, _e, _slot))
+
     for offer in offers:
         filter_t0 = time.perf_counter()
         oid = offer.get("id")
@@ -914,14 +924,7 @@ def _process_offers_for_user(
                 offer_end_local = parsed_end.astimezone(gettz(tz_name))
 
         conflict_reason = None
-        for slot in booked_slots:
-            start_local = _parse_user_slot_local(slot.get("from"), tz_name)
-            end_local = _parse_user_slot_local(slot.get("to"), tz_name)
-            if not start_local or not end_local:
-                continue
-            if end_local < start_local:
-                start_local, end_local = end_local, start_local
-
+        for start_local, end_local, slot in _parsed_booked_slots:
             overlap = False
             if offer_end_local:
                 if not (offer_end_local <= start_local or pickup_local >= end_local):
@@ -929,7 +932,6 @@ def _process_offers_for_user(
             else:
                 if start_local <= pickup_local <= end_local:
                     overlap = True
-
             if overlap:
                 slot_name = slot.get("name") or "Sans nom"
                 conflict_reason = (

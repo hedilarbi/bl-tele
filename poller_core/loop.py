@@ -49,6 +49,7 @@ from .p2_client import (
     _map_portal_offer,
     _athena_get_offers,
     _ensure_portal_token,
+    warmup_p2_reserve_connection,
 )
 from .processing import debug_print_offers, _process_offers_for_user, _init_rides_cache_async
 from .p1_client import warmup_p1_reserve_connection
@@ -122,9 +123,14 @@ _p2_next_poll: Dict[Tuple[str, int], float] = {}
 # all P2 requests pause together so the IP has a chance to recover.
 _p2_global_blocked_until: float = 0.0
 _p2_global_429_count: int = 0
+_p2_last_429_ts: float = 0.0          # monotonic timestamp of most recent global 429
 _p2_global_lock = threading.Lock()
 _P2_BACKOFF_429_BASE_S = 10.0   # initial wait after first global 429
 _P2_BACKOFF_429_MAX_S  = 300.0  # cap at 5 minutes
+# How long the IP must be 429-free before a 200 is allowed to decrement the counter.
+# Without this guard, a single allowed request after a 20s pause resets the counter to 0,
+# preventing backoff from ever growing past count=2 / 20s — the oscillation seen in prod.
+_P2_RECOVERY_WINDOW_S = 120.0   # 2 minutes of clean polling before count decrements
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
 _fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2 + 5)
@@ -257,14 +263,13 @@ def poll_user(user):
 
     poll_real_orders = ALWAYS_POLL_REAL_ORDERS and not (USE_MOCK_P1 and USE_MOCK_P2)
 
-    # Skip P1 entirely if Playwright is in cooldown for this user — avoids the
-    # 1→8→1→8 spin loop that hammers Blacklane with 403s while waiting.
+    # Gate P1 only — P2 still polls independently even when P1 is in cooldown or
+    # has an invalid token, so offers on Athena are never silently missed.
+    _p1_in_cooldown = False
     _p1_skip_key = (str(bot_id), int(telegram_id))
     if time.time() < _p1_skip_until.get(_p1_skip_key, 0.0):
-        return f"Skipped {telegram_id} (P1 in Playwright cooldown)"
-
-    # Skip immediately if this user's token was already marked invalid (unchanged since 401/403)
-    if is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version)):
+        _p1_in_cooldown = True
+    elif is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version)):
         _ar = get_token_auto_refresh(str(bot_id), int(telegram_id))
         if _ar and email and password:
             # Auto-refresh is ON: clear invalid mark and pre-arm fail counter so
@@ -274,7 +279,7 @@ def poll_user(user):
         else:
             if _ar:
                 _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Token invalid but BL credentials missing")
-            return f"Skipped {telegram_id} (token invalid — waiting for update)"
+            _p1_in_cooldown = True
 
     def _set_token_problem(kind: str):
         """Mark token invalid in memory + send pinned warning. kind: 'no_token' | 'expired'"""
@@ -355,6 +360,8 @@ def poll_user(user):
 
     def _fetch_p1_offers_real():
         nonlocal token, mobile_headers
+        if _p1_in_cooldown:
+            return []
         if not token or not str(token).strip():
             _set_token_problem("no_token")
             return []
@@ -405,8 +412,19 @@ def poll_user(user):
                         tg_send_message(bot_tok, telegram_id, "✅ <b>Token refreshed successfully</b> — bot is back online.")
                         _log_offers_found("P1", telegram_id, results2 or [])
                         return results2 or []
+                    if status_code2 is None:
+                        # Verification timed out (network error, not an auth rejection).
+                        # The Playwright token is fresh and likely valid — save it and
+                        # let the next cycle confirm. Counting this as a failure would
+                        # disable auto-refresh after 3 P1 timeouts, discarding good tokens.
+                        _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] P1 verification timed out — saving new token, will confirm next cycle")
+                        save_playwright_p1_token(bot_id, telegram_id, new_token, new_refresh, mobile_headers)
+                        token = new_token
+                        _p1_fail_counts.pop(_fail_key, None)
+                        _p1_skip_until.pop(_ar_key, None)
+                        return []
                     _poll_log(f"❌ [AUTO-REFRESH] [{bot_id}] New token still {status_code2} after Playwright login")
-                # Auto-refresh attempt failed
+                # Auto-refresh attempt failed (401/403 from new token, or Playwright itself failed)
                 _ar_n = _auto_refresh_fail_counts.get(_ar_key, 0) + 1
                 _auto_refresh_fail_counts[_ar_key] = _ar_n
                 if _ar_n >= _AUTO_REFRESH_FAIL_THRESHOLD:
@@ -571,8 +589,9 @@ def poll_user(user):
             ],
         }
         included = portal_sample.get("included") or []
+        included_idx = {(it.get("type"), str(it.get("id"))): it for it in included}
         for raw in (portal_sample.get("data") or []):
-            mapped = _map_portal_offer(raw, included)
+            mapped = _map_portal_offer(raw, included_idx)
             if mapped:
                 offers_p2.append(mapped)
 
@@ -618,13 +637,19 @@ def poll_user(user):
         if status_code == 200 and isinstance(payload, dict):
             _p2_next_poll[_p2_key] = time.time() + P2_POLL_INTERVAL_S
             with _p2_global_lock:
-                _p2_global_429_count = 0
                 _p2_global_blocked_until = 0.0
+                # Only decrement count after sustained quiet — 2 min with no 429.
+                # Brief 200s right after a backoff period are Athena granting 1-2 tokens
+                # before re-throttling; decrementing on those collapses the counter to 0
+                # every cycle, preventing the backoff from ever growing past 20s.
+                if time.time() - _p2_last_429_ts >= _P2_RECOVERY_WINDOW_S:
+                    _p2_global_429_count = max(0, _p2_global_429_count - 1)
             if ATHENA_USE_OFFERS_ETAG and new_etag:
                 set_offers_etag(bot_id, telegram_id, new_etag)
             included = payload.get("included") or []
+            included_idx = {(it.get("type"), str(it.get("id"))): it for it in included}
             for raw in (payload.get("data") or []):
-                mapped = _map_portal_offer(raw, included)
+                mapped = _map_portal_offer(raw, included_idx)
                 if mapped:
                     offers.append(mapped)
             _log_offers_found("P2", telegram_id, offers)
@@ -632,9 +657,10 @@ def poll_user(user):
             if status_code == 429:
                 with _p2_global_lock:
                     _p2_global_429_count += 1
+                    _p2_last_429_ts = time.time()
                     n = _p2_global_429_count
                     backoff = min(_P2_BACKOFF_429_BASE_S * (2 ** (n - 1)), _P2_BACKOFF_429_MAX_S)
-                    _p2_global_blocked_until = time.time() + backoff
+                    _p2_global_blocked_until = _p2_last_429_ts + backoff
                 _poll_log(f"⚠️ P2 [{bot_id}] 429 (global_consecutive={n}, backoff={backoff:.0f}s, all P2 paused)")
             else:
                 _poll_log(f"⚠️ P2 [{bot_id}] status={status_code} has_token={bool(tok)}")
@@ -643,13 +669,32 @@ def poll_user(user):
     if not USE_MOCK_P1 or not USE_MOCK_P2:
         if ENABLE_P1 and ENABLE_P2 and not USE_MOCK_P1 and not USE_MOCK_P2:
             # Parallel P1+P2: both requests fired simultaneously.
-            # Eliminates the sequential RTT wasted waiting for P1 before starting P2.
+            # P1 result is consumed as soon as it arrives — P2 backoff/cooldown no longer
+            # delays P1 offer processing (previously up to P2_POLL_INTERVAL_S = 2s extra wait).
             _f1 = _fetch_executor.submit(_fetch_p1_offers_real)
             _f2 = _fetch_executor.submit(_fetch_p2_offers_real)
             try:
                 offers_p1 = _f1.result()
             except Exception:
                 offers_p1 = []
+
+            # Process P1 offers immediately while P2 fetch is still in flight.
+            if offers_p1:
+                _p1_ts = time.time()
+                for _o in offers_p1:
+                    if isinstance(_o, dict) and _o.get("_poll_ts") is None:
+                        _o["_poll_ts"] = _p1_ts
+                _p1_intervals = get_rides_intervals(bot_id, telegram_id) or []
+                debug_print_offers(telegram_id, offers_p1)
+                _process_offers_for_user(
+                    bot_id, telegram_id, offers_p1, filters, class_state,
+                    booked_slots, blocked_days, _p1_intervals, tz_name,
+                    p1_token=token, p1_headers=mobile_headers, p2_token=portal_token,
+                    cache_version=cache_version, bl_uuid=bl_uuid, user_cfilters=user_cfilters,
+                    portal_email=email, portal_password=password,
+                )
+                offers_p1 = []  # prevent double-processing in shared path below
+
             try:
                 _p2_res = _f2.result()
                 if isinstance(_p2_res, tuple):
@@ -740,17 +785,27 @@ def _warmup_reserve_connections_async():
     def _job():
         try:
             users = _get_users_cached()
+            p1_warmed = False
+            p2_warmed = False
             for u in users:
-                tok = u[2] if len(u) > 2 else None
-                hdrs = None
-                try:
-                    from db import get_mobile_headers as _gmh
-                    hdrs = _gmh(u[0], u[1])
-                except Exception:
-                    pass
-                if tok and str(tok).strip():
-                    warmup_p1_reserve_connection(tok, hdrs)
-                    return
+                if not p1_warmed:
+                    tok = u[2] if len(u) > 2 else None
+                    hdrs = None
+                    try:
+                        from db import get_mobile_headers as _gmh
+                        hdrs = _gmh(u[0], u[1])
+                    except Exception:
+                        pass
+                    if tok and str(tok).strip():
+                        warmup_p1_reserve_connection(tok, hdrs)
+                        p1_warmed = True
+                if not p2_warmed:
+                    p2_tok = get_portal_token_mem(u[0], u[1])
+                    if p2_tok:
+                        warmup_p2_reserve_connection(p2_tok)
+                        p2_warmed = True
+                if p1_warmed and p2_warmed:
+                    break
         except Exception:
             pass
     _fetch_executor.submit(_job)

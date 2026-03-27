@@ -84,6 +84,24 @@ def _get_p2_reserve_session() -> requests.Session:
     return _p2_reserve_session
 
 
+def warmup_p2_reserve_connection(access_token: str):
+    """Pre-warm the shared P2 reserve session with a GET /chauffeur/offers.
+    Call at startup and every ~45s to keep the TCP/TLS connection alive."""
+    try:
+        sess = _get_p2_reserve_session()
+        try:
+            sess.cookies.clear()
+        except Exception:
+            pass
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "*/*",
+        }
+        sess.request("GET", f"{PARTNER_API_BASE}/chauffeur/offers", headers=headers, timeout=5)
+    except Exception:
+        pass
+
+
 def _safe_attr(d, *keys, default=None):
     cur = d
     for k in keys:
@@ -134,8 +152,9 @@ def _normalize_vclass(name: str) -> str:
     return m.get(key, name or "")
 
 
-def _map_portal_offer(raw: dict, included: list) -> Optional[dict]:
-    """Convert Athena JSON:API offer into the internal shape."""
+def _map_portal_offer(raw: dict, included_idx: dict) -> Optional[dict]:
+    """Convert Athena JSON:API offer into the internal shape.
+    included_idx must be pre-built as {(type, str(id)): item} before the offer loop."""
     if not isinstance(raw, dict):
         return None
 
@@ -184,10 +203,10 @@ def _map_portal_offer(raw: dict, included: list) -> Optional[dict]:
     dropOffLocation = None
 
     if pu_rel and pu_rel.get("id") and pu_rel.get("type"):
-        inc = _find_included(included, pu_rel["type"], pu_rel["id"])
+        inc = included_idx.get((pu_rel["type"], str(pu_rel["id"])))
         pickUpLocation = _extract_loc_from_included(inc) or {}
     if do_rel and do_rel.get("id") and do_rel.get("type"):
-        inc = _find_included(included, do_rel["type"], do_rel["id"])
+        inc = included_idx.get((do_rel["type"], str(do_rel["id"])))
         dropOffLocation = _extract_loc_from_included(inc) or None
 
     flight_no = attrs.get("flight_number")
@@ -375,8 +394,7 @@ def _athena_get_offers(
         headers["If-None-Match"] = etag
     try:
         r = _session_request("GET", url, headers=headers, timeout=P2_POLL_TIMEOUT_S)
-        raw_text = r.text
-        _log_poll_response("P2 poll /hades/offers", r.status_code, raw_text)
+        raw_text = r.text if LOG_RAW_API_RESPONSES else None
         new_etag = r.headers.get("etag") or r.headers.get("ETag")
         if r.status_code == 304:
             return 304, None, new_etag
@@ -423,8 +441,6 @@ def _athena_get_rides(
         headers["If-None-Match"] = etag
     try:
         r = _session_request("GET", url, headers=headers, timeout=P2_POLL_TIMEOUT_S)
-        raw_text = r.text
-        _log_poll_response("P2 poll /hades/rides", r.status_code, raw_text)
         new_etag = r.headers.get("etag") or r.headers.get("ETag")
         if r.status_code == 304:
             return 304, None, new_etag
