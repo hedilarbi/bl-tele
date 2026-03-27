@@ -338,8 +338,32 @@ async def _playwright_pkce_login(email: str, password: str) -> Tuple[bool, Optio
     code_holder: dict = {}
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await (await browser.new_context()).new_page()
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-infobars",
+                    "--disable-extensions",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/22D82"
+                ),
+                viewport={"width": 390, "height": 844},
+                device_scale_factor=3,
+                is_mobile=True,
+                has_touch=True,
+                locale="en-CA",
+            )
+            # Mask webdriver flag that headless Chromium exposes by default
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            page = await context.new_page()
 
             async def _on_request(request):
                 if request.url.startswith("com.blacklane"):
@@ -349,11 +373,15 @@ async def _playwright_pkce_login(email: str, password: str) -> Tuple[bool, Optio
 
             page.on("request", _on_request)
             await page.goto(authorize_url)
+            # Randomise typing and submission delays to avoid fixed-interval bot signatures
+            await page.wait_for_timeout(int(800 + secrets.randbelow(600)))
             await page.fill('input[name="username"]', email)
+            await page.wait_for_timeout(int(300 + secrets.randbelow(400)))
             await page.fill('input[name="password"]', password)
+            await page.wait_for_timeout(int(200 + secrets.randbelow(300)))
             try:
                 await page.click('button[type="submit"]', timeout=10000)
-                await page.wait_for_timeout(4000)
+                await page.wait_for_timeout(int(3000 + secrets.randbelow(2000)))
             except Exception:
                 pass
             await browser.close()
