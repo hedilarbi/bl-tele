@@ -15,6 +15,9 @@ from .config import (
     ENABLE_P2,
     POLL_INTERVAL,
     P2_POLL_INTERVAL_S,
+    P2_BURST_INTERVAL_S,
+    P2_BURST_ACTIVE_DURATION,
+    P2_BURST_CALM_DURATION,
     BURST_POLL_INTERVAL_S,
     BURST_DURATION_S,
     MAX_WORKERS,
@@ -98,7 +101,12 @@ _user_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 # Consecutive P1 401/403 counter per (bot_id, telegram_id).
 # Token is only marked invalid after _P1_FAIL_THRESHOLD consecutive failures
 # to absorb transient Auth0 hiccups that resolve on their own.
-_p1_fail_counts: Dict[Tuple[str, int], int] = {}
+# Each entry: {"n": int, "ts": float} — ts is the last-increment timestamp so
+# stale entries (from a previous episode hours ago) are not mistaken for a
+# concurrent multi-user failure when checking for IP-level blocks.
+_p1_fail_counts: Dict[Tuple[str, int], dict] = {}
+_p1_fail_counts_lock = threading.Lock()
+_P1_FAIL_COUNT_TTL_S = 120.0   # entries older than 2 min are stale
 _P1_FAIL_THRESHOLD = 8  # more tolerance before triggering Playwright
 # Consecutive auto-refresh failures per (bot_id, telegram_id).
 # When auto_refresh mode is ON and Playwright re-login fails this many times,
@@ -143,6 +151,16 @@ _P2_BACKOFF_429_MAX_S  = 300.0  # cap at 5 minutes
 # Without this guard, a single allowed request after a 20s pause resets the counter to 0,
 # preventing backoff from ever growing past count=2 / 20s — the oscillation seen in prod.
 _P2_RECOVERY_WINDOW_S = 120.0   # 2 minutes of clean polling before count decrements
+# P2 burst/calm cycle: poll aggressively for P2_BURST_ACTIVE_DURATION seconds,
+# then calm down for P2_BURST_CALM_DURATION seconds, and repeat.
+# The cycle is wall-clock based so all users stay in sync.
+_P2_CYCLE_S: float = P2_BURST_ACTIVE_DURATION + P2_BURST_CALM_DURATION
+
+
+def _p2_current_interval() -> float:
+    """Return the per-user P2 poll interval based on where we are in the burst cycle."""
+    phase = time.time() % _P2_CYCLE_S
+    return P2_BURST_INTERVAL_S if phase < P2_BURST_ACTIVE_DURATION else P2_POLL_INTERVAL_S
 # Dedicated executor for parallel P1+P2 fetch inside poll_user.
 # Needs MAX_WORKERS*2 slots so all concurrent users can fetch both platforms simultaneously.
 _fetch_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS * 2 + 5)
@@ -287,7 +305,8 @@ def poll_user(user):
             # Auto-refresh is ON: clear invalid mark and pre-arm fail counter so
             # the very next 401/403 triggers Playwright immediately (skip the 3-cycle warmup).
             clear_token_invalid(str(bot_id), int(telegram_id))
-            _p1_fail_counts[(str(bot_id), int(telegram_id))] = _P1_FAIL_THRESHOLD - 1
+            with _p1_fail_counts_lock:
+                _p1_fail_counts[(str(bot_id), int(telegram_id))] = {"n": _P1_FAIL_THRESHOLD - 1, "ts": time.time()}
         else:
             if _ar:
                 _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Token invalid but BL credentials missing")
@@ -382,13 +401,28 @@ def poll_user(user):
         observe_ms("p1_fetch_ms", (time.perf_counter() - t0) * 1000.0)
         if status_code in (401, 403):
             _fail_key = (str(bot_id), int(telegram_id))
-            _p1_fail_counts[_fail_key] = _p1_fail_counts.get(_fail_key, 0) + 1
-            _fail_n = _p1_fail_counts[_fail_key]
+            _now_fail = time.time()
+            with _p1_fail_counts_lock:
+                _entry = _p1_fail_counts.get(_fail_key)
+                # Treat stale entries (from a previous episode) as if they were 0
+                if _entry and (_now_fail - _entry["ts"]) > _P1_FAIL_COUNT_TTL_S:
+                    _entry = None
+                _new_n = (_entry["n"] if _entry else 0) + 1
+                _p1_fail_counts[_fail_key] = {"n": _new_n, "ts": _now_fail}
+            _fail_n = _new_n
             _poll_log(
                 f"⚠️ P1 [{bot_id}] status={status_code} "
                 f"(consecutive fail {_fail_n}/{_P1_FAIL_THRESHOLD})"
             )
             if _fail_n < _P1_FAIL_THRESHOLD:
+                # Non-auto-refresh users: don't tolerate repeated 403s — a burst of
+                # retries triggers Blacklane abuse detection and revokes other users' tokens.
+                if _fail_n == 1:
+                    _ar_early = get_token_auto_refresh(str(bot_id), int(telegram_id))
+                    if not _ar_early:
+                        _p1_fail_counts.pop(_fail_key, None)
+                        _set_token_problem("expired")
+                        return []
                 # Transient failure — skip this cycle without marking invalid
                 return []
             # Threshold reached — check auto-refresh mode
@@ -420,8 +454,14 @@ def poll_user(user):
                 # IP-block detection: if 2+ users are ALL at the fail threshold right now,
                 # OR if any other user has started failing (even 1 fail), the server is
                 # blocking our IP — Playwright can't fix this, skip and wait for it to lift.
-                _users_at_threshold = sum(1 for v in _p1_fail_counts.values() if v >= _P1_FAIL_THRESHOLD)
-                _other_users_failing = sum(1 for k, v in _p1_fail_counts.items() if v >= 1 and k != _fail_key)
+                _now_check = time.time()
+                with _p1_fail_counts_lock:
+                    _fresh_counts = {
+                        k: v["n"] for k, v in _p1_fail_counts.items()
+                        if (_now_check - v["ts"]) <= _P1_FAIL_COUNT_TTL_S
+                    }
+                _users_at_threshold = sum(1 for v in _fresh_counts.values() if v >= _P1_FAIL_THRESHOLD)
+                _other_users_failing = sum(1 for k, v in _fresh_counts.items() if v >= 1 and k != _fail_key)
                 if _users_at_threshold >= 2 or _other_users_failing >= 1:
                     _poll_log(
                         f"⚠️ [AUTO-REFRESH] [{bot_id}] {_users_at_threshold} users at 403 threshold "
@@ -684,13 +724,10 @@ def poll_user(user):
 
         offers: List[dict] = []
         if status_code == 200 and isinstance(payload, dict):
-            _p2_next_poll[_p2_key] = time.time() + P2_POLL_INTERVAL_S
+            _p2_next_poll[_p2_key] = time.time() + _p2_current_interval()
             with _p2_global_lock:
                 _p2_global_blocked_until = 0.0
                 # Only decrement count after sustained quiet — 2 min with no 429.
-                # Brief 200s right after a backoff period are Athena granting 1-2 tokens
-                # before re-throttling; decrementing on those collapses the counter to 0
-                # every cycle, preventing the backoff from ever growing past 20s.
                 if time.time() - _p2_last_429_ts >= _P2_RECOVERY_WINDOW_S:
                     _p2_global_429_count = max(0, _p2_global_429_count - 1)
             if ATHENA_USE_OFFERS_ETAG and new_etag:

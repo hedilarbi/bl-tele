@@ -14,7 +14,10 @@ MOBILE_CLIENT_ID = os.getenv("BL_MOBILE_CLIENT_ID", "")
 PORTAL_PAGE_SIZE = 50
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_S", "0.3"))
-P2_POLL_INTERVAL_S = float(os.getenv("P2_POLL_INTERVAL_S", "2.0"))  # min seconds between P2 requests per user after a 200
+P2_POLL_INTERVAL_S       = float(os.getenv("P2_POLL_INTERVAL_S",       "2.0"))  # calm-phase interval (safe)
+P2_BURST_INTERVAL_S      = float(os.getenv("P2_BURST_INTERVAL_S",      "0.8"))  # burst-phase interval (aggressive)
+P2_BURST_ACTIVE_DURATION = float(os.getenv("P2_BURST_ACTIVE_DURATION",  "300")) # seconds of fast polling per cycle (default 5 min)
+P2_BURST_CALM_DURATION   = float(os.getenv("P2_BURST_CALM_DURATION",    "60"))  # seconds of slow polling per cycle (default 1 min)
 MAX_WORKERS = max(1, int(os.getenv("MAX_WORKERS", "10")))
 RIDES_REFRESH_INTERVAL_S = int(os.getenv("RIDES_REFRESH_INTERVAL_S", "3600"))
 HTTP_POOL_SIZE = max(4, int(os.getenv("HTTP_POOL_SIZE", "32")))
