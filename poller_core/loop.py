@@ -113,6 +113,14 @@ _AR_MIN_INTERVAL_S = 600.0  # 10 minutes
 # Concurrent sessions from the same IP amplify Blacklane's abuse detection.
 # Non-blocking tryacquire: if busy, the caller skips and retries next cycle.
 _playwright_lock = threading.Lock()
+# Observation window before firing Playwright: when a user hits the fail threshold
+# we wait _PLAYWRIGHT_OBSERVE_S seconds to see if other users also start failing.
+# If they do → IP-level revocation (Playwright can't fix this, skip it).
+# If they don't → genuine single-token expiry (safe to run Playwright).
+# This prevents the pattern where bl_oussema_1_bot hits 8/8 alone (real expiry),
+# Playwright fires, Blacklane detects it and revokes all tokens from our IP.
+_playwright_pending: Dict[Tuple[str, int], float] = {}  # user_key -> ts of first threshold hit
+_PLAYWRIGHT_OBSERVE_S = 3.0
 # When Playwright is in cooldown, skip ALL P1 API calls for this user until the
 # cooldown expires. Prevents the 1→8→1→8 spin that spams Blacklane with 403s.
 _p1_skip_until: Dict[Tuple[str, int], float] = {}
@@ -392,20 +400,35 @@ def poll_user(user):
                 _now = time.time()
                 if _now - _last < _AR_MIN_INTERVAL_S:
                     # Too soon — silence all P1 calls for this user until cooldown expires
+                    _playwright_pending.pop(_ar_key, None)
                     _p1_skip_until[_ar_key] = _last + _AR_MIN_INTERVAL_S
                     _p1_fail_counts.pop(_fail_key, None)
                     return []
+                # Observation window: wait _PLAYWRIGHT_OBSERVE_S seconds after first hitting
+                # threshold. During this window other users accumulate failures if the IP is
+                # blocked. After the window, we check both the strict threshold AND whether
+                # any other user has ANY failures — a much earlier signal of IP revocation.
+                if _ar_key not in _playwright_pending:
+                    _playwright_pending[_ar_key] = _now
+                    return []
+                elif _now - _playwright_pending[_ar_key] < _PLAYWRIGHT_OBSERVE_S:
+                    return []
+                else:
+                    del _playwright_pending[_ar_key]
+
                 _ar_last_attempt[_ar_key] = _now
                 # IP-block detection: if 2+ users are ALL at the fail threshold right now,
-                # the server is blocking our IP — not rejecting individual tokens.
-                # Playwright can't fix an IP block; skip and wait for it to lift.
+                # OR if any other user has started failing (even 1 fail), the server is
+                # blocking our IP — Playwright can't fix this, skip and wait for it to lift.
                 _users_at_threshold = sum(1 for v in _p1_fail_counts.values() if v >= _P1_FAIL_THRESHOLD)
-                if _users_at_threshold >= 2:
+                _other_users_failing = sum(1 for k, v in _p1_fail_counts.items() if v >= 1 and k != _fail_key)
+                if _users_at_threshold >= 2 or _other_users_failing >= 1:
                     _poll_log(
                         f"⚠️ [AUTO-REFRESH] [{bot_id}] {_users_at_threshold} users at 403 threshold "
                         f"— IP-level block suspected, skipping Playwright"
                     )
                     _ar_last_attempt.pop(_ar_key, None)  # don't burn the attempt slot
+                    _playwright_pending.pop(_ar_key, None)
                     _p1_skip_until[_ar_key] = _now + _AR_MIN_INTERVAL_S
                     _p1_fail_counts.pop(_fail_key, None)
                     return []
