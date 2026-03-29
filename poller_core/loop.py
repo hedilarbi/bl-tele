@@ -98,16 +98,13 @@ _burst_until = 0.0
 _burst_lock = threading.Lock()
 _user_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-# Consecutive P1 401/403 counter per (bot_id, telegram_id).
-# Token is only marked invalid after _P1_FAIL_THRESHOLD consecutive failures
-# to absorb transient Auth0 hiccups that resolve on their own.
+# Per-user P1 401/403 failure timestamps for concurrent-failure detection.
 # Each entry: {"n": int, "ts": float} — ts is the last-increment timestamp so
 # stale entries (from a previous episode hours ago) are not mistaken for a
 # concurrent multi-user failure when checking for IP-level blocks.
 _p1_fail_counts: Dict[Tuple[str, int], dict] = {}
 _p1_fail_counts_lock = threading.Lock()
 _P1_FAIL_COUNT_TTL_S = 120.0   # entries older than 2 min are stale
-_P1_FAIL_THRESHOLD = 8  # more tolerance before triggering Playwright
 # Consecutive auto-refresh failures per (bot_id, telegram_id).
 # When auto_refresh mode is ON and Playwright re-login fails this many times,
 # the mode is disabled and the user is notified to update manually.
@@ -121,14 +118,6 @@ _AR_MIN_INTERVAL_S = 600.0  # 10 minutes
 # Concurrent sessions from the same IP amplify Blacklane's abuse detection.
 # Non-blocking tryacquire: if busy, the caller skips and retries next cycle.
 _playwright_lock = threading.Lock()
-# Observation window before firing Playwright: when a user hits the fail threshold
-# we wait _PLAYWRIGHT_OBSERVE_S seconds to see if other users also start failing.
-# If they do → IP-level revocation (Playwright can't fix this, skip it).
-# If they don't → genuine single-token expiry (safe to run Playwright).
-# This prevents the pattern where bl_oussema_1_bot hits 8/8 alone (real expiry),
-# Playwright fires, Blacklane detects it and revokes all tokens from our IP.
-_playwright_pending: Dict[Tuple[str, int], float] = {}  # user_key -> ts of first threshold hit
-_PLAYWRIGHT_OBSERVE_S = 3.0
 # When Playwright is in cooldown, skip ALL P1 API calls for this user until the
 # cooldown expires. Prevents the 1→8→1→8 spin that spams Blacklane with 403s.
 _p1_skip_until: Dict[Tuple[str, int], float] = {}
@@ -302,11 +291,8 @@ def poll_user(user):
     elif is_token_invalid(str(bot_id), int(telegram_id), token, int(cache_version)):
         _ar = get_token_auto_refresh(str(bot_id), int(telegram_id))
         if _ar and email and password:
-            # Auto-refresh is ON: clear invalid mark and pre-arm fail counter so
-            # the very next 401/403 triggers Playwright immediately (skip the 3-cycle warmup).
+            # Auto-refresh is ON: clear invalid mark so the next 403 triggers Playwright.
             clear_token_invalid(str(bot_id), int(telegram_id))
-            with _p1_fail_counts_lock:
-                _p1_fail_counts[(str(bot_id), int(telegram_id))] = {"n": _P1_FAIL_THRESHOLD - 1, "ts": time.time()}
         else:
             if _ar:
                 _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] Token invalid but BL credentials missing")
@@ -403,29 +389,23 @@ def poll_user(user):
             _fail_key = (str(bot_id), int(telegram_id))
             _now_fail = time.time()
             with _p1_fail_counts_lock:
-                _entry = _p1_fail_counts.get(_fail_key)
-                # Treat stale entries (from a previous episode) as if they were 0
-                if _entry and (_now_fail - _entry["ts"]) > _P1_FAIL_COUNT_TTL_S:
-                    _entry = None
-                _new_n = (_entry["n"] if _entry else 0) + 1
-                _p1_fail_counts[_fail_key] = {"n": _new_n, "ts": _now_fail}
-            _fail_n = _new_n
-            _poll_log(
-                f"⚠️ P1 [{bot_id}] status={status_code} "
-                f"(consecutive fail {_fail_n}/{_P1_FAIL_THRESHOLD})"
-            )
-            if _fail_n < _P1_FAIL_THRESHOLD:
-                # Non-auto-refresh users: don't tolerate repeated 403s — a burst of
-                # retries triggers Blacklane abuse detection and revokes other users' tokens.
-                if _fail_n == 1:
-                    _ar_early = get_token_auto_refresh(str(bot_id), int(telegram_id))
-                    if not _ar_early:
-                        _p1_fail_counts.pop(_fail_key, None)
-                        _set_token_problem("expired")
-                        return []
-                # Transient failure — skip this cycle without marking invalid
+                _p1_fail_counts[_fail_key] = {"n": 1, "ts": _now_fail}
+            _poll_log(f"⚠️ P1 [{bot_id}] status={status_code} (fail)")
+            # Immediately check if other users are also failing — indicates IP-level block.
+            with _p1_fail_counts_lock:
+                _other_users_failing = sum(
+                    1 for k, v in _p1_fail_counts.items()
+                    if k != _fail_key and (_now_fail - v["ts"]) <= _P1_FAIL_COUNT_TTL_S
+                )
+            if _other_users_failing >= 1:
+                _poll_log(
+                    f"⚠️ [{bot_id}] {_other_users_failing} other user(s) also failing "
+                    f"— IP-level block suspected, entering cooldown"
+                )
+                _p1_skip_until[_fail_key] = _now_fail + _AR_MIN_INTERVAL_S
+                _p1_fail_counts.pop(_fail_key, None)
                 return []
-            # Threshold reached — check auto-refresh mode
+            # Single-user failure — token expired.
             auto_refresh = get_token_auto_refresh(str(bot_id), int(telegram_id))
             _ar_key = (str(bot_id), int(telegram_id))
             if auto_refresh and email and password:
@@ -434,48 +414,14 @@ def poll_user(user):
                 _now = time.time()
                 if _now - _last < _AR_MIN_INTERVAL_S:
                     # Too soon — silence all P1 calls for this user until cooldown expires
-                    _playwright_pending.pop(_ar_key, None)
                     _p1_skip_until[_ar_key] = _last + _AR_MIN_INTERVAL_S
                     _p1_fail_counts.pop(_fail_key, None)
                     return []
-                # Observation window: wait _PLAYWRIGHT_OBSERVE_S seconds after first hitting
-                # threshold. During this window other users accumulate failures if the IP is
-                # blocked. After the window, we check both the strict threshold AND whether
-                # any other user has ANY failures — a much earlier signal of IP revocation.
-                if _ar_key not in _playwright_pending:
-                    _playwright_pending[_ar_key] = _now
-                    return []
-                elif _now - _playwright_pending[_ar_key] < _PLAYWRIGHT_OBSERVE_S:
-                    return []
-                else:
-                    del _playwright_pending[_ar_key]
-
                 _ar_last_attempt[_ar_key] = _now
-                # IP-block detection: if 2+ users are ALL at the fail threshold right now,
-                # OR if any other user has started failing (even 1 fail), the server is
-                # blocking our IP — Playwright can't fix this, skip and wait for it to lift.
-                _now_check = time.time()
-                with _p1_fail_counts_lock:
-                    _fresh_counts = {
-                        k: v["n"] for k, v in _p1_fail_counts.items()
-                        if (_now_check - v["ts"]) <= _P1_FAIL_COUNT_TTL_S
-                    }
-                _users_at_threshold = sum(1 for v in _fresh_counts.values() if v >= _P1_FAIL_THRESHOLD)
-                _other_users_failing = sum(1 for k, v in _fresh_counts.items() if v >= 1 and k != _fail_key)
-                if _users_at_threshold >= 2 or _other_users_failing >= 1:
-                    _poll_log(
-                        f"⚠️ [AUTO-REFRESH] [{bot_id}] {_users_at_threshold} users at 403 threshold "
-                        f"— IP-level block suspected, skipping Playwright"
-                    )
-                    _ar_last_attempt.pop(_ar_key, None)  # don't burn the attempt slot
-                    _playwright_pending.pop(_ar_key, None)
-                    _p1_skip_until[_ar_key] = _now + _AR_MIN_INTERVAL_S
-                    _p1_fail_counts.pop(_fail_key, None)
-                    return []
                 # Serialize Playwright: only one browser session per process at a time.
                 # Concurrent sessions from the same IP amplify abuse detection signals.
                 if not _playwright_lock.acquire(blocking=False):
-                    _poll_log(f"⏸ [AUTO-REFRESH] [{bot_id}] Playwright busy — will retry next window")
+                    _poll_log(f"⏸ [AUTO-REFRESH] [{bot_id}] Playwright busy — will retry next cycle")
                     _ar_last_attempt.pop(_ar_key, None)  # don't burn the attempt slot
                     _p1_fail_counts.pop(_fail_key, None)
                     return []
@@ -504,8 +450,7 @@ def poll_user(user):
                     if status_code2 is None:
                         # Verification timed out (network error, not an auth rejection).
                         # The Playwright token is fresh and likely valid — save it and
-                        # let the next cycle confirm. Counting this as a failure would
-                        # disable auto-refresh after 3 P1 timeouts, discarding good tokens.
+                        # let the next cycle confirm.
                         _poll_log(f"⚠️ [AUTO-REFRESH] [{bot_id}] P1 verification timed out — saving new token, will confirm next cycle")
                         save_playwright_p1_token(bot_id, telegram_id, new_token, new_refresh, mobile_headers)
                         token = new_token
