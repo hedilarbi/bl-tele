@@ -1,5 +1,6 @@
 import json
 import time
+import random
 import traceback
 import threading
 import builtins as _builtins
@@ -649,6 +650,9 @@ def poll_user(user):
             elif _p2_backoff_logged:
                 _poll_log(f"▶️ P2 global backoff lifted — resuming polls")
                 _p2_backoff_logged = False
+                # Stagger re-entry: assign each user a random delay (0–4s) so they
+                # don't all slam Athena simultaneously the moment backoff expires.
+                _p2_next_poll[_p2_key] = _now + random.uniform(0, 4.0)
         # Per-user cooldown: skip if this specific user polled too recently.
         if _now < _p2_next_poll.get(_p2_key, 0):
             return [], portal_token
