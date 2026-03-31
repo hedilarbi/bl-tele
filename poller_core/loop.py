@@ -639,9 +639,12 @@ def poll_user(user):
         _now = time.time()
         with _p2_global_lock:
             if _now < _p2_global_blocked_until:
+                _remaining = _p2_global_blocked_until - _now
+                _poll_log(f"⏸ P2 [{bot_id}] skipped — global backoff ({_remaining:.0f}s remaining)")
                 return [], portal_token
         # Per-user cooldown: skip if this specific user polled too recently.
         if _now < _p2_next_poll.get(_p2_key, 0):
+            _poll_log(f"⏸ P2 [{bot_id}] skipped — per-user cooldown")
             return [], portal_token
         # Check in-memory cache first — avoids a DB read every 200ms cycle.
         tok = portal_token or get_portal_token_mem(bot_id, telegram_id)
@@ -653,6 +656,7 @@ def poll_user(user):
         if not tok:
             return [], tok
         etag = get_offers_etag(bot_id, telegram_id) if ATHENA_USE_OFFERS_ETAG else None
+        _poll_log(f"🔄 P2 [{bot_id}] polling...")
         t0 = time.perf_counter()
         status_code, payload, new_etag = _athena_get_offers(tok, etag=etag)
         observe_ms("p2_fetch_ms", (time.perf_counter() - t0) * 1000.0)
@@ -669,6 +673,7 @@ def poll_user(user):
 
         offers: List[dict] = []
         if status_code == 200 and isinstance(payload, dict):
+            _poll_log(f"✅ P2 [{bot_id}] 200 OK")
             _p2_next_poll[_p2_key] = time.time() + _p2_current_interval()
             with _p2_global_lock:
                 _p2_global_blocked_until = 0.0
