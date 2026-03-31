@@ -132,6 +132,7 @@ _p2_next_poll: Dict[Tuple[str, int], float] = {}
 # all P2 requests pause together so the IP has a chance to recover.
 _p2_global_blocked_until: float = 0.0
 _p2_global_429_count: int = 0
+_p2_backoff_logged: bool = False  # True while we're inside a backoff window — suppresses per-cycle spam
 _p2_last_429_ts: float = 0.0          # monotonic timestamp of most recent global 429
 _p2_global_lock = threading.Lock()
 _P2_BACKOFF_429_BASE_S = 10.0   # initial wait after first global 429
@@ -637,14 +638,19 @@ def poll_user(user):
         # Global IP-level cooldown: if any user triggered a 429 block, all P2 requests pause.
         _p2_key = (str(bot_id), int(telegram_id))
         _now = time.time()
+        global _p2_backoff_logged
         with _p2_global_lock:
             if _now < _p2_global_blocked_until:
-                _remaining = _p2_global_blocked_until - _now
-                _poll_log(f"⏸ P2 [{bot_id}] skipped — global backoff ({_remaining:.0f}s remaining)")
+                if not _p2_backoff_logged:
+                    _remaining = _p2_global_blocked_until - _now
+                    _poll_log(f"⏸ P2 all users — global backoff ({_remaining:.0f}s remaining)")
+                    _p2_backoff_logged = True
                 return [], portal_token
+            elif _p2_backoff_logged:
+                _poll_log(f"▶️ P2 global backoff lifted — resuming polls")
+                _p2_backoff_logged = False
         # Per-user cooldown: skip if this specific user polled too recently.
         if _now < _p2_next_poll.get(_p2_key, 0):
-            _poll_log(f"⏸ P2 [{bot_id}] skipped — per-user cooldown")
             return [], portal_token
         # Check in-memory cache first — avoids a DB read every 200ms cycle.
         tok = portal_token or get_portal_token_mem(bot_id, telegram_id)
@@ -691,12 +697,14 @@ def poll_user(user):
             _log_offers_found("P2", telegram_id, offers)
         else:
             if status_code == 429:
+                global _p2_backoff_logged
                 with _p2_global_lock:
                     _p2_global_429_count += 1
                     _p2_last_429_ts = time.time()
                     n = _p2_global_429_count
                     backoff = min(_P2_BACKOFF_429_BASE_S * (2 ** (n - 1)), _P2_BACKOFF_429_MAX_S)
                     _p2_global_blocked_until = _p2_last_429_ts + backoff
+                    _p2_backoff_logged = False  # reset so the next skipped cycle logs once
                 _poll_log(f"⚠️ P2 [{bot_id}] 429 (global_consecutive={n}, backoff={backoff:.0f}s, all P2 paused)")
             else:
                 _poll_log(f"⚠️ P2 [{bot_id}] status={status_code} has_token={bool(tok)}")
