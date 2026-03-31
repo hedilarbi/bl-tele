@@ -636,9 +636,9 @@ def poll_user(user):
         if not ENABLE_P2:
             return [], portal_token
         # Global IP-level cooldown: if any user triggered a 429 block, all P2 requests pause.
+        global _p2_backoff_logged
         _p2_key = (str(bot_id), int(telegram_id))
         _now = time.time()
-        global _p2_backoff_logged
         with _p2_global_lock:
             if _now < _p2_global_blocked_until:
                 if not _p2_backoff_logged:
@@ -697,7 +697,6 @@ def poll_user(user):
             _log_offers_found("P2", telegram_id, offers)
         else:
             if status_code == 429:
-                global _p2_backoff_logged
                 with _p2_global_lock:
                     _p2_global_429_count += 1
                     _p2_last_429_ts = time.time()
