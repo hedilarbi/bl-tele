@@ -864,6 +864,7 @@ def run():
 
     _CLEANUP_CYCLE_EVERY = 200    # cleanup not_valid cache every ~20s at 100ms poll
     _WARMUP_CYCLE_EVERY = 150    # re-warm reserve connections every ~45s at 300ms poll
+    _HEARTBEAT_CYCLE_EVERY = 600  # heartbeat log every ~3min at 300ms poll
 
     # Pre-warm reserve connections immediately at startup
     _warmup_reserve_connections_async()
@@ -874,6 +875,10 @@ def run():
             cleanup_not_valid_cache()
         if cycle_idx % _WARMUP_CYCLE_EVERY == 0:
             _warmup_reserve_connections_async()
+        if cycle_idx % _HEARTBEAT_CYCLE_EVERY == 0:
+            with _p2_global_lock:
+                _p2_remaining = max(0.0, _p2_global_blocked_until - time.time())
+            _poll_log(f"💓 heartbeat | cycle={cycle_idx} users={len(_get_users_cached())} p2_backoff={_p2_remaining:.0f}s")
         _now_ts = time.time()
         if _now_ts - _last_schedule_prune >= _SCHEDULE_PRUNE_INTERVAL_S:
             _last_schedule_prune = _now_ts
