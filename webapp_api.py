@@ -115,6 +115,10 @@ async def _validation_exception_handler(request: Request, exc: RequestValidation
         pass
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
+# ----------------- Poller internal API ----------------
+from poller_api import router as _poller_router
+app.include_router(_poller_router)
+
 # ----------------- Startup -----------------
 @app.on_event("startup")
 async def _startup():
