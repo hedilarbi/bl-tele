@@ -39,6 +39,7 @@ from db import (
     log_offer_decision,
     save_pinned_warning,
     clear_pinned_warning,
+    save_offer_message,
 )
 from poller_core.filters import _get_enabled_filter_slugs
 from poller_core.notify import pin_warning_if_needed, unpin_warning_if_any
@@ -291,6 +292,29 @@ def post_unpin_warning(
         unpin_warning_if_any(body.bot_id, body.telegram_id, body.kind)
     except Exception as e:
         logging.warning("unpin_warning_if_any failed: %s", e)
+    return {"ok": True}
+
+
+# ── Offer message (for "Show details" button) ─────────────────────────────────
+
+class SaveOfferMessageBody(BaseModel):
+    bot_id: str
+    telegram_id: int
+    message_key: str
+    header_text: str
+    full_text: str
+
+
+@router.post("/offer-message")
+def post_offer_message(
+    body: SaveOfferMessageBody,
+    Authorization: Optional[str] = Header(default=None),
+):
+    _auth(Authorization)
+    try:
+        save_offer_message(body.bot_id, body.telegram_id, body.message_key, body.header_text, body.full_text)
+    except Exception as e:
+        logging.warning("save_offer_message failed: %s", e)
     return {"ok": True}
 
 
