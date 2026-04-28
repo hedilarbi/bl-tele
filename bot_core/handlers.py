@@ -505,6 +505,23 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
+    if query.data.startswith("delete_flight_blacklist:"):
+        try:
+            idx = int(query.data.split(":", 1)[1])
+            filters_data = get_filters(bot_id, user_id)
+            current = filters_data.get("flight_blacklist") or []
+            if 0 <= idx < len(current):
+                removed = current.pop(idx)
+                filters_data["flight_blacklist"] = current
+                update_filters(bot_id, user_id, json.dumps(filters_data))
+                await query.answer(f"✅ '{removed}' removed.", show_alert=False)
+            else:
+                await query.answer("⚠️ Entry not found.", show_alert=False)
+        except Exception:
+            await query.answer("❌ Error.", show_alert=False)
+        info_text, menu = build_flight_blacklist_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
 
     # Ends datetime callbacks
     if query.data == "ends_dt":

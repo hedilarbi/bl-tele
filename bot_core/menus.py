@@ -390,10 +390,13 @@ def build_flight_blacklist_menu(bot_id: str, user_id: int):
         info_text = f"✈️ *Blocked flights*\n\n{lines}"
     else:
         info_text = "✈️ *Blocked flights*\n\n_Aucune entrée pour le moment._"
-    keyboard = [
-        [InlineKeyboardButton("➕ Add flight number", callback_data="add_flight_blacklist")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")],
-    ]
+    keyboard = []
+    for idx, flight in enumerate(items):
+        keyboard.append([
+            InlineKeyboardButton(f"🗑️ {flight}", callback_data=f"delete_flight_blacklist:{idx}")
+        ])
+    keyboard.append([InlineKeyboardButton("➕ Add flight number", callback_data="add_flight_blacklist")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")])
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
