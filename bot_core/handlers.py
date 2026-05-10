@@ -487,6 +487,23 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
+    if query.data.startswith("delete_pickup_blacklist:"):
+        try:
+            idx = int(query.data.split(":", 1)[1])
+            filters_data = get_filters(bot_id, user_id)
+            current = filters_data.get("pickup_blacklist") or []
+            if 0 <= idx < len(current):
+                removed = current.pop(idx)
+                filters_data["pickup_blacklist"] = current
+                update_filters(bot_id, user_id, json.dumps(filters_data))
+                await query.answer(f"✅ '{removed}' removed.", show_alert=False)
+            else:
+                await query.answer("⚠️ Entry not found.", show_alert=False)
+        except Exception:
+            await query.answer("❌ Error.", show_alert=False)
+        info_text, menu = build_pickup_blacklist_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
     if query.data == "add_dropoff_blacklist":
         user_waiting_input[state_key] = "dropoff_blacklist_add"
         await query.edit_message_text(
@@ -495,6 +512,23 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Or multiple separated by commas (e.g., `USA, NYC, Boston`)",
             parse_mode="Markdown",
         )
+        return
+    if query.data.startswith("delete_dropoff_blacklist:"):
+        try:
+            idx = int(query.data.split(":", 1)[1])
+            filters_data = get_filters(bot_id, user_id)
+            current = filters_data.get("dropoff_blacklist") or []
+            if 0 <= idx < len(current):
+                removed = current.pop(idx)
+                filters_data["dropoff_blacklist"] = current
+                update_filters(bot_id, user_id, json.dumps(filters_data))
+                await query.answer(f"✅ '{removed}' removed.", show_alert=False)
+            else:
+                await query.answer("⚠️ Entry not found.", show_alert=False)
+        except Exception:
+            await query.answer("❌ Error.", show_alert=False)
+        info_text, menu = build_dropoff_blacklist_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
     if query.data == "add_flight_blacklist":
         user_waiting_input[state_key] = "flight_blacklist_add"

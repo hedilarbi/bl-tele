@@ -360,10 +360,13 @@ def build_pickup_blacklist_menu(bot_id: str, user_id: int):
         info_text = f"🚫 *Pickup blacklist*\n\n{lines}"
     else:
         info_text = "🚫 *Pickup blacklist*\n\n_Aucune entrée pour le moment._"
-    keyboard = [
-        [InlineKeyboardButton("➕ Add pickup term", callback_data="add_pickup_blacklist")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")],
-    ]
+    keyboard = []
+    for idx, term in enumerate(items):
+        keyboard.append([
+            InlineKeyboardButton(f"🗑️ {term}", callback_data=f"delete_pickup_blacklist:{idx}")
+        ])
+    keyboard.append([InlineKeyboardButton("➕ Add pickup term", callback_data="add_pickup_blacklist")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")])
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
@@ -375,10 +378,13 @@ def build_dropoff_blacklist_menu(bot_id: str, user_id: int):
         info_text = f"🚫 *Dropoff blacklist*\n\n{lines}"
     else:
         info_text = "🚫 *Dropoff blacklist*\n\n_Aucune entrée pour le moment._"
-    keyboard = [
-        [InlineKeyboardButton("➕ Add dropoff term", callback_data="add_dropoff_blacklist")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")],
-    ]
+    keyboard = []
+    for idx, term in enumerate(items):
+        keyboard.append([
+            InlineKeyboardButton(f"🗑️ {term}", callback_data=f"delete_dropoff_blacklist:{idx}")
+        ])
+    keyboard.append([InlineKeyboardButton("➕ Add dropoff term", callback_data="add_dropoff_blacklist")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")])
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
