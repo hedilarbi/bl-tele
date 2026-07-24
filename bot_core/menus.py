@@ -479,6 +479,9 @@ def _range_to_utc(range_key: str, tz_name: str):
             start = this_month.replace(month=this_month.month - 1)
         end = this_month
         label = "Prev month"
+    elif range_key == "all":
+        start = end = None
+        label = "All time"
 
     def _to_utc_str(dt: datetime | None):
         if not dt:
@@ -495,6 +498,8 @@ def _pct(part: int, total: int) -> int:
 
 
 def build_stats_summary(bot_id: str, user_id: int, range_key: str = "today"):
+    if not range_key:
+        range_key = "today"
     tz = get_user_timezone(bot_id, user_id)
     start_utc, end_utc, label = _range_to_utc(range_key, tz)
     stats = get_offer_stats(bot_id, user_id, start_utc=start_utc, end_utc=end_utc)
