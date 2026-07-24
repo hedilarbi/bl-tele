@@ -497,14 +497,8 @@ def init_db():
     conn.commit()
     conn.close()
 
-    # Prune offer_logs older than 30 days to keep DB size under control.
-    try:
-        from .offer_logs import prune_offer_logs
-        deleted = prune_offer_logs(days_to_keep=30)
-        if deleted:
-            _builtins.print(f"[init_db] Pruned {deleted} offer_logs rows older than 30 days.")
-    except Exception:
-        pass
+    # Offer logs are now kept indefinitely for historical analysis and statistics.
+    # Pruning is disabled to preserve user history.
 
     # Prune past booked_slots and blocked_days at startup.
     try:
