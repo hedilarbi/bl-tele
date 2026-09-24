@@ -130,7 +130,9 @@ def _save_mobile_input_for_user(
     if not token_candidate or not headers_from_dump:
         return "❌ Invalid input. Send a full HTTP dump including Authorization + headers."
 
-    update_token(bot_id, user_id, token_candidate, headers=headers_from_dump, auth_meta={})
+    # auth_meta=None keeps the stored refresh_token ({} used to wipe it, so the poller could only
+    # re-login with Playwright). The poller refuses a refresh that would switch chauffeur account.
+    update_token(bot_id, user_id, token_candidate, headers=headers_from_dump, auth_meta=None)
 
     ok, note = validate_mobile_session(token_candidate, headers_from_dump)
     if ok:
