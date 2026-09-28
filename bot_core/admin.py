@@ -25,6 +25,10 @@ from db import (
     get_endtime_formulas,
     get_offer_logs,
     get_offer_logs_counts,
+    list_bot_admins,
+    is_bot_admin,
+    add_bot_admin,
+    remove_bot_admin,
 )
 
 
@@ -32,9 +36,7 @@ def _admin_owner_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     bot_id = (context.application.bot_data or {}).get("bot_id")
     if not bot_id:
         return False
-    bot = get_bot_instance(bot_id)
-    owner_id = bot.get("owner_telegram_id") if bot else None
-    return bool(owner_id and int(owner_id) == int(update.effective_user.id))
+    return is_bot_admin(bot_id, update.effective_user.id)
 
 
 def _sanitize_bot_id(raw: str) -> str:
@@ -503,3 +505,59 @@ async def admin_offers_callback(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard.append([InlineKeyboardButton("⬅️ Retour", callback_data=f"admin_manage:{target_bot_id}")])
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+def _current_admin_bot_id(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    return (context.application.bot_data or {}).get("bot_id")
+
+
+async def admin_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _admin_owner_ok(update, context):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    bot_id = _current_admin_bot_id(context)
+    if not context.args or not context.args[0].strip().lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /addadmin <telegram_id>")
+        return
+    telegram_id = int(context.args[0].strip())
+    ok, reason = add_bot_admin(bot_id, telegram_id)
+    if not ok:
+        await update.message.reply_text("❌ Failed to add admin.")
+        return
+    await update.message.reply_text(f"✅ Telegram ID <code>{telegram_id}</code> added as admin.", parse_mode="HTML")
+
+
+async def admin_remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _admin_owner_ok(update, context):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    bot_id = _current_admin_bot_id(context)
+    if not context.args or not context.args[0].strip().lstrip("-").isdigit():
+        await update.message.reply_text("Usage: /removeadmin <telegram_id>")
+        return
+    telegram_id = int(context.args[0].strip())
+    bot = get_bot_instance(bot_id)
+    owner_id = bot.get("owner_telegram_id") if bot else None
+    if owner_id is not None and int(owner_id) == telegram_id:
+        await update.message.reply_text("⛔ Cannot remove the primary owner. Use /addbot flow to reassign.")
+        return
+    ok, reason = remove_bot_admin(bot_id, telegram_id)
+    if not ok:
+        await update.message.reply_text("Telegram ID not found in admin list.")
+        return
+    await update.message.reply_text(f"✅ Telegram ID <code>{telegram_id}</code> removed from admins.", parse_mode="HTML")
+
+
+async def admin_list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _admin_owner_ok(update, context):
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+    bot_id = _current_admin_bot_id(context)
+    bot = get_bot_instance(bot_id)
+    owner_id = bot.get("owner_telegram_id") if bot else None
+    ids = list_bot_admins(bot_id)
+    lines = ["👑 <b>Admins</b>:"]
+    for tid in ids:
+        tag = " (owner)" if owner_id is not None and int(owner_id) == tid else ""
+        lines.append(f"• <code>{tid}</code>{tag}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")

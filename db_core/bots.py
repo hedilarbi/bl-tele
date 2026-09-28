@@ -148,6 +148,62 @@ def assign_bot_owner(bot_id: str, telegram_id: int) -> tuple[bool, str]:
     return True, "ok"
 
 
+def list_bot_admins(bot_id: str) -> list[int]:
+    """All telegram_ids allowed to act as admin on this bot (owner + extra admins)."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT owner_telegram_id FROM bot_instances WHERE bot_id = ?", (bot_id,))
+    row = c.fetchone()
+    ids = {int(row[0])} if row and row[0] is not None else set()
+    c.execute("SELECT telegram_id FROM bot_admins WHERE bot_id = ?", (bot_id,))
+    ids.update(int(r[0]) for r in c.fetchall())
+    conn.close()
+    return sorted(ids)
+
+
+def is_bot_admin(bot_id: str, telegram_id: int) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT owner_telegram_id FROM bot_instances WHERE bot_id = ?", (bot_id,))
+    row = c.fetchone()
+    if row and row[0] is not None and int(row[0]) == int(telegram_id):
+        conn.close()
+        return True
+    c.execute(
+        "SELECT 1 FROM bot_admins WHERE bot_id = ? AND telegram_id = ?",
+        (bot_id, int(telegram_id)),
+    )
+    found = c.fetchone() is not None
+    conn.close()
+    return found
+
+
+def add_bot_admin(bot_id: str, telegram_id: int) -> tuple[bool, str]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT bot_id FROM bot_instances WHERE bot_id = ?", (bot_id,))
+    if not c.fetchone():
+        conn.close()
+        return False, "bot_not_found"
+    c.execute(
+        "INSERT OR IGNORE INTO bot_admins (bot_id, telegram_id) VALUES (?, ?)",
+        (bot_id, int(telegram_id)),
+    )
+    conn.commit()
+    conn.close()
+    return True, "ok"
+
+
+def remove_bot_admin(bot_id: str, telegram_id: int) -> tuple[bool, str]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM bot_admins WHERE bot_id = ? AND telegram_id = ?", (bot_id, int(telegram_id)))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    return (True, "ok") if deleted else (False, "not_found")
+
+
 def set_bot_admin_active(bot_id: str, admin_active: bool):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -195,6 +251,7 @@ def delete_bot_instance(bot_id: str, allow_admin: bool = False) -> tuple[bool, s
         c.execute("DELETE FROM pinned_warnings WHERE bot_id = ?", (bid,))
         c.execute("DELETE FROM user_custom_filters WHERE bot_id = ?", (bid,))
         c.execute("DELETE FROM endtime_formulas WHERE bot_id = ?", (bid,))
+        c.execute("DELETE FROM bot_admins WHERE bot_id = ?", (bid,))
         # optional/legacy tables
         try:
             c.execute("DELETE FROM offer_messages WHERE bot_id = ?", (bid,))

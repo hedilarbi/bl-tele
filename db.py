@@ -38,6 +38,10 @@ from db_core.bots import (
     assign_bot_owner,
     set_bot_admin_active,
     get_bot_admin_active,
+    list_bot_admins,
+    is_bot_admin,
+    add_bot_admin,
+    remove_bot_admin,
 )
 from db_core.slots import add_booked_slot, get_booked_slots, delete_booked_slot, prune_booked_slots
 from db_core.schedule import get_blocked_days, add_blocked_day, delete_blocked_day, prune_blocked_days

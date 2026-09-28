@@ -46,6 +46,7 @@ from .utils import (
 from db import (
     add_user,
     assign_bot_owner,
+    is_bot_admin,
     update_token,
     update_filters,
     add_booked_slot,
@@ -169,7 +170,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role == "admin":
         if bot_id:
             ok, reason = assign_bot_owner(bot_id, user_id)
-            if not ok and reason == "bot_already_owned":
+            if not ok and reason == "bot_already_owned" and not is_bot_admin(bot_id, user_id):
                 await update.message.reply_text("⛔ Admin bot is already assigned to another user.")
                 return
         await update.message.reply_text(
@@ -179,7 +180,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /deletebot <code>&lt;bot_id|name&gt;</code>\n"
             "• /listbots\n"
             "• /botinfo <code>&lt;bot_id&gt;</code>\n"
-            "• /listusers\n",
+            "• /listusers\n"
+            "• /addadmin <code>&lt;telegram_id&gt;</code>\n"
+            "• /removeadmin <code>&lt;telegram_id&gt;</code>\n"
+            "• /listadmins\n",
             parse_mode="HTML",
         )
         return

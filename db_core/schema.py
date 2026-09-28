@@ -84,6 +84,19 @@ def init_db():
     """
     )
 
+    # additional telegram ids allowed to act as admin on a bot (beyond owner_telegram_id)
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_admins (
+            bot_id TEXT NOT NULL,
+            telegram_id INTEGER NOT NULL,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (bot_id, telegram_id),
+            FOREIGN KEY (bot_id) REFERENCES bot_instances(bot_id)
+        )
+    """
+    )
+
     # users
     c.execute(
         """

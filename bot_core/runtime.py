@@ -14,6 +14,9 @@ from .admin import (
     admin_botinfo_callback,
     admin_manage_callback,
     admin_offers_callback,
+    admin_add_admin,
+    admin_remove_admin,
+    admin_list_admins,
 )
 from db import init_db, add_bot_instance, list_bot_instances
 
@@ -40,6 +43,9 @@ def _build_application(bot_row: dict):
         app.add_handler(CommandHandler("botinfo", admin_bot_info))
         app.add_handler(CommandHandler("bot", admin_bot_info))
         app.add_handler(CommandHandler("listusers", admin_list_users))
+        app.add_handler(CommandHandler("addadmin", admin_add_admin))
+        app.add_handler(CommandHandler("removeadmin", admin_remove_admin))
+        app.add_handler(CommandHandler("listadmins", admin_list_admins))
         app.add_handler(CallbackQueryHandler(admin_manage_callback, pattern=r"^admin_manage:"))
         app.add_handler(CallbackQueryHandler(admin_botinfo_callback, pattern=r"^admin_botinfo:"))
         app.add_handler(CallbackQueryHandler(admin_offers_callback, pattern=r"^admin_offers:"))
