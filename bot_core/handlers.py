@@ -494,6 +494,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• One per message (e.g., `USA`)\n"
             "• Or multiple separated by commas (e.g., `USA, NYC, Boston`)",
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]),
         )
         return
     if query.data.startswith("delete_pickup_blacklist:"):
@@ -520,6 +521,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• One per message (e.g., `USA`)\n"
             "• Or multiple separated by commas (e.g., `USA, NYC, Boston`)",
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]),
         )
         return
     if query.data.startswith("delete_dropoff_blacklist:"):
@@ -546,6 +548,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• One per message (e.g., `EK 243`)\n"
             "• Or multiple separated by commas (e.g., `EK 243, BA 002`)",
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]),
         )
         return
     if query.data.startswith("delete_flight_blacklist:"):
