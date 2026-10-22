@@ -27,6 +27,8 @@ from db_core.users import (
     get_bl_uuid,
     get_token_auto_refresh,
     set_token_auto_refresh,
+    get_distance_unit,
+    set_distance_unit,
 )
 from db_core.bots import (
     add_bot_instance,

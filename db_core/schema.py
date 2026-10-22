@@ -178,6 +178,11 @@ def init_db():
             c.execute(alter_sql)
         except Exception:
             pass
+    for alter_sql in ["ALTER TABLE users ADD COLUMN distance_unit TEXT DEFAULT 'km'"]:
+        try:
+            c.execute(alter_sql)
+        except Exception:
+            pass
 
     # booked slots
     c.execute(

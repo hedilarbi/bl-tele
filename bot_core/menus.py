@@ -24,6 +24,7 @@ from .utils import (
     safe,
     _esc,
     _norm_guest_requests,
+    km_to_unit,
 )
 from db import (
     DB_FILE,
@@ -38,6 +39,7 @@ from db import (
     get_offer_logs,
     get_offer_stats,
     get_token_auto_refresh,
+    get_distance_unit,
 )
 
 
@@ -100,15 +102,20 @@ def build_settings_menu(user_id: int, bot_id: Optional[str] = None, allow_tz_cha
     ar_icon = "🟢" if auto_refresh else "🔴"
     ar_label = "ON" if auto_refresh else "OFF"
 
+    distance_unit = get_distance_unit(bot_id, user_id) if bot_id else "km"
+    unit_label = "Miles (mi)" if distance_unit == "mi" else "Kilometers (km)"
+
     info_text = (
         "🔧 *Settings*\n\n"
         f"🌍 Timezone: `{tz}`\n"
         f"📱 Mobile session: {dot} ({token_status})\n"
         f"🔄 Auto refresh token: {ar_icon} {ar_label}\n"
+        f"📏 Distance unit: {unit_label}\n"
         f"🔔 Notifications: {notif_line}\n"
         f"🪪 BL account: {bl_email_line}\n\n"
         "• *Mobile sessions* to add/update your Blacklane token\n"
         "• *Auto refresh* lets the bot renew your token automatically\n"
+        "• *Distance unit* controls km vs miles for the distance filter\n"
         "• *BL account* to set your Blacklane email/password"
     )
 
@@ -117,6 +124,7 @@ def build_settings_menu(user_id: int, bot_id: Optional[str] = None, allow_tz_cha
         [InlineKeyboardButton("🪪 BL account", web_app=WebAppInfo(url=_with_bot_id(BL_ACCOUNT_URL, bot_id, as_user_id)))],
         [InlineKeyboardButton("📱 Mobile sessions", callback_data="mobile_sessions")],
         [InlineKeyboardButton(f"🔄 Auto refresh: {ar_label}", callback_data="toggle_auto_refresh")],
+        [InlineKeyboardButton(f"📏 Distance unit: {distance_unit.upper()}", callback_data="toggle_distance_unit")],
         [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")],
     ]
     if allow_tz_change:
@@ -162,6 +170,10 @@ def build_filters_menu(filters_data: dict, user_id: int, bot_id: Optional[str] =
     min_km      = filters_data.get("min_km", 0)
     max_km      = filters_data.get("max_km", 0)
 
+    distance_unit = get_distance_unit(bot_id, user_id) if bot_id else "km"
+    min_dist_disp = round(km_to_unit(min_km, distance_unit), 1)
+    max_dist_disp = round(km_to_unit(max_km, distance_unit), 1)
+
     # End-time formulas (admin-assigned)
     rows = get_endtime_formulas(bot_id, user_id) if bot_id else []
     if rows:
@@ -187,9 +199,8 @@ def build_filters_menu(filters_data: dict, user_id: int, bot_id: Optional[str] =
         f"🕒 Work schedule: {work_start} – {work_end}\n"
         f"⏳ Delay (gap): {delay} min\n"
         f"⌛ Min duration: {min_duration} h\n"
-        f"📏 Min km: {min_km}\n"
-        f"📏 Max km: {max_km}\n"
-       
+        f"📏 Min distance: {min_dist_disp} {distance_unit}\n"
+        f"📏 Max distance: {max_dist_disp} {distance_unit}\n"
     )
 
     keyboard = [
@@ -211,8 +222,8 @@ def build_filters_menu(filters_data: dict, user_id: int, bot_id: Optional[str] =
             InlineKeyboardButton("⌛ Change duration", callback_data="change_min_duration"),
         ],
         [
-            InlineKeyboardButton("📏 Change min km", callback_data="change_min_km"),
-            InlineKeyboardButton("📏 Change max km", callback_data="change_max_km"),
+            InlineKeyboardButton(f"📏 Change min ({distance_unit})", callback_data="change_min_km"),
+            InlineKeyboardButton(f"📏 Change max ({distance_unit})", callback_data="change_max_km"),
         ],
         [
             InlineKeyboardButton("🚫 Pickup blacklist", callback_data="pickup_blacklist"),
@@ -253,19 +264,19 @@ def build_work_schedule_end_prompt():
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
-# --- KM prompts ---
-def build_min_km_input_menu():
-    info_text = (
-        "📏 *Enter MIN kilometers* as a float (e.g., `50`)."
-    )
+# --- Distance prompts ---
+def build_min_km_input_menu(bot_id: Optional[str] = None, user_id: Optional[int] = None):
+    unit = get_distance_unit(bot_id, user_id) if bot_id else "km"
+    example = "31" if unit == "mi" else "50"
+    info_text = f"📏 *Enter MIN distance in {unit}* as a float (e.g., `{example}`)."
     keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]
     return info_text, InlineKeyboardMarkup(keyboard)
 
 
-def build_max_km_input_menu():
-    info_text = (
-        "📏 *Enter MAX kilometers* as a float (e.g., `150`)."
-    )
+def build_max_km_input_menu(bot_id: Optional[str] = None, user_id: Optional[int] = None):
+    unit = get_distance_unit(bot_id, user_id) if bot_id else "km"
+    example = "93" if unit == "mi" else "150"
+    info_text = f"📏 *Enter MAX distance in {unit}* as a float (e.g., `{example}`)."
     keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_filters")]]
     return info_text, InlineKeyboardMarkup(keyboard)
 
@@ -684,8 +695,11 @@ def build_all_filters_view(bot_id: str, user_id: int):
     gap         = f.get("gap")
     pmin        = f.get("price_min")
     pmax        = f.get("price_max")
+    distance_unit = get_distance_unit(bot_id, user_id)
     kmin        = f.get("min_km")
     kmax        = f.get("max_km")
+    kmin_disp   = round(km_to_unit(kmin, distance_unit), 1) if kmin is not None else None
+    kmax_disp   = round(km_to_unit(kmax, distance_unit), 1) if kmax is not None else None
     min_dur     = f.get("min_duration")
 
     # === Classes (per mode & class) ===
@@ -742,8 +756,8 @@ def build_all_filters_view(bot_id: str, user_id: int):
 
     # Distance
     lines.append("📏 <b>Distance limits</b>:")
-    lines.append(f"• Min: {kmin} km" if kmin is not None else "• Min: —")
-    lines.append(f"• Max: {kmax} km" if kmax is not None else "• Max: —")
+    lines.append(f"• Min: {kmin_disp} {distance_unit}" if kmin_disp is not None else "• Min: —")
+    lines.append(f"• Max: {kmax_disp} {distance_unit}" if kmax_disp is not None else "• Max: —")
     lines.append("")
 
     # Hourly min duration

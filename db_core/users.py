@@ -203,6 +203,28 @@ def set_token_auto_refresh(bot_id: str, telegram_id: int, enabled: bool):
     conn.close()
 
 
+def get_distance_unit(bot_id: str, telegram_id: int) -> str:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT distance_unit FROM users WHERE bot_id = ? AND telegram_id = ?", (bot_id, telegram_id))
+    row = c.fetchone()
+    conn.close()
+    unit = row[0] if row and row[0] else "km"
+    return "mi" if unit == "mi" else "km"
+
+
+def set_distance_unit(bot_id: str, telegram_id: int, unit: str):
+    unit = "mi" if unit == "mi" else "km"
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET distance_unit = ? WHERE bot_id = ? AND telegram_id = ?",
+        (unit, bot_id, telegram_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def update_filters(bot_id: str, telegram_id: int, filters_json: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()

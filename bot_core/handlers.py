@@ -42,6 +42,7 @@ from .utils import (
     validate_mobile_session,
     validate_datetime,
     validate_day,
+    unit_to_km,
 )
 from db import (
     add_user,
@@ -64,6 +65,8 @@ from db import (
     get_bot_instance,
     get_token_auto_refresh,
     set_token_auto_refresh,
+    get_distance_unit,
+    set_distance_unit,
 )
 
 
@@ -577,15 +580,22 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # KM changes
+    # Distance changes
     if query.data == "change_min_km":
         user_waiting_input[state_key] = "min_km"
-        info_text, menu = build_min_km_input_menu()
+        info_text, menu = build_min_km_input_menu(bot_id, user_id)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
     if query.data == "change_max_km":
         user_waiting_input[state_key] = "max_km"
-        info_text, menu = build_max_km_input_menu()
+        info_text, menu = build_max_km_input_menu(bot_id, user_id)
+        await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
+        return
+
+    if query.data == "toggle_distance_unit":
+        current = get_distance_unit(bot_id, user_id)
+        set_distance_unit(bot_id, user_id, "km" if current == "mi" else "mi")
+        info_text, menu = build_settings_menu(user_id, bot_id, allow_tz_change=admin_mode, as_user_id=user_id)
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
 
@@ -895,11 +905,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text("❌ Please send a float greater than 0 (e.g., `50`).")
                 return
+            entered_val, entered_unit = val, None
+            if field in ("min_km", "max_km"):
+                entered_unit = get_distance_unit(bot_id, user_id)
+                val = unit_to_km(val, entered_unit)
             value = val
 
         filters_data = get_filters(bot_id, user_id)
         filters_data[field] = value
         update_filters(bot_id, user_id, json.dumps(filters_data))
-        await update.message.reply_text(f"✅ Updated {field} to {value}")
+        if field in ("min_km", "max_km"):
+            await update.message.reply_text(f"✅ Updated {field} to {entered_val:g} {entered_unit}")
+        else:
+            await update.message.reply_text(f"✅ Updated {field} to {value}")
         info_text, menu = build_filters_menu(filters_data, user_id, bot_id, as_user_id=user_id)
         await update.message.reply_text(info_text, parse_mode="Markdown", reply_markup=menu)

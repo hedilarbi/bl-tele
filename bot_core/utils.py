@@ -375,6 +375,19 @@ def fmt_money(price, currency):
         return f"{price} {currency or ''}".strip()
 
 
+KM_PER_MILE = 1.609344
+
+
+def km_to_unit(km_value, unit: str) -> float:
+    if km_value is None:
+        return km_value
+    return float(km_value) / KM_PER_MILE if unit == "mi" else float(km_value)
+
+
+def unit_to_km(value, unit: str) -> float:
+    return float(value) * KM_PER_MILE if unit == "mi" else float(value)
+
+
 def fmt_km(meters):
     if meters is None:
         return "—"
