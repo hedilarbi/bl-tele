@@ -203,7 +203,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _capture_from_update(update, bot_id)
     add_user(bot_id, user_id)
     is_active = get_active(bot_id, user_id)
-    menu, status_text = build_main_menu(is_active)
+    menu, status_text = build_main_menu(is_active, bot_id, user_id)
     await update.message.reply_text(
         f"**Main menu**\n\nBot status: {status_text}\n\nChoose your action:",
         parse_mode="Markdown",
@@ -250,7 +250,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Activate / Deactivate
     if query.data == "activate":
         set_active(bot_id, user_id, True)
-        menu, status_text = build_main_menu(True)
+        menu, status_text = build_main_menu(True, bot_id, user_id)
         await query.edit_message_text(
             f"**Main menu**\n\nBot status: {status_text}",
             parse_mode="Markdown",
@@ -259,7 +259,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if query.data == "deactivate":
         set_active(bot_id, user_id, False)
-        menu, status_text = build_main_menu(False)
+        menu, status_text = build_main_menu(False, bot_id, user_id)
         await query.edit_message_text(
             f"**Main menu**\n\nBot status: {status_text}",
             parse_mode="Markdown",
@@ -381,7 +381,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(info_text, parse_mode="Markdown", reply_markup=menu)
         return
     if query.data == "back_to_main":
-        menu, status_text = build_main_menu(get_active(bot_id, user_id))
+        menu, status_text = build_main_menu(get_active(bot_id, user_id), bot_id, user_id)
         await query.edit_message_text(
             f"**Main menu**\n\nBot status: {status_text}",
             parse_mode="Markdown",

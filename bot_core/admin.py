@@ -309,7 +309,7 @@ async def admin_manage_callback(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["admin_target_bot_id"] = bot_id
     context.user_data["admin_target_user_id"] = int(owner_id)
     is_active = get_active(bot_id, int(owner_id))
-    menu, status_text = build_main_menu(is_active)
+    menu, status_text = build_main_menu(is_active, bot_id, int(owner_id))
     admin_kb = [
         [InlineKeyboardButton("📋 Historique des offres", callback_data=f"admin_offers:{bot_id}:{owner_id}:0")],
     ] + list(menu.inline_keyboard)

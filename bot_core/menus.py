@@ -4,7 +4,15 @@ from datetime import datetime, timedelta, timezone
 from dateutil.tz import gettz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
-from .config import BOOKED_SLOTS_URL, SCHEDULE_URL, CURRENT_SCHEDULE_URL, BL_ACCOUNT_URL, MINI_APP_BASE, _with_bot_id
+from .config import (
+    BOOKED_SLOTS_URL,
+    SCHEDULE_URL,
+    CURRENT_SCHEDULE_URL,
+    BL_ACCOUNT_URL,
+    DOCUMENTATION_URL,
+    MINI_APP_BASE,
+    _with_bot_id,
+)
 from .storage import get_filters
 from .utils import (
     mask_email,
@@ -33,7 +41,7 @@ from db import (
 )
 
 
-def build_main_menu(is_active: bool):
+def build_main_menu(is_active: bool, bot_id: Optional[str] = None, as_user_id: Optional[int] = None):
     status_text = "✅ Active" if is_active else "❌ Not active"
     action_buttons = [InlineKeyboardButton("🔴 Deactivate", callback_data="deactivate")] if is_active else [
         InlineKeyboardButton("🟢 Activate", callback_data="activate")
@@ -47,6 +55,7 @@ def build_main_menu(is_active: bool):
             InlineKeyboardButton("⚙️ Filters", callback_data="filters"),
             InlineKeyboardButton("🔧 Settings", callback_data="settings"),
         ],
+        [InlineKeyboardButton("📖 Documentation / Aide", web_app=WebAppInfo(url=_with_bot_id(DOCUMENTATION_URL, bot_id, as_user_id)))],
         action_buttons,
     ]
     return InlineKeyboardMarkup(keyboard), status_text

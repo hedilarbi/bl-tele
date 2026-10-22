@@ -41,6 +41,7 @@ BOOKED_SLOTS_URL = f"{MINI_APP_BASE}/booked-slots"
 SCHEDULE_URL = f"{MINI_APP_BASE}/schedule"
 CURRENT_SCHEDULE_URL = f"{MINI_APP_BASE}/current-schedule"
 BL_ACCOUNT_URL = f"{MINI_APP_BASE}/bl-account"
+DOCUMENTATION_URL = f"{MINI_APP_BASE}/documentation"
 
 API_HOST = os.getenv("API_HOST", "https://chauffeur-app-api.blacklane.com")
 
