@@ -932,7 +932,11 @@ def list_user_rides(
             data_all = (payload or {}).get("data") if isinstance(payload, dict) else []
             included = (payload or {}).get("included") if isinstance(payload, dict) else []
             bl_uuid = get_bl_uuid(bot_id, uid)
-            kept = _filter_rides_by_bl_uuid(data_all or [], bl_uuid) if bl_uuid else (data_all or [])
+            # Same rule as the poller: keep rides assigned to this chauffeur AND rides not dispatched yet.
+            kept = [
+                raw for raw in (data_all or [])
+                if not bl_uuid or _athena_assigned_driver_id(raw) in (None, str(bl_uuid))
+            ]
 
             for raw in kept:
                 try:

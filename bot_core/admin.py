@@ -480,7 +480,8 @@ async def admin_offers_callback(update: Update, context: ContextTypes.DEFAULT_TY
             created = (r.get("created_at") or "")[:16]
             status = r.get("status") or ""
             if notify:
-                blocks.append(f"<i>{html.escape(created)}</i>\n{html.escape(notify)}")
+                # notify_text is stored already HTML-escaped by the poller; unescape first to avoid "&lt;" showing up.
+                blocks.append(f"<i>{html.escape(created)}</i>\n{html.escape(html.unescape(notify))}")
             else:
                 # Fallback for old entries without notify_text
                 icon = "✅" if status == "accepted" else ("⚠️" if status == "not_accepted" else "❌")
